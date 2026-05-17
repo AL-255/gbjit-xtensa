@@ -243,22 +243,24 @@ u32 xt_srai(xt_emit *e, u8 ar, u8 as, u8 sa) {
 }
 
 /* EXTUI ar, at, shiftimm (0..31), maskimm (0..15 = width-1).
- *   Canonical layout:
+ *   Canonical layout (verified against xtensa-esp32s3-elf-as):
  *     bits  0..3  = 0  (op0)
  *     bits  4..7  = t (= at, source)
  *     bits  8..11 = sh_lo4
  *     bits 12..15 = r (= ar, dest)
  *     bit  16     = sh_hi1
- *     bits 17..19 = 0b100  (fixed → puts op1's high bit set)
+ *     bit  17     = 0  (fixed)
+ *     bit  18     = 1  (fixed)
+ *     bit  19     = 0  (fixed)
  *     bits 20..23 = maskimm
- *   So in RRR fields: op0=0, op1 = 0x8 | sh_hi1, op2 = maskimm.
+ *   So in RRR-field terms: op0=0, op1 = 0x4 | sh_hi1, op2 = maskimm.
  */
 u32 xt_extui(xt_emit *e, u8 ar, u8 at, u8 shiftimm, u8 maskimm) {
     assert(shiftimm <= 31);
     assert(maskimm <= 15);
     u8 sh_lo4 = (u8)(shiftimm & 0xF);
     u8 sh_hi1 = (u8)((shiftimm >> 4) & 1);
-    return emit24(e, enc_rrr((u8)(maskimm & 0xF), (u8)(0x8 | sh_hi1), ar, sh_lo4, at));
+    return emit24(e, enc_rrr((u8)(maskimm & 0xF), (u8)(0x4 | sh_hi1), ar, sh_lo4, at));
 }
 
 u32 xt_raw32(xt_emit *e, u32 word) {

@@ -21,6 +21,10 @@
 #define HAVE_MMAP_EXEC 1
 #endif
 
+#if defined(ESP_PLATFORM)
+#include "esp_heap_caps.h"
+#endif
+
 #define ARENA_CAP_DEFAULT (64u * 1024u)
 
 /* Host-side address-space sentinels. The JIT-emitted Xtensa code uses these
@@ -34,45 +38,64 @@
 #define HOST_STACK_TOP  0x80000100u  /* a1 init points here */
 
 static void *alloc_exec_arena(u32 cap) {
-#if HAVE_MMAP_EXEC
+#if defined(HAVE_MMAP_EXEC)
     void *p = mmap(NULL, cap, PROT_READ | PROT_WRITE | PROT_EXEC,
                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (p == MAP_FAILED) return NULL;
     return p;
 #elif defined(ESP_PLATFORM)
-    extern void *heap_caps_malloc(size_t, u32);
-    return heap_caps_malloc(cap, (1u << 5) | (1u << 11) | (1u << 1));
+    /* Internal SRAM, 32-bit accessible, executable. PSRAM is not executable
+     * on the S3, so we don't request CAP_SPIRAM. */
+    return heap_caps_malloc(cap, MALLOC_CAP_EXEC | MALLOC_CAP_INTERNAL | MALLOC_CAP_32BIT);
 #else
     return malloc(cap);
 #endif
 }
 
 static void free_exec_arena(void *p, u32 cap) {
-#if HAVE_MMAP_EXEC
+#if defined(HAVE_MMAP_EXEC)
     munmap(p, cap);
+#elif defined(ESP_PLATFORM)
+    (void)cap; heap_caps_free(p);
 #else
     (void)cap; free(p);
 #endif
 }
 
 /* Resolver for the literal pool. */
-typedef struct host_resolver_ctx {
+typedef struct resolver_ctx {
     cpu_state *cpu;
-} host_resolver_ctx;
+} resolver_ctx;
 
+#if defined(ESP_PLATFORM)
+/* On the target, literal-pool entries are real 32-bit addresses. The CPU
+ * reads cpu_state/mmu directly and calls helpers via CALLX0. */
+static u32 target_helper_addr(literal_id id, void *user) {
+    resolver_ctx *r = (resolver_ctx *)user;
+    switch (id) {
+        case ADDR_CPU_BASE:     return (u32)(uintptr_t)r->cpu;
+        case ADDR_MMU_BASE:     return (u32)(uintptr_t)r->cpu->mmu;
+        case HELPER_SM83_STEP:  return (u32)(uintptr_t)&sm83_step;
+        case HELPER_MMU_READ8:  return (u32)(uintptr_t)&mmu_read8;
+        case HELPER_MMU_WRITE8: return (u32)(uintptr_t)&mmu_write8;
+        default: return 0;
+    }
+}
+#else
+/* On the host, literal-pool entries are sentinels that xt_sim's translate /
+ * call_thunk callbacks recognise. */
 static u32 host_helper_addr(literal_id id, void *user) {
     (void)user;
     switch (id) {
         case ADDR_CPU_BASE: return HOST_CPU_BASE;
         case ADDR_MMU_BASE: return HOST_MMU_BASE;
-        /* For function tokens, return the literal_id value itself so the
-         * sim's call_thunk can dispatch via the same enum. */
         case HELPER_SM83_STEP:  return (u32)HELPER_SM83_STEP;
         case HELPER_MMU_READ8:  return (u32)HELPER_MMU_READ8;
         case HELPER_MMU_WRITE8: return (u32)HELPER_MMU_WRITE8;
         default: return 0;
     }
 }
+#endif
 
 /* Linked-list bucket nodes for block lookup. */
 typedef struct dispatcher_bucket {
@@ -216,10 +239,30 @@ void gbjit_dispatcher_invalidate_addr(gbjit_dispatcher *d, u16 gb_addr) {
 }
 
 #if defined(ESP_PLATFORM)
-typedef void (*block_entry_fn)(cpu_state *);
+/* On the ESP32-S3, IDF compiles C code with the **windowed** ABI (ENTRY /
+ * RETW). The JIT-emitted code uses the **CALL0** ABI (a0 = return address,
+ * no window rotation). To cross the boundary safely we hand-write a small
+ * trampoline: ENTRY allocates our windowed frame, we save the (windowed)
+ * caller's return address `a0` to the local frame, CALLX0 into the JIT
+ * block, the JIT returns via `JX a0` to the instruction right after our
+ * CALLX0, we restore `a0`, and RETW back to the windowed caller. */
+__attribute__((noinline))
 static void enter_block_native(gbjit_block *b, cpu_state *cpu) {
-    block_entry_fn fn = (block_entry_fn)(b->code + b->entry_off);
-    fn(cpu);
+    uint32_t fn = (uint32_t)(uintptr_t)(b->code + b->entry_off);
+    /* Pin `cpu` into a2 — CALL0 callees receive their first argument there.
+     * Pin `fn` into a8 — CALLX0's target register, free across the call. */
+    register uint32_t a2_cpu asm("a2") = (uint32_t)(uintptr_t)cpu;
+    register uint32_t a8_fn  asm("a8") = fn;
+    asm volatile (
+        "s32i a0, a1, 0\n"      /* save windowed return PC to our frame */
+        "callx0 %1\n"           /* CALL0 into the JIT block */
+        "l32i a0, a1, 0\n"      /* restore windowed return PC */
+        : "+r"(a2_cpu)
+        : "r"(a8_fn)
+        : "a3","a4","a5","a6","a7","a9","a10","a11","a12","a13","a14","a15",
+          "memory"
+    );
+    (void)b;
 }
 #else
 
@@ -326,8 +369,12 @@ void gbjit_dispatcher_run_until(gbjit_dispatcher *d, u64 until) {
         }
 
         if (!b) {
-            host_resolver_ctx hr = { cpu };
+            resolver_ctx hr = { cpu };
+#if defined(ESP_PLATFORM)
+            b = gbjit_compile_block(&d->cc, cpu, cpu->pc, target_helper_addr, &hr);
+#else
             b = gbjit_compile_block(&d->cc, cpu, cpu->pc, host_helper_addr, &hr);
+#endif
             if (!b) {
                 sm83_step(cpu);
                 prev = NULL;

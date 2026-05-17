@@ -246,12 +246,12 @@ static void step(xt_sim *s) {
             }
         }
 
-        /* EXTUI (canonical): op0=0, bits 17..19 = 0b100 → op1 has high bit set.
-         * In RRR-field terms: op1 = 0b100x where x = sh_hi1.
+        /* EXTUI (canonical): op0=0, bit 18 fixed = 1, bits 17,19 fixed = 0.
+         * In RRR-field terms: op1 = 0b010x where x = sh_hi1.
          *   shiftimm = (sh_hi1 << 4) | sh_lo4   (sh_lo4 in s field)
          *   maskimm  = op2 (0..15, width-1)
          *   src      = t, dst = r.                                          */
-        if ((op1 & 0xE) == 0x8) {
+        if ((op1 & 0xE) == 0x4) {
             u32 sh_hi1 = op1 & 1;
             u32 shift = (sh_hi1 << 4) | sr;
             u32 width = (u32)op2 + 1u;

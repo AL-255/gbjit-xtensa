@@ -17,19 +17,19 @@ u8 *codecache_alloc(codecache *cc, u32 size) {
 }
 
 #if defined(ESP_PLATFORM)
-#include "esp_cache.h"
-#include "esp_heap_caps.h"
+/* ESP32-S3 IRAM is internal SRAM that is NOT routed through the L1 cache
+ * (cache covers flash/PSRAM only). Writes via the data path are visible to
+ * the instruction fetch path immediately. We still emit a memory barrier
+ * so the compiler can't reorder later instruction fetches above the code-
+ * writing stores. */
 void codecache_finalize(codecache *cc, u8 *block, u32 size) {
-    (void)cc;
-    /* Ensure stores are visible and the icache for [block,block+size) is
-       invalidated so the CPU fetches the freshly-written instructions. */
-    esp_cache_msync(block, size, ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_TYPE_INST);
+    (void)cc; (void)block; (void)size;
+    __sync_synchronize();
 }
 #else
 void codecache_finalize(codecache *cc, u8 *block, u32 size) {
     (void)cc; (void)block; (void)size;
-    /* Host x86_64: writes are coherent with icache. Just sync via the
-       builtin barrier for defence-in-depth. */
+    /* Host x86_64: writes are coherent with icache. */
     __builtin___clear_cache((char *)block, (char *)(block + size));
 }
 #endif

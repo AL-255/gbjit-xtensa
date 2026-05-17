@@ -9,7 +9,7 @@ Snapshot at end of M5 + M6 work block. See `PLAN.md` for the original design.
 | **M1** — Host scaffolding + SM83 reference interpreter | ✅ done | `interp_smoke` |
 | **M2** — Xtensa LX7 encoder (24-bit ISA subset, bit-accurate against canonical encodings) | ✅ done | `encoder_smoke`, `encoder_bits`, `xtensa_sim` |
 | **M3** — Block-based JIT, host-validated through the Xtensa simulator | ✅ done | `jit_differential` |
-| **M4** — ESP32-S3 / ESP-IDF port | ⏸ deferred (per user) | requires ESP-IDF install |
+| **M4** — ESP32-S3 / ESP-IDF port | ✅ done | runs under qemu-system-xtensa via `scripts/run_qemu_s3.sh` |
 | **M5** — JIT optimization passes | ✅ done (a–e, see below) | `jit_differential` (3 ROMs) |
 | **M6** — SMC / cache-invalidation correctness | ✅ done | `smc` |
 
@@ -108,13 +108,66 @@ $ ctest --test-dir build --output-on-failure
 100% tests passed, 0 tests failed out of 6
 ```
 
+## ESP32-S3 / qemu — how it runs
+
+`port/esp32s3/` is an ESP-IDF v6 project that wraps `core/` + `jit/`
+(minus `xtensa_sim.c`, which is host-only) as a component and a tiny
+`app_main` driver. Key on-target details:
+
+- **Calling convention bridge**: IDF compiles C with the windowed Xtensa
+  ABI (ENTRY / RETW, CALL8 / CALLX8); the JIT emits CALL0 (RET / CALLX0).
+  `enter_block_native` in `jit/dispatcher.c` is a small windowed wrapper
+  that saves the windowed return PC, `CALLX0`s into the JIT block, and
+  restores after the JIT's `JX a0` returns.
+- **Helper-pointer resolver**: on target, `target_helper_addr()` returns
+  real `&sm83_step`, `&mmu_read8`, `&mmu_write8` plus the actual
+  `cpu_state*` and `mmu*` pointers — no host sentinels.
+- **Code arena**: `heap_caps_malloc(MALLOC_CAP_EXEC | MALLOC_CAP_INTERNAL |
+  MALLOC_CAP_32BIT)` on the S3. Internal SRAM is not L1-cached on the
+  S3, so `codecache_finalize` is a memory barrier only — no `esp_cache_*`
+  needed.
+- **Console**: `CONFIG_ESP_CONSOLE_UART_DEFAULT=y` so qemu's `-serial
+  mon:stdio` captures `ESP_LOGI` output.
+- **Watchdogs disabled** so the JIT busy-loop is not interrupted
+  (`CONFIG_ESP_INT_WDT=n`, `CONFIG_ESP_TASK_WDT_EN=n`).
+
+To run from a clean checkout:
+
+```sh
+. ~/.espressif/v6.0.1/esp-idf/export.sh
+./scripts/run_qemu_s3.sh           # builds, merges, runs in qemu
+```
+
+Expected output:
+
+```
+gbjit: halted=1 pc=$010B cycles=44
+gbjit: end state: A=$00 F=$70 B=$13
+gbjit: RESULT: PASS
+```
+
+That's the same end-state the host `jit_differential` test asserts —
+the JIT generates identical Xtensa bytes on host and target, and the
+target execution matches the host simulator.
+
+### Encoder ground-truth check
+
+`scripts/verify_encoder_vs_toolchain.sh` assembles the same mnemonics
+with `xtensa-esp32s3-elf-as` and prints the canonical bytes — used to
+catch encoder bugs that the in-tree round-trip tests would otherwise
+miss (since the simulator and encoder could agree on a wrong layout).
+This is exactly how the EXTUI fixed-bit-pattern bug was found and
+corrected.
+
 ## Next likely work
 
-1. **M4 — ESP-IDF port**: ESP-IDF v5.x install + `port/esp32s3/main`; route
-   helper-pointer resolver to real `&sm83_step` / `&mmu_read8` /
-   `&mmu_write8`; wire the codegen-level chaining JX. `qemu-system-xtensa`
-   is now available for headless testing.
-2. **More inline coverage**: `ADC`/`SBC`, control flow (`JR cc`, `JP`),
+1. **More inline coverage**: `ADC`/`SBC`, control flow (`JR cc`, `JP`),
    PUSH/POP, `(HL)` memory accesses with a fast-path WRAM/HRAM check.
-3. **Lazy flag materialisation**: huge win for arithmetic-heavy code where
-   the F register is overwritten before being read.
+2. **Lazy flag materialisation**: huge win for arithmetic-heavy code
+   where the F register is overwritten before being read.
+3. **Codegen-level block chaining**: emit a patchable L32R + JX at block
+   exit so hot loops never return to the dispatcher. The infrastructure
+   (`chain_lit_off` / `n_chain_lit` on `gbjit_block`) is reserved; only
+   the emit-and-patch path is missing.
+4. **Wire `mmu_write8` → `gbjit_dispatcher_invalidate_addr`** so SMC
+   under real games (rare) drops stale blocks automatically.

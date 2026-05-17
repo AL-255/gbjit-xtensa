@@ -1,0 +1,18 @@
+# GBJIT-Xtensa target defaults.
+CONFIG_IDF_TARGET="esp32s3"
+
+# Console on UART0 — what qemu-system-xtensa wires to stdio via -serial.
+CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+
+# Release: -O2.
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+
+# IRAM heap is what the JIT codecache uses; keep memprot off so the EXEC
+# allocation works under qemu.
+CONFIG_ESP_SYSTEM_MEMPROT_FEATURE=n
+
+# Disable both watchdogs — the JIT busy-loop has no yield points.
+CONFIG_ESP_INT_WDT=n
+CONFIG_ESP_TASK_WDT_EN=n
+
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192

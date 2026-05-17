@@ -114,13 +114,12 @@ int main(void) {
     ONE_INSTR(xt_srai(&e, 3, 4, 1), 0x213140, "SRAI a3,a4,1");
 
     /* EXTUI a3, a4, 0, 7 (extract 8 bits at shift 0):
-       op0=0, t=4, sh_lo4=0, r=3, sh_hi1=0, fixed_op1_hi=0b100, maskimm=7
-       op1 = 0x8 | sh_hi1 = 8; op2 = maskimm = 7
-       word = (7<<20)|(8<<16)|(3<<12)|(0<<8)|(4<<4) = 0x783040 */
-    ONE_INSTR(xt_extui(&e, 3, 4, 0, 7), 0x783040, "EXTUI a3,a4,0,7");
-    /* EXTUI a3, a4, 8, 7: sh_lo4=8, sh_hi1=0
-       word = (7<<20)|(8<<16)|(3<<12)|(8<<8)|(4<<4) = 0x783840 */
-    ONE_INSTR(xt_extui(&e, 3, 4, 8, 7), 0x783840, "EXTUI a3,a4,8,7");
+       op0=0, t=4, sh_lo4=0, r=3, sh_hi1=0, op1=(0x4|sh_hi1)=4, op2=maskimm=7
+       word = (7<<20)|(4<<16)|(3<<12)|(0<<8)|(4<<4) = 0x743040
+       (verified against xtensa-esp32s3-elf-as `extui a3,a4,0,8`) */
+    ONE_INSTR(xt_extui(&e, 3, 4, 0, 7), 0x743040, "EXTUI a3,a4,0,7");
+    /* EXTUI a3, a4, 8, 7: sh_lo4=8, sh_hi1=0 → 0x743840 */
+    ONE_INSTR(xt_extui(&e, 3, 4, 8, 7), 0x743840, "EXTUI a3,a4,8,7");
 
     if (failed) {
         fprintf(stderr, "%d encoder check(s) failed\n", failed);
