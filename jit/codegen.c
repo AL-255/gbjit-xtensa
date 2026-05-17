@@ -588,6 +588,171 @@ static bool inline_op(xt_emit *e, u8 opcode, u16 pc, inline_ctx *ictx) {
         return true;
     }
 
+    /* --- PUSH rr (0xC5 BC, 0xD5 DE, 0xE5 HL, 0xF5 AF). WRAM-stack fast-path. */
+    if (opcode == 0xC5 || opcode == 0xD5 || opcode == 0xE5 || opcode == 0xF5) {
+        u8 pair = (opcode >> 4) & 3;
+        u32 hi_off = 0, lo_off = 0;
+        bool is_af = (pair == 3);
+        switch (pair) {
+            case 0: hi_off = OFF_B; lo_off = OFF_C; break;
+            case 1: hi_off = OFF_D; lo_off = OFF_E; break;
+            case 2: hi_off = OFF_H; lo_off = OFF_L; break;
+            case 3: hi_off = OFF_A; lo_off = OFF_F; break;
+        }
+
+        u32 wram_base_minus_C000 =
+            ictx->mmu_base_value + (u32)offsetof(mmu, wram) - 0xC000u;
+        i32 wram_lit = lit_alloc_u32(ictx->L, wram_base_minus_C000);
+        if (wram_lit < 0) return false;
+
+        xt_l16ui(e, 4, 13, OFF_SP);
+        xt_addi(e, 8, 4, -2);
+        xt_extui(e, 8, 8, 0, 15);
+        xt_extui(e, 5, 8, 13, 2);
+        xt_addi(e, 5, 5, -6);
+
+        u32 br_to_slow = e->len;
+        xt_bnez(e, 5, 4);
+
+        /* Fast path. */
+        xt_s16i(e, 8, 13, OFF_SP);
+        u32 pc_off = ictx->entry_off + e->len;
+        emit_l32r_at(e, 6, (u32)wram_lit, pc_off);
+        xt_add(e, 5, 6, 8);
+        xt_l8ui(e, 7, 13, lo_off);
+        if (is_af) {                       /* PUSH AF: F's low nibble = 0 */
+            xt_movi(e, 9, 0xF0);
+            xt_and(e, 7, 7, 9);
+        }
+        xt_s8i(e, 7, 5, 0);
+        xt_l8ui(e, 7, 13, hi_off);
+        xt_s8i(e, 7, 5, 1);
+        emit_advance(e, 1, 16);
+
+        u32 j_to_end = e->len;
+        xt_j(e, 4);
+
+        /* Slow path. */
+        u32 slow_pos = e->len;
+        emit_sync_state(e);
+        xt_mov(e, 2, 13);
+        emit_callx0_helper(e, ictx->lit_off[HELPER_SM83_STEP], ictx->entry_off);
+        emit_reload_state(e, ictx->lit_off[ADDR_CPU_BASE], ictx->entry_off);
+
+        u32 end_pos = e->len;
+        patch_branch_to(e, br_to_slow, slow_pos);
+        patch_j_to(e, j_to_end, end_pos);
+        return true;
+    }
+
+    /* --- POP rr (0xC1 BC, 0xD1 DE, 0xE1 HL, 0xF1 AF). */
+    if (opcode == 0xC1 || opcode == 0xD1 || opcode == 0xE1 || opcode == 0xF1) {
+        u8 pair = (opcode >> 4) & 3;
+        u32 hi_off = 0, lo_off = 0;
+        bool is_af = (pair == 3);
+        switch (pair) {
+            case 0: hi_off = OFF_B; lo_off = OFF_C; break;
+            case 1: hi_off = OFF_D; lo_off = OFF_E; break;
+            case 2: hi_off = OFF_H; lo_off = OFF_L; break;
+            case 3: hi_off = OFF_A; lo_off = OFF_F; break;
+        }
+
+        u32 wram_base_minus_C000 =
+            ictx->mmu_base_value + (u32)offsetof(mmu, wram) - 0xC000u;
+        i32 wram_lit = lit_alloc_u32(ictx->L, wram_base_minus_C000);
+        if (wram_lit < 0) return false;
+
+        xt_l16ui(e, 4, 13, OFF_SP);
+        xt_extui(e, 5, 4, 13, 2);
+        xt_addi(e, 5, 5, -6);
+
+        u32 br_to_slow = e->len;
+        xt_bnez(e, 5, 4);
+
+        /* Fast path: a5 = byte ptr; load low → lo_off, high → hi_off. */
+        u32 pc_off = ictx->entry_off + e->len;
+        emit_l32r_at(e, 6, (u32)wram_lit, pc_off);
+        xt_add(e, 5, 6, 4);
+        xt_l8ui(e, 7, 5, 0);
+        if (is_af) {
+            xt_movi(e, 9, 0xF0);
+            xt_and(e, 7, 7, 9);
+        }
+        xt_s8i(e, 7, 13, lo_off);
+        xt_l8ui(e, 7, 5, 1);
+        xt_s8i(e, 7, 13, hi_off);
+        /* SP += 2 */
+        xt_addi(e, 4, 4, 2);
+        xt_extui(e, 4, 4, 0, 15);
+        xt_s16i(e, 4, 13, OFF_SP);
+        emit_advance(e, 1, 12);
+
+        u32 j_to_end = e->len;
+        xt_j(e, 4);
+
+        u32 slow_pos = e->len;
+        emit_sync_state(e);
+        xt_mov(e, 2, 13);
+        emit_callx0_helper(e, ictx->lit_off[HELPER_SM83_STEP], ictx->entry_off);
+        emit_reload_state(e, ictx->lit_off[ADDR_CPU_BASE], ictx->entry_off);
+
+        u32 end_pos = e->len;
+        patch_branch_to(e, br_to_slow, slow_pos);
+        patch_j_to(e, j_to_end, end_pos);
+        return true;
+    }
+
+    /* --- LD (HL+),A (0x22), LD (HL-),A (0x32), LD A,(HL+) (0x2A), LD A,(HL-) (0x3A).
+     * WRAM fast-path; HL is updated by ±1 after the access. */
+    if (opcode == 0x22 || opcode == 0x32 || opcode == 0x2A || opcode == 0x3A) {
+        bool is_load = (opcode == 0x2A || opcode == 0x3A);
+        int hl_delta = (opcode == 0x32 || opcode == 0x3A) ? -1 : 1;
+
+        u32 wram_base_minus_C000 =
+            ictx->mmu_base_value + (u32)offsetof(mmu, wram) - 0xC000u;
+        i32 wram_lit = lit_alloc_u32(ictx->L, wram_base_minus_C000);
+        if (wram_lit < 0) return false;
+
+        xt_l16ui(e, 9, 13, OFF_HL);
+        xt_extui(e, 4, 9, 13, 2);
+        xt_addi(e, 4, 4, -6);
+
+        u32 br_to_slow = e->len;
+        xt_bnez(e, 4, 4);
+
+        /* Fast path. */
+        u32 pc_off = ictx->entry_off + e->len;
+        emit_l32r_at(e, 5, (u32)wram_lit, pc_off);
+        xt_add(e, 4, 5, 9);
+        if (is_load) {
+            xt_l8ui(e, 2, 4, 0);
+            xt_s8i(e, 2, 13, OFF_A);
+        } else {
+            xt_l8ui(e, 2, 13, OFF_A);
+            xt_s8i(e, 2, 4, 0);
+        }
+        /* HL ± 1 */
+        xt_addi(e, 9, 9, hl_delta);
+        xt_extui(e, 9, 9, 0, 15);
+        xt_s16i(e, 9, 13, OFF_HL);
+        emit_advance(e, 1, 8);
+
+        u32 j_to_end = e->len;
+        xt_j(e, 4);
+
+        /* Slow path. */
+        u32 slow_pos = e->len;
+        emit_sync_state(e);
+        xt_mov(e, 2, 13);
+        emit_callx0_helper(e, ictx->lit_off[HELPER_SM83_STEP], ictx->entry_off);
+        emit_reload_state(e, ictx->lit_off[ADDR_CPU_BASE], ictx->entry_off);
+
+        u32 end_pos = e->len;
+        patch_branch_to(e, br_to_slow, slow_pos);
+        patch_j_to(e, j_to_end, end_pos);
+        return true;
+    }
+
     /* --- RET (0xC9) — pop return PC. WRAM-stack fast path. */
     if (opcode == 0xC9) {
         u32 wram_base_minus_C000 =
