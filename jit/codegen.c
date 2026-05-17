@@ -526,6 +526,110 @@ static bool inline_op(xt_emit *e, u8 opcode, u16 pc, inline_ctx *ictx) {
         return true;
     }
 
+    /* --- CALL a16 (0xCD) and RST nn (0xC7/CF/D7/DF/E7/EF/F7/FF) — push return
+     * PC and jump. WRAM-stack fast path; helper fallback for HRAM stacks. */
+    if (opcode == 0xCD || (opcode & 0xC7) == 0xC7) {
+        u16 ret_pc, target;
+        if (opcode == 0xCD) {
+            u8 lo = mmu_read8(m, (u16)(pc + 1));
+            u8 hi = mmu_read8(m, (u16)(pc + 2));
+            target = (u16)(lo | (hi << 8));
+            ret_pc = (u16)(pc + 3);
+        } else {
+            target = (u16)(opcode & 0x38);   /* RST $00/$08/.../$38 */
+            ret_pc = (u16)(pc + 1);
+        }
+        u8 lo_ret = (u8)(ret_pc & 0xFF);
+        u8 hi_ret = (u8)((ret_pc >> 8) & 0xFF);
+        u8 cycles_taken = (opcode == 0xCD) ? 24 : 16;
+
+        u32 wram_base_minus_C000 =
+            ictx->mmu_base_value + (u32)offsetof(mmu, wram) - 0xC000u;
+        i32 wram_lit = lit_alloc_u32(ictx->L, wram_base_minus_C000);
+        if (wram_lit < 0) return false;
+
+        /* a4 = SP, a8 = new_SP (= SP - 2). */
+        xt_l16ui(e, 4, 13, OFF_SP);
+        xt_addi(e, 8, 4, -2);
+        xt_extui(e, 8, 8, 0, 15);
+
+        /* WRAM range check on new_SP. */
+        xt_extui(e, 5, 8, 13, 2);
+        xt_addi(e, 5, 5, -6);
+
+        u32 br_to_slow = e->len;
+        xt_bnez(e, 5, 4);
+
+        /* Fast path. */
+        xt_s16i(e, 8, 13, OFF_SP);
+        u32 pc_off = ictx->entry_off + e->len;
+        emit_l32r_at(e, 6, (u32)wram_lit, pc_off);
+        xt_add(e, 5, 6, 8);                  /* byte ptr at SP */
+        xt_movi(e, 7, (i32)lo_ret);
+        xt_s8i(e, 7, 5, 0);
+        xt_movi(e, 7, (i32)hi_ret);
+        xt_s8i(e, 7, 5, 1);
+        emit_load_u16(e, 11, target, 2);
+        xt_addi(e, 12, 12, cycles_taken);
+
+        u32 j_to_end = e->len;
+        xt_j(e, 4);
+
+        /* Slow path. */
+        u32 slow_pos = e->len;
+        emit_sync_state(e);
+        xt_mov(e, 2, 13);
+        emit_callx0_helper(e, ictx->lit_off[HELPER_SM83_STEP], ictx->entry_off);
+        emit_reload_state(e, ictx->lit_off[ADDR_CPU_BASE], ictx->entry_off);
+
+        u32 end_pos = e->len;
+        patch_branch_to(e, br_to_slow, slow_pos);
+        patch_j_to(e, j_to_end, end_pos);
+        return true;
+    }
+
+    /* --- RET (0xC9) — pop return PC. WRAM-stack fast path. */
+    if (opcode == 0xC9) {
+        u32 wram_base_minus_C000 =
+            ictx->mmu_base_value + (u32)offsetof(mmu, wram) - 0xC000u;
+        i32 wram_lit = lit_alloc_u32(ictx->L, wram_base_minus_C000);
+        if (wram_lit < 0) return false;
+
+        xt_l16ui(e, 4, 13, OFF_SP);
+        xt_extui(e, 5, 4, 13, 2);
+        xt_addi(e, 5, 5, -6);
+
+        u32 br_to_slow = e->len;
+        xt_bnez(e, 5, 4);
+
+        /* Fast path: a11 = M16[SP], SP += 2. */
+        u32 pc_off = ictx->entry_off + e->len;
+        emit_l32r_at(e, 6, (u32)wram_lit, pc_off);
+        xt_add(e, 5, 6, 4);
+        xt_l8ui(e, 7, 5, 0);
+        xt_l8ui(e, 8, 5, 1);
+        xt_slli(e, 8, 8, 8);
+        xt_or(e, 11, 7, 8);                  /* new PC */
+        xt_addi(e, 4, 4, 2);
+        xt_extui(e, 4, 4, 0, 15);
+        xt_s16i(e, 4, 13, OFF_SP);
+        xt_addi(e, 12, 12, 16);
+
+        u32 j_to_end = e->len;
+        xt_j(e, 4);
+
+        u32 slow_pos = e->len;
+        emit_sync_state(e);
+        xt_mov(e, 2, 13);
+        emit_callx0_helper(e, ictx->lit_off[HELPER_SM83_STEP], ictx->entry_off);
+        emit_reload_state(e, ictx->lit_off[ADDR_CPU_BASE], ictx->entry_off);
+
+        u32 end_pos = e->len;
+        patch_branch_to(e, br_to_slow, slow_pos);
+        patch_j_to(e, j_to_end, end_pos);
+        return true;
+    }
+
     /* --- JP a16 (0xC3) — unconditional, block terminator. */
     if (opcode == 0xC3) {
         u8 lo = mmu_read8(m, (u16)(pc + 1));
