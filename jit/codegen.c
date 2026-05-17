@@ -846,6 +846,49 @@ static bool inline_op(xt_emit *e, u8 opcode, u16 pc, inline_ctx *ictx) {
         return true;
     }
 
+    /* --- ALU A,(HL) — 0x86, 0x8E, 0x96, 0x9E, 0xA6, 0xAE, 0xB6, 0xBE.
+     * Same WRAM fast-path / helper-fallback pattern as LD r,(HL). */
+    if ((opcode >= 0x86 && opcode <= 0xBE) && ((opcode & 7) == 6)) {
+        u8 group = (opcode >> 3) & 0x7;
+        if (group == 1 || group == 3) return false;   /* ADC/SBC: helper */
+
+        u32 wram_base_minus_C000 =
+            ictx->mmu_base_value + (u32)offsetof(mmu, wram) - 0xC000u;
+        i32 wram_lit = lit_alloc_u32(ictx->L, wram_base_minus_C000);
+        if (wram_lit < 0) return false;
+
+        xt_l16ui(e, 9, 13, OFF_HL);           /* keep HL in a9 across the inline */
+        xt_extui(e, 4, 9, 13, 2);
+        xt_addi(e, 4, 4, -6);
+
+        u32 br_to_slow = e->len;
+        xt_bnez(e, 4, 4);
+
+        /* Fast path: load (HL) into a3, do ALU(A, (HL)). */
+        u32 pc_off = ictx->entry_off + e->len;
+        emit_l32r_at(e, 5, (u32)wram_lit, pc_off);
+        xt_add(e, 4, 5, 9);
+        xt_l8ui(e, 3, 4, 0);                 /* a3 = mem[HL] */
+        xt_l8ui(e, 2, 13, OFF_A);            /* a2 = A */
+        ALU_INLINE(group);
+        emit_advance(e, 1, 8);
+
+        u32 j_to_end = e->len;
+        xt_j(e, 4);
+
+        /* Slow path. */
+        u32 slow_pos = e->len;
+        emit_sync_state(e);
+        xt_mov(e, 2, 13);
+        emit_callx0_helper(e, ictx->lit_off[HELPER_SM83_STEP], ictx->entry_off);
+        emit_reload_state(e, ictx->lit_off[ADDR_CPU_BASE], ictx->entry_off);
+
+        u32 end_pos = e->len;
+        patch_branch_to(e, br_to_slow, slow_pos);
+        patch_j_to(e, j_to_end, end_pos);
+        return true;
+    }
+
     /* --- ALU A,r — 0x80..0xBF.
      *
      * Layout: opcodes 0x80+r..0x87+r form a group of 8 (one per source reg).
