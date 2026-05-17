@@ -1,9 +1,25 @@
+# Pick which embedded ROM the bench harness runs. Default keeps the
+# existing Blargg cpu_instrs sub-test 06; pass -DBENCH_ROM=sml to swap
+# in Super Mario Land for game-workload measurements.
+if(NOT DEFINED BENCH_ROM)
+    set(BENCH_ROM "blargg_06")
+endif()
+
+if(BENCH_ROM STREQUAL "sml")
+    set(_embed_rom "sml.gb")
+    set(_rom_define "BENCH_ROM_SML=1")
+else()
+    set(_embed_rom "blargg_06.gb")
+    set(_rom_define "BENCH_ROM_BLARGG=1")
+endif()
+
 idf_component_register(
     SRCS "app_main.c"
     PRIV_REQUIRES gbjit esp_timer
-    EMBED_FILES "blargg_06.gb"
+    EMBED_FILES "${_embed_rom}"
     INCLUDE_DIRS ""
 )
+target_compile_definitions(${COMPONENT_LIB} PRIVATE ${_rom_define})
 
 # Tuning knob for the benchmark harness; override on the cmake line via
 # `idf.py -DBENCH_CYCLES_BUDGET=500000 build` when capturing qemu traces.

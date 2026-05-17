@@ -117,8 +117,23 @@ typedef struct smc_page_node {
 bool gbjit_dispatcher_init(gbjit_dispatcher *d, cpu_state *cpu) {
     memset(d, 0, sizeof(*d));
     d->cpu = cpu;
-    d->arena_cap = ARENA_CAP_DEFAULT;
-    d->arena = alloc_exec_arena(d->arena_cap);
+    /* Try the default arena size first, then degrade. On ESP32-S3 the
+     * largest contiguous block of EXEC-capable internal SRAM is sensitive
+     * to .bss size (our 256 KB cartridge ROM array eats a lot of DRAM,
+     * which fragments the unified IRAM/DRAM pool). For small carts the
+     * JIT only emits a few KB of code, so a 32 KB or even 16 KB arena
+     * still runs everything we benchmark. */
+    static const u32 arena_caps[] = {
+        ARENA_CAP_DEFAULT,  /* 64 KB */
+        32u * 1024u,
+        16u * 1024u,
+        8u  * 1024u,
+    };
+    for (u32 i = 0; i < sizeof(arena_caps)/sizeof(arena_caps[0]); i++) {
+        d->arena_cap = arena_caps[i];
+        d->arena = alloc_exec_arena(d->arena_cap);
+        if (d->arena) break;
+    }
     if (!d->arena) return false;
     codecache_init(&d->cc, (u8 *)d->arena, d->arena_cap);
     d->interp_fallback = false;

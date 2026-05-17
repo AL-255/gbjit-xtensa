@@ -23,10 +23,15 @@
 set -euo pipefail
 
 BENCH_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-RESULTS_DIR="$BENCH_DIR/results"
 PORT_DIR="$BENCH_DIR/../port/esp32s3"
 BUILD_DIR="$PORT_DIR/build"
 BUDGET="${BENCH_CYCLES_BUDGET:-200000}"
+BENCH_ROM="${BENCH_ROM:-blargg_06}"
+if [[ "$BENCH_ROM" == "blargg_06" ]]; then
+    RESULTS_DIR="$BENCH_DIR/results"
+else
+    RESULTS_DIR="$BENCH_DIR/results/$BENCH_ROM"
+fi
 
 if ! command -v qemu-system-xtensa >/dev/null; then
     echo "ERR: source ESP-IDF export.sh first" >&2
@@ -48,8 +53,8 @@ build_firmware() {
         *) echo "ERR: unknown mode $mode" >&2; exit 1 ;;
     esac
     echo "[bench] building firmware: $mode (budget=$BUDGET)..." >&2
-    (cd "$PORT_DIR" && idf.py -DBENCH_CYCLES_BUDGET="$BUDGET" $extra_def fullclean >/dev/null \
-                   && idf.py -DBENCH_CYCLES_BUDGET="$BUDGET" $extra_def build) >/tmp/gbjit_bench_build.log 2>&1 \
+    (cd "$PORT_DIR" && idf.py -DBENCH_CYCLES_BUDGET="$BUDGET" -DBENCH_ROM="$BENCH_ROM" $extra_def fullclean >/dev/null \
+                   && idf.py -DBENCH_CYCLES_BUDGET="$BUDGET" -DBENCH_ROM="$BENCH_ROM" $extra_def build) >/tmp/gbjit_bench_build.log 2>&1 \
         || { tail -30 /tmp/gbjit_bench_build.log; exit 3; }
     # Generate qemu_efuse.bin via a short `idf.py qemu` (cleanly killed).
     (cd "$PORT_DIR" && timeout 3 idf.py qemu >/dev/null 2>&1 || true)

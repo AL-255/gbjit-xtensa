@@ -30,8 +30,15 @@ static const char *TAG = "gbjit";
 #define BENCH_CYCLES_BUDGET (5ull * 1000ull * 1000ull)
 #endif
 
-extern const uint8_t blargg_rom_start[] asm("_binary_blargg_06_gb_start");
-extern const uint8_t blargg_rom_end  [] asm("_binary_blargg_06_gb_end");
+#if defined(BENCH_ROM_SML)
+extern const uint8_t rom_start[] asm("_binary_sml_gb_start");
+extern const uint8_t rom_end  [] asm("_binary_sml_gb_end");
+static const char *ROM_LABEL = "sml";
+#else
+extern const uint8_t rom_start[] asm("_binary_blargg_06_gb_start");
+extern const uint8_t rom_end  [] asm("_binary_blargg_06_gb_end");
+static const char *ROM_LABEL = "blargg_06";
+#endif
 
 static cpu_state s_cpu;
 static mmu s_mmu;
@@ -54,9 +61,11 @@ static void serial_sink(void *ctx, uint8_t b) {
 }
 
 static void load_rom_and_reset(void) {
-    size_t rom_len = (size_t)(blargg_rom_end - blargg_rom_start);
+    size_t rom_len = (size_t)(rom_end - rom_start);
     mmu_init(&s_mmu);
-    memcpy(s_mmu.rom, blargg_rom_start, rom_len);
+    /* Use mmu_load_rom so MBC1 carts (like SML) get their cartridge header
+     * parsed and rom_bank state wired up. */
+    mmu_load_rom(&s_mmu, rom_start, rom_len);
     s_mmu.serial_sink = serial_sink;
     cpu_reset(&s_cpu, &s_mmu);
     s_serial_len = 0;
@@ -181,7 +190,8 @@ static void run_jit_nocache(void) {
 
 void app_main(void) {
     ESP_LOGI(TAG, "boot — gbjit-xtensa benchmark");
-    ESP_LOGI(TAG, "rom size = %u bytes", (unsigned)(blargg_rom_end - blargg_rom_start));
+    ESP_LOGI(TAG, "rom = %s, size = %u bytes", ROM_LABEL,
+             (unsigned)(rom_end - rom_start));
 
 #if defined(BENCH_MODE_INTERP_ONLY)
     run_interp();
