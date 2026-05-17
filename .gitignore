@@ -24,3 +24,6 @@ port/esp32s3/sdkconfig
 port/esp32s3/sdkconfig.old
 port/esp32s3/dependencies.lock
 port/esp32s3/managed_components/
+benchmark/results/*_qemu_trace.log
+benchmark/results/*_qemu_stdout.txt
+benchmark/__pycache__/
