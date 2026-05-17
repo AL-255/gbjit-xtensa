@@ -102,30 +102,25 @@ int main(void) {
        Here we pass lit_offset = 0xFFFF: word = 0xFFFF31 */
     ONE_INSTR(xt_l32r(&e, 3, 0xFFFF), 0xFFFF31, "L32R a3,-4");
 
-    /* SLLI a3, a4, 1: sa1 = 31 = 0x1F, sa_lo4 = 0xF, sa_hi1 = 1
-        op2 = 0x1 | (1<<3) = 0x9, op1 = 1, r=3, s=4, t=0xF
-        word = (9 << 20) | (1 << 16) | (3 << 12) | (4 << 8) | (0xF << 4)
-             = 0x9134F0 (but op0 = 0 implicit)
-    */
-    ONE_INSTR(xt_slli(&e, 3, 4, 1), 0x9134F0, "SLLI a3,a4,1");
-    /* SLLI a3, a4, 16: sa1 = 16 = 0x10, lo4=0, hi1=1; op2=0x9, t=0
-        word = (9<<20) | (1<<16) | (3<<12) | (4<<8) | 0 = 0x913400 */
-    ONE_INSTR(xt_slli(&e, 3, 4, 16), 0x913400, "SLLI a3,a4,16");
-    /* SRLI a3, a4, 8: op2=4, op1=1, r=3, s=8, t=4
-        word = (4<<20) | (1<<16) | (3<<12) | (8<<8) | (4<<4) = 0x413840 */
+    /* SLLI a3, a4, 1: sa1=31, sa_lo4=0xF, sa_hi1=1; op2=1, op1=1, r=3, s=4, t=0xF
+       word = (1<<20)|(1<<16)|(3<<12)|(4<<8)|(0xF<<4) = 0x1134F0 */
+    ONE_INSTR(xt_slli(&e, 3, 4, 1), 0x1134F0, "SLLI a3,a4,1");
+    /* SLLI a3, a4, 16: sa1=16, sa_lo4=0, sa_hi1=1; op2=1, t=0
+       word = (1<<20)|(1<<16)|(3<<12)|(4<<8) = 0x113400 */
+    ONE_INSTR(xt_slli(&e, 3, 4, 16), 0x113400, "SLLI a3,a4,16");
+    /* SRLI a3, a4, 8: op2=4, op1=1, r=3, s=8, t=4 → 0x413840 */
     ONE_INSTR(xt_srli(&e, 3, 4, 8), 0x413840, "SRLI a3,a4,8");
-    /* SRAI a3, a4, 1: sa_lo4=1, hi1=0; op2=2, op1=1, r=3, s=1, t=4
-        word = (2<<20) | (1<<16) | (3<<12) | (1<<8) | (4<<4) = 0x213140 */
+    /* SRAI a3, a4, 1: sa_lo4=1, sa_hi1=0; op2=2, op1=1, r=3, s=1, t=4 → 0x213140 */
     ONE_INSTR(xt_srai(&e, 3, 4, 1), 0x213140, "SRAI a3,a4,1");
 
-    /* EXTUI a3, a4, 0, 7  (extract 8 bits at shift 0 — i.e., AND with 0xFF):
-        sh_lo4=0, sh_hi1=0 → op2=4; op1 = mask = 7
-        word = (4<<20) | (7<<16) | (3<<12) | (0<<8) | (4<<4) = 0x473040 */
-    ONE_INSTR(xt_extui(&e, 3, 4, 0, 7), 0x473040, "EXTUI a3,a4,0,7");
-    /* EXTUI a3, a4, 8, 7 (byte at shift 8 -> extract second byte):
-        sh_lo4=8, sh_hi1=0 → op2=4
-        word = (4<<20) | (7<<16) | (3<<12) | (8<<8) | (4<<4) = 0x473840 */
-    ONE_INSTR(xt_extui(&e, 3, 4, 8, 7), 0x473840, "EXTUI a3,a4,8,7");
+    /* EXTUI a3, a4, 0, 7 (extract 8 bits at shift 0):
+       op0=0, t=4, sh_lo4=0, r=3, sh_hi1=0, fixed_op1_hi=0b100, maskimm=7
+       op1 = 0x8 | sh_hi1 = 8; op2 = maskimm = 7
+       word = (7<<20)|(8<<16)|(3<<12)|(0<<8)|(4<<4) = 0x783040 */
+    ONE_INSTR(xt_extui(&e, 3, 4, 0, 7), 0x783040, "EXTUI a3,a4,0,7");
+    /* EXTUI a3, a4, 8, 7: sh_lo4=8, sh_hi1=0
+       word = (7<<20)|(8<<16)|(3<<12)|(8<<8)|(4<<4) = 0x783840 */
+    ONE_INSTR(xt_extui(&e, 3, 4, 8, 7), 0x783840, "EXTUI a3,a4,8,7");
 
     if (failed) {
         fprintf(stderr, "%d encoder check(s) failed\n", failed);

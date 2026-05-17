@@ -74,8 +74,8 @@ int main(void) {
         0x76,                   /* HALT */
     };
 
-    cpu_state cpu_i, cpu_j;
-    mmu m_i, m_j;
+    static cpu_state cpu_i, cpu_j;
+    static mmu m_i, m_j;
     run_interp(prog, sizeof(prog), &cpu_i, &m_i);
     run_jit   (prog, sizeof(prog), &cpu_j, &m_j);
 
@@ -87,8 +87,63 @@ int main(void) {
         failed++;
     }
 
+    /* ALU-heavy ROM: exercises ADD/SUB/AND/OR/XOR/CP inlined paths and the
+     * resulting F register. */
+    static const u8 alu_prog[] = {
+        0x3E, 0x42,             /* LD A,$42 */
+        0x06, 0x13,             /* LD B,$13 */
+        0x80,                   /* ADD A,B  -> A=$55, F=$00 */
+        0x90,                   /* SUB B    -> A=$42, F=$40 */
+        0xA0,                   /* AND B    -> A=$02, F=$20 */
+        0xB0,                   /* OR  B    -> A=$13, F=$00 */
+        0xA8,                   /* XOR B    -> A=$00, F=$80 */
+        0xB8,                   /* CP  B    -> A unchanged, F=$70 */
+        0x76,                   /* HALT */
+    };
+    static cpu_state cpu_i2, cpu_j2;
+    static mmu m_i2, m_j2;
+    run_interp(alu_prog, sizeof(alu_prog), &cpu_i2, &m_i2);
+    run_jit   (alu_prog, sizeof(alu_prog), &cpu_j2, &m_j2);
+    check_match("alu rom", &cpu_i2, &cpu_j2);
+
+    /* Loop ROM — multiple blocks, exercises the dispatcher's chain cache. */
+    static const u8 loop_prog[] = {
+        0x06, 0x00,             /* 0x0100  LD B,$00 */
+        0x04,                   /* 0x0102  INC B */
+        0x78,                   /* 0x0103  LD A,B */
+        0xFE, 0x03,             /* 0x0104  CP $03 (helper — sets Z if B==3) */
+        0x20, 0xFA,             /* 0x0106  JR NZ,-6 (back to 0x0102) */
+        0x76,                   /* 0x0108  HALT */
+    };
+    static cpu_state cpu_il, cpu_jl;
+    static mmu m_il, m_jl;
+    run_interp(loop_prog, sizeof(loop_prog), &cpu_il, &m_il);
+    run_jit   (loop_prog, sizeof(loop_prog), &cpu_jl, &m_jl);
+    check_match("loop rom", &cpu_il, &cpu_jl);
+
+    /* INC/DEC + 16-bit ops ROM. */
+    static const u8 inc_prog[] = {
+        0x01, 0xFF, 0x12,       /* LD BC,$12FF                 (sets B=$12, C=$FF) */
+        0x03,                   /* INC BC  -> BC=$1300 (8 cyc, no flags) */
+        0x11, 0x00, 0x80,       /* LD DE,$8000 */
+        0x1B,                   /* DEC DE -> DE=$7FFF */
+        0x21, 0x0F, 0x00,       /* LD HL,$000F */
+        0x23,                   /* INC HL -> HL=$0010 */
+        0x3E, 0xFF,             /* LD A,$FF (sets A=$FF, F=$B0 still from reset preserved) */
+        0x3C,                   /* INC A  -> A=$00 (wraps), F = Z|H | (preserved C) */
+        0x3D,                   /* DEC A  -> A=$FF, F = N|H | (preserved C) */
+        0x06, 0x10,             /* LD B,$10 */
+        0x05,                   /* DEC B -> B=$0F, F = N | H | (preserved C) */
+        0x76,                   /* HALT */
+    };
+    static cpu_state cpu_i3, cpu_j3;
+    static mmu m_i3, m_j3;
+    run_interp(inc_prog, sizeof(inc_prog), &cpu_i3, &m_i3);
+    run_jit   (inc_prog, sizeof(inc_prog), &cpu_j3, &m_j3);
+    check_match("inc rom", &cpu_i3, &cpu_j3);
+
     if (failed) { fprintf(stderr, "%d differential check(s) failed\n", failed); return 1; }
-    printf("jit differential: OK  (PC=%04X A=%02X cycles=%llu)\n",
-           cpu_j.pc, cpu_j.a, (unsigned long long)cpu_j.cycles);
+    printf("jit differential: OK (smoke A=%02X | alu A=%02X F=%02X | inc HL=%04X DE=%04X)\n",
+           cpu_j.a, cpu_j2.a, cpu_j2.f, cpu_j3.hl, cpu_j3.de);
     return 0;
 }

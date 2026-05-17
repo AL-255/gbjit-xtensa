@@ -17,3 +17,7 @@ add_test(NAME xtensa_sim COMMAND test_xtensa_sim)
 add_executable(test_jit_differential test_jit_differential.c)
 target_link_libraries(test_jit_differential PRIVATE gbjit_jit)
 add_test(NAME jit_differential COMMAND test_jit_differential)
+
+add_executable(test_smc test_smc.c)
+target_link_libraries(test_smc PRIVATE gbjit_jit)
+add_test(NAME smc COMMAND test_smc)

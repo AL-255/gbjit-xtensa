@@ -225,9 +225,10 @@ u32 xt_ret(xt_emit *e) {
  *     r = ar,  s = sa & 0xF,  t = at
  */
 u32 xt_slli(xt_emit *e, u8 ar, u8 as, u8 sa) {
+    /* Canonical: bits 21..23 = 0 (fixed). sa_hi1 lives at bit 20 (op2 LSB). */
     assert(sa >= 1 && sa <= 31);
     u8 sa1 = (u8)(32u - sa);
-    u8 op2 = (u8)(0x1 | ((sa1 >> 4) << 3));
+    u8 op2 = (u8)((sa1 >> 4) & 1);
     return emit24(e, enc_rrr(op2, 0x1, ar, as, (u8)(sa1 & 0xF)));
 }
 u32 xt_srli(xt_emit *e, u8 ar, u8 as, u8 sa) {
@@ -235,24 +236,29 @@ u32 xt_srli(xt_emit *e, u8 ar, u8 as, u8 sa) {
     return emit24(e, enc_rrr(0x4, 0x1, ar, sa, as));
 }
 u32 xt_srai(xt_emit *e, u8 ar, u8 as, u8 sa) {
+    /* Canonical: bit 21 fixed = 1, bits 22..23 = 0. So op2 = 2 | sa_hi1. */
     assert(sa <= 31);
-    u8 op2 = (u8)(0x2 | ((sa >> 4) << 3));
+    u8 op2 = (u8)(0x2 | ((sa >> 4) & 1));
     return emit24(e, enc_rrr(op2, 0x1, ar, (u8)(sa & 0xF), as));
 }
 
-/* EXTUI ar, at, shiftimm, maskimm
- *   Extracts maskimm+1 bits starting at shiftimm from at, zero-extends into ar.
- *   op0=0, op2 = 0x4 | (sh_hi1<<3)  ∈ {0x4, 0xC}
- *   op1 = maskimm  (0..15, encodes width-1)
- *   r = ar
- *   s = shiftimm & 0xF
- *   t = at
+/* EXTUI ar, at, shiftimm (0..31), maskimm (0..15 = width-1).
+ *   Canonical layout:
+ *     bits  0..3  = 0  (op0)
+ *     bits  4..7  = t (= at, source)
+ *     bits  8..11 = sh_lo4
+ *     bits 12..15 = r (= ar, dest)
+ *     bit  16     = sh_hi1
+ *     bits 17..19 = 0b100  (fixed → puts op1's high bit set)
+ *     bits 20..23 = maskimm
+ *   So in RRR fields: op0=0, op1 = 0x8 | sh_hi1, op2 = maskimm.
  */
 u32 xt_extui(xt_emit *e, u8 ar, u8 at, u8 shiftimm, u8 maskimm) {
     assert(shiftimm <= 31);
     assert(maskimm <= 15);
-    u8 op2 = (u8)(0x4 | ((shiftimm >> 4) << 3));
-    return emit24(e, enc_rrr(op2, (u8)(maskimm & 0xF), ar, (u8)(shiftimm & 0xF), at));
+    u8 sh_lo4 = (u8)(shiftimm & 0xF);
+    u8 sh_hi1 = (u8)((shiftimm >> 4) & 1);
+    return emit24(e, enc_rrr((u8)(maskimm & 0xF), (u8)(0x8 | sh_hi1), ar, sh_lo4, at));
 }
 
 u32 xt_raw32(xt_emit *e, u32 word) {

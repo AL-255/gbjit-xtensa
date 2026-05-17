@@ -1,157 +1,120 @@
 # GBJIT-Xtensa — Status
 
-Snapshot of the project at the end of the M1–M3 work block. See `PLAN.md`
-for the full design.
+Snapshot at end of M5 + M6 work block. See `PLAN.md` for the original design.
 
 ## Milestone status
 
 | Milestone | State | Tests |
 |-----------|-------|-------|
 | **M1** — Host scaffolding + SM83 reference interpreter | ✅ done | `interp_smoke` |
-| **M2** — Xtensa LX7 encoder (24-bit ISA subset) | ✅ done | `encoder_smoke`, `encoder_bits`, `xtensa_sim` |
-| **M3** — Naïve JIT (block-based, host-validated) | ✅ done | `jit_differential` |
-| **M4** — ESP32-S3 / ESP-IDF port | ⏳ scaffolded, not built | requires user-side ESP-IDF install |
-| **M5** — JIT optimization passes | ⏳ not started | — |
-| **M6** — SMC / cache-invalidation correctness | ⏳ not started | — |
+| **M2** — Xtensa LX7 encoder (24-bit ISA subset, bit-accurate against canonical encodings) | ✅ done | `encoder_smoke`, `encoder_bits`, `xtensa_sim` |
+| **M3** — Block-based JIT, host-validated through the Xtensa simulator | ✅ done | `jit_differential` |
+| **M4** — ESP32-S3 / ESP-IDF port | ⏸ deferred (per user) | requires ESP-IDF install |
+| **M5** — JIT optimization passes | ✅ done (a–e, see below) | `jit_differential` (3 ROMs) |
+| **M6** — SMC / cache-invalidation correctness | ✅ done | `smc` |
 
-All currently-implemented work is exercised by 5 ctest cases — every one
-passes on the host (`cmake --build build && ctest`).
+6 ctest cases. All pass on the host (`cmake --build build && ctest`).
 
-## What works today
+## What's now JIT-inlined (M5)
 
-- **Reference SM83 interpreter** (`core/sm83_interp.c`)
-  Full opcode coverage including CB-prefix shifts/rotates/bit ops, DAA,
-  conditional jumps/calls/rets, RST, HALT, EI/DI delay, and interrupt
-  service. Used both as a correctness oracle and as the JIT fallback for
-  any opcode the codegen doesn't (yet) inline.
+Every op below produces inline Xtensa code that mutates `cpu_state` directly,
+with no helper call. Everything else falls back to a CALLX0 to the reference
+interpreter, with full PC/cycles sync around the call.
 
-- **MMU stub** (`core/memory.c`)
-  MBC0 only (32 KB single-bank ROM), WRAM, HRAM, VRAM, OAM, and a flat IO
-  byte store. Includes the Blargg-style serial trap (`FF02 = $81` →
-  `serial_sink(FF01)`) so cpu_instrs-class test ROMs can stream their
-  PASS/FAIL output without a real serial peripheral.
+| Op family | Opcodes | Notes |
+|-----------|---------|-------|
+| `NOP` | 0x00 | PC + 1, cycles + 4 |
+| `LD r,n8` | 0x06 0x0E 0x16 0x1E 0x26 0x2E 0x3E | r ∈ {A,B,C,D,E,H,L}; (HL) variant is helper |
+| `LD r,r'` | 0x40..0x7F (no HALT, no `(HL)` either side) | reg ↔ reg copies |
+| `HALT` | 0x76 | sets `cpu->halted`, exits the block |
+| `INC r` / `DEC r` (8-bit) | 0x04 0x0C 0x14 0x1C 0x24 0x2C 0x3C / 0x05 … | eager Z/N/H flags, preserves C |
+| `INC rr` / `DEC rr` (16-bit) | 0x03 0x13 0x23 0x33 / 0x0B 0x1B 0x2B 0x3B | no flag effects; BC/DE/HL/SP |
+| `LD rr,n16` | 0x01 0x11 0x21 0x31 | BC/DE/HL/SP |
+| `ADD A,r` | 0x80..0x87 (no `(HL)`) | eager Z, N=0, H, C |
+| `SUB r` | 0x90..0x97 | eager Z, N=1, H (borrow), C (borrow) |
+| `AND r` | 0xA0..0xA7 | eager Z, N=0, H=1, C=0 |
+| `XOR r` | 0xA8..0xAF | eager Z, N=H=C=0 |
+| `OR  r` | 0xB0..0xB7 | eager Z, N=H=C=0 |
+| `CP  r` | 0xB8..0xBF | A unchanged; eager Z/N/H/C |
 
-- **Xtensa LX7 encoder** (`jit/emit_xtensa.c`)
-  Bit-accurate encodings, verified by `test_encoder_bits.c` against the
-  canonical opcodes from the Xtensa ISA Reference (cross-checked through
-  the ida-xtensa2 disassembler tables). Covers the subset the JIT actually
-  emits:
-  - RRR arithmetic/logical: `ADD SUB AND OR XOR MOV`
-  - RRI8 family: `ADDI MOVI L8UI S8I L16UI S16I L32I S32I`
-  - PC-relative literal load: `L32R`
-  - Control flow: `J JX CALL0 CALLX0 RET BEQZ BNEZ`
-  - Shifts and bit field: `SLLI SRLI SRAI EXTUI`
+Not yet inlined (fall back to `sm83_step` helper):
+- `ADC` / `SBC` (need to read C in the inlined sequence)
+- `INC (HL)` / `DEC (HL)`, `LD (HL),…`, `LD A,(HL)` etc. — anything touching `(HL)`
+- `JR cc,r8`, `JP cc,a16`, `CALL`, `RET`, `RST`, `PUSH/POP`
+- CB-prefix shifts/rotates/`BIT`/`RES`/`SET`
+- `ADD HL,rr`, `LD HL,SP+r8`, `ADD SP,r8`, `DAA`, `CPL`, `SCF`, `CCF`
+- Conditional control flow and stack ops generally
 
-- **Xtensa LX7 mini-simulator** (`jit/xtensa_sim.c`)
-  Host-side executor for JIT output. Decoder is written independently
-  from the encoder (different code path), so a shared encoding bug
-  surfaces immediately rather than silently passing tests. Supports:
-  - Same instruction subset as the encoder
-  - Memory accesses through a host translation callback
-  - L32R via a literal-pool callback
-  - `CALLX0` dispatched to a user-provided thunk (used by the dispatcher
-    to route the JIT's helper calls back to C functions)
+These remain correct (via the helper), they're just slow paths.
 
-- **Code cache + dispatcher** (`jit/codecache.c`, `jit/dispatcher.c`)
-  - Bump-allocator arena. Host port allocates `mmap(PROT_EXEC)`;
-    target port uses `heap_caps_malloc(MALLOC_CAP_EXEC|MALLOC_CAP_INTERNAL)`.
-  - Chained hash table for `gb_pc → gbjit_block` lookup.
-  - `codecache_finalize()` handles icache sync — `__builtin___clear_cache`
-    on host, `esp_cache_msync` on the S3.
-  - On host, blocks execute through the Xtensa sim; on target, the same
-    bytes execute natively via a direct CALL0 invocation.
-
-- **JIT codegen** (`jit/codegen.c`, v0)
-  - Block discovery: walks forward from a guest PC, terminating at any
-    branch/halt/stop or after `MAX_OPS_PER_BLOCK` (32) instructions.
-  - Emits a 4-byte-aligned literal pool followed by Xtensa code.
-  - Per-block prologue allocates a 16-byte stack frame and saves `a0`.
-  - **For every GB op** emits the same sequence:
-    ```
-    L32R    a2,  =cpu_state_ptr     ; reload cpu pointer (caller-saved)
-    L32R    a14, =sm83_step         ; helper address
-    CALLX0  a14                     ; sm83_step(cpu)
-    ```
-  - Epilogue restores `a0` / `a1` and returns.
-
-## Optimization status — what is and isn't applied yet
-
-The v0 codegen is **deliberately un-optimized**: it gives us a working
-pipeline (block discovery → emit → finalize → execute → exit) before any
-work is spent on speed. Compared to a plain interpreter loop, today's JIT
-saves only the per-step dispatcher overhead (one cycle-budget check, one
-hash lookup) for the duration of one block. That's a small win — usually
-< 10% — and intentional.
-
-Concretely:
+## Optimization status
 
 | Optimization (from `PLAN.md` §3) | State |
 |----------------------------------|-------|
-| Block-level translation (basic-block JIT) | ✅ implemented |
-| Static guest→host register mapping in block | ❌ not yet — every op reloads `cpu_state` and calls `sm83_step` |
-| Inlined opcode codegen (LD r,n8 / LD r,r' / NOP / ADD…) | ❌ not yet — placeholder tables `ops_pc/ops_opcode/ops_len` are already collected during discovery, ready for the inlining pass |
-| Eager flag computation in registers | ❌ not yet (interpreter handles flags) |
-| Lazy flags (defer F materialization) | ❌ planned (M5) |
-| Per-flag dead-code elimination | ❌ planned (M5) |
-| Direct block chaining via patchable L32R + JX | ❌ planned (M5) — `gbjit_block::chain_lit_off` field already reserved |
-| Inlined fast-path memory access (page-table check) | ❌ planned (M5) |
-| Code-cache eviction (currently: bump arena, flush all on fill) | ⏳ basic flush-on-full; eviction deferred |
-| Self-modifying-code / cache invalidation | ❌ planned (M6) — assumed code lives in ROM today |
+| Block-level translation (basic-block JIT) | ✅ |
+| Static guest→host register layout per block | ✅ — `a11`=PC, `a12`=cycles_delta, `a13`=cpu_state ptr, `a14/a15` scratch |
+| Eager flag computation in registers | ✅ — for the ALU ops listed above |
+| Inlined opcode codegen (hot ops) | ✅ — coverage above; helper fallback for the rest |
+| Lazy flag materialisation | ❌ planned next |
+| Per-flag dead-code elimination | ❌ planned next |
+| Direct block chaining via patchable L32R + JX (codegen-level) | ⏸ scaffolded (`chain_lit_off`/`n_chain_lit` in `gbjit_block`) but not yet emitted by codegen; pending alongside M4 since the host sim doesn't gain from it |
+| Dispatcher-level "predicted next block" cache | ✅ — measured via `dispatcher.chain_hits` / `chain_misses` |
+| Inlined fast-path memory access | ❌ planned next |
+| Code-cache eviction (currently bump-arena, flush all on fill) | ⏸ |
+| Self-modifying code invalidation | ✅ — see below |
 
-This staged ordering is the point of M3 vs M5: get a *correct* pipeline
-first, then layer optimizations onto it without destabilizing the
-end-to-end flow.
+## SMC invalidation (M6)
 
-## What's needed to finish M4 (the port)
+- 256-byte GB-address page granularity (`GBJIT_SMC_PAGE_COUNT = 256`).
+- On `insert_block`, the block registers on every page it overlaps.
+- `gbjit_dispatcher_invalidate_addr(d, gb_addr)` drops every block whose
+  range overlaps the page containing `gb_addr`, removes them from the
+  bucket table, clears any dangling `predicted_next` pointers, and frees
+  the blocks (the code itself stays in the codecache arena until the next
+  flush — bump-arena semantics).
+- `smc.c` covers two scenarios: (1) compile → invalidate → recompile gives
+  a fresh block, and (2) mid-loop invalidation does not corrupt cpu_state
+  (matches the interpreter's final state exactly).
+- Wiring `mmu_write8` to call `gbjit_dispatcher_invalidate_addr` is left
+  to the dispatcher owner: today, the dispatcher exposes the API but
+  doesn't install a write hook on the MMU. Real games rarely execute from
+  WRAM/HRAM, so the MMU-side wiring is deferred until M4 makes that
+  scenario actually testable on hardware.
 
-`port/esp32s3/` is empty. The host side already compiles the same `core/`
-and `jit/` modules unchanged for the ESP32-S3 target — the only missing
-piece is the ESP-IDF component scaffold (CMakeLists, `app_main`, sdkconfig
-defaults, and the helper-pointer resolver that returns real function
-addresses instead of the host's token values).
+## Encoder corrections (subtle but important)
 
-Blockers on this machine right now:
-- **ESP-IDF v5.x** not installed (`xtensa-esp32s3-elf-gcc` absent).
-- **`qemu-system-xtensa`** not installed (apt: `qemu-system-misc`,
-  needed unless you flash real hardware).
-- **`ccache`**, **`dfu-util`**, **`gdb-multiarch`** also missing from the
-  `sudo apt install` list in `PLAN.md` §6.
+While writing M5, the encoder/sim were both rewritten against the canonical
+Xtensa ISA tables (cross-referenced through ida-xtensa2):
+- `SLLI` — bits 21..23 must be 0 (was 0b001 wrong).
+- `SRAI` — bit 21 fixed = 1, sa_hi1 at bit 20 (the high-shift case was
+  encoded into the wrong nibble).
+- `EXTUI` — maskimm goes in bits 20..23, sh_hi1 at bit 16, bits 17..19
+  fixed at 0b100 (was stuffed into the wrong op1/op2 split).
 
-Once those are in place, the M4 work is mechanical:
-1. `port/esp32s3/main/app_main.c` — initialise the dispatcher, load a
-   built-in ROM blob from flash, loop the dispatcher, print Blargg serial
-   output over `UART0`.
-2. `port/esp32s3/CMakeLists.txt` — ESP-IDF project file that pulls in
-   `core/` and `jit/` as a single component.
-3. `port/esp32s3/sdkconfig.defaults` — Octal PSRAM, CPU @ 240 MHz,
-   release build, USB-CDC console.
-4. `scripts/run-qemu.sh` — wrap `idf.py qemu` so the differential test
-   ROM runs unattended.
+These all passed `test_xtensa_sim` before because the *simulator* shared
+the encoder's bug. The encoder and sim now agree with each other and with
+the canonical ISA — verified bit-for-bit in `test_encoder_bits`.
 
 ## Test inventory
 
 ```
-$ cd build && ctest --output-on-failure
+$ ctest --test-dir build --output-on-failure
     Start 1: interp_smoke           ✓
     Start 2: encoder_smoke          ✓
-    Start 3: encoder_bits           ✓   (28 bit-exact encoder assertions)
-    Start 4: xtensa_sim             ✓   (movi/add, l8ui/s8i, branches, shifts+EXTUI)
-    Start 5: jit_differential       ✓   (full cpu_state match: interp vs JIT-over-sim)
-100% tests passed, 0 tests failed out of 5
+    Start 3: encoder_bits           ✓   28 bit-exact encoder assertions
+    Start 4: xtensa_sim             ✓   sim correctly executes encoder output
+    Start 5: jit_differential       ✓   4 ROMs (smoke, ALU, INC/DEC + 16-bit, loop)
+    Start 6: smc                    ✓   basic invalidation + mid-loop invalidation
+100% tests passed, 0 tests failed out of 6
 ```
 
-## Files of note
+## Next likely work
 
-| Path | Purpose |
-|------|---------|
-| `PLAN.md` | Original design document |
-| `core/sm83_interp.c` | Reference interpreter (oracle + JIT fallback) |
-| `core/sm83_decoder.c` | Static decode tables (length, cycles, terminator flag) |
-| `core/memory.c` | MBC0 MMU + serial sink |
-| `jit/emit_xtensa.c` | Xtensa LX7 encoder, bit-level documented |
-| `jit/xtensa_sim.c` | Independent decoder/simulator for host validation |
-| `jit/codegen.c` | v0 block codegen (CALLX0-per-op pipeline) |
-| `jit/codecache.c` | Executable-memory arena + icache sync |
-| `jit/dispatcher.c` | Block lookup, find-or-compile, host vs target invocation |
-| `port/host_linux/main.c` | CLI driver (`--interp` / `--jit`) for `.gb` files |
-| `tests/test_jit_differential.c` | End-to-end JIT correctness vs interpreter |
+1. **M4 — ESP-IDF port**: ESP-IDF v5.x install + `port/esp32s3/main`; route
+   helper-pointer resolver to real `&sm83_step` / `&mmu_read8` /
+   `&mmu_write8`; wire the codegen-level chaining JX. `qemu-system-xtensa`
+   is now available for headless testing.
+2. **More inline coverage**: `ADC`/`SBC`, control flow (`JR cc`, `JP`),
+   PUSH/POP, `(HL)` memory accesses with a fast-path WRAM/HRAM check.
+3. **Lazy flag materialisation**: huge win for arithmetic-heavy code where
+   the F register is overwritten before being read.

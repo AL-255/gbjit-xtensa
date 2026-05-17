@@ -219,49 +219,44 @@ static void step(xt_sim *s) {
             }
         }
 
-        /* Shifts: op1 == 1. */
+        /* Shifts (canonical encoding):
+         *   SLLI: op1=1, bits 21..23 = 0, sa_hi1 at bit 20.
+         *         → op2 ∈ {0, 1}; sa1 = (op2 << 4) | t; sa = 32 - sa1.
+         *   SRAI: op1=1, bit 21 = 1, bits 22..23 = 0, sa_hi1 at bit 20.
+         *         → op2 ∈ {2, 3}; sa = ((op2 & 1) << 4) | s.
+         *   SRLI: op1=1, op2=4. sa = s (0..15), source = t.
+         */
         if (op1 == 0x1) {
-            /* SLLI: op2 ∈ {0x1, 0x9}; sa1 = ((op2 >> 3) << 4) | t; sa = 32 - sa1 */
-            if ((op2 & ~0x8) == 0x1) {
-                u32 sa1 = (((op2 >> 3) & 1) << 4) | t;
+            if (op2 == 0x0 || op2 == 0x1) {
+                u32 sa1 = ((u32)op2 << 4) | t;
                 u32 sa = 32u - sa1;
-                if (sa == 0) s->a[r] = s->a[sr];
-                else s->a[r] = (sa >= 32) ? 0 : (s->a[sr] << sa);
+                s->a[r] = (sa >= 32) ? 0 : (s->a[sr] << sa);
                 return;
             }
-            /* SRAI: op2 ∈ {0x2, 0xA}; sa = (((op2>>3)<<4) | s) */
-            if ((op2 & ~0x8) == 0x2) {
-                u32 sa = (((op2 >> 3) & 1) << 4) | sr;
+            if (op2 == 0x2 || op2 == 0x3) {
+                u32 sa = (((u32)op2 & 1) << 4) | sr;
                 i32 v = (i32)s->a[t];
                 s->a[r] = (sa >= 32) ? (u32)(v >> 31) : (u32)(v >> sa);
                 return;
             }
-            /* SRLI: op2 = 0x4, sa in s field (0..15), t = source. */
             if (op2 == 0x4) {
                 u32 sa = sr;
                 s->a[r] = s->a[t] >> sa;
                 return;
             }
-            /* EXTUI: op2 ∈ {0x4, 0xC}; shiftimm = (((op2>>3)<<4) | s); maskimm = op1;
-             * NOTE: we already saw op1=1 means shifts; for EXTUI op1 = maskimm so
-             * op1 can be 0..15. This branch is only entered for op1=1 (i.e.
-             * mask=1 → extract 2 bits). So distinguish EXTUI from SRLI by
-             * op2 having bit 3 considered, AND by op1 in [0..15].
-             *
-             * To avoid this clash we re-check the broader op1 range below. */
         }
 
-        /* EXTUI: op0=0, op2 = 0x4 | (sh_hi1<<3), op1 = maskimm (0..15).
-         * Could also alias with SRLI (op2=0x4, op1=1) — but EXTUI generally has
-         * op1 != 1 OR we can disambiguate by maskimm conventions. The encoder
-         * never emits SRLI with sa==1 (use SLLI for that — different op).
-         * The dispatch above already returned for op1==0/1; reach here for
-         * op1 in 2..15 — that's unambiguously EXTUI. */
-        {
-            u32 sh = (((op2 >> 3) & 1) << 4) | sr;
-            u32 width = (u32)op1 + 1u;
+        /* EXTUI (canonical): op0=0, bits 17..19 = 0b100 → op1 has high bit set.
+         * In RRR-field terms: op1 = 0b100x where x = sh_hi1.
+         *   shiftimm = (sh_hi1 << 4) | sh_lo4   (sh_lo4 in s field)
+         *   maskimm  = op2 (0..15, width-1)
+         *   src      = t, dst = r.                                          */
+        if ((op1 & 0xE) == 0x8) {
+            u32 sh_hi1 = op1 & 1;
+            u32 shift = (sh_hi1 << 4) | sr;
+            u32 width = (u32)op2 + 1u;
             u32 mask = (width == 32) ? 0xFFFFFFFFu : ((1u << width) - 1u);
-            s->a[r] = (s->a[t] >> sh) & mask;
+            s->a[r] = (s->a[t] >> shift) & mask;
             return;
         }
     }

@@ -5,19 +5,32 @@
 #include "cpu_state.h"
 #include "codecache.h"
 
-/* Helper IDs used by the codegen — these are 32-bit "tokens" placed in the
- * literal pool. On the ESP32-S3 target the tokens ARE the helper function
- * addresses (so CALLX0 calls them directly). On the host they are small
- * integers and the xt_sim dispatches them via a thunk. The codegen never
- * cares which — it just uses helper_addr() callback. */
+/* Tokens placed in a block's literal pool. The codegen treats all of these
+ * as opaque 32-bit values; the dispatcher (host or target) decides what they
+ * mean.
+ *
+ *   ADDR_*  literals hold base addresses used as a target for L32R + memory
+ *           access (cpu_state and mmu structs). On the host these are
+ *           "sentinels" recognised by the xt_sim translate callback; on the
+ *           ESP32-S3 target they are the real physical pointers.
+ *
+ *   HELPER_* literals hold function targets for CALLX0. On the host the sim
+ *           routes them through a thunk; on the target the CPU calls them
+ *           directly.                                                       */
 typedef enum {
-    HELPER_SM83_STEP = 0,
+    ADDR_CPU_BASE = 0,
+    ADDR_MMU_BASE,
+    HELPER_SM83_STEP,
     HELPER_MMU_READ8,
     HELPER_MMU_WRITE8,
-    HELPER_COUNT
-} helper_id;
+    LITERAL_COUNT
+} literal_id;
 
-typedef u32 (*jit_helper_addr_fn)(helper_id id);
+/* For backwards-compat readability. */
+typedef literal_id helper_id;
+#define HELPER_COUNT LITERAL_COUNT
+
+typedef u32 (*jit_helper_addr_fn)(literal_id id, void *user);
 
 typedef struct gbjit_block {
     u16  gb_pc_start;
@@ -30,12 +43,20 @@ typedef struct gbjit_block {
      * function pointers. Patched when the target block is compiled. */
     u32 *chain_lit_off;
     u32  n_chain_lit;
+    /* Soft "predicted-next" cache (host fast-path). When a block falls
+     * through, the dispatcher updates this to the next block's pointer; on
+     * subsequent executions of *this* block, the dispatcher skips the hash
+     * lookup if cpu->pc matches `predicted_next_pc`. */
+    struct gbjit_block *predicted_next;
+    u16                 predicted_next_pc;
 } gbjit_block;
 
 /* Compile from `pc` for one basic block. Allocates from `cc`. `helper_addr`
- * is the function-pointer resolver for CALLX0 targets. Returns NULL on error. */
+ * is the literal-pool resolver. `user` is passed through to it. Returns NULL
+ * on error. */
 gbjit_block *gbjit_compile_block(codecache *cc, cpu_state *cpu, u16 pc,
-                                  jit_helper_addr_fn helper_addr);
+                                  jit_helper_addr_fn helper_addr,
+                                  void *user);
 
 void gbjit_block_free(gbjit_block *b);
 
