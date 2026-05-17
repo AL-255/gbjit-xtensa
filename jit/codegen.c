@@ -67,7 +67,41 @@
  * Round up to 96 to leave headroom for future inlining additions. */
 #define BYTES_PER_OP 96
 #define PROLOGUE_EPILOGUE_BYTES 128
-#define LITERAL_POOL_BYTES (LITERAL_COUNT * 4)
+/* Extra literal slots reserved per block for inline ops that need a
+ * precomputed 32-bit constant (typically a host pointer into mmu state). */
+#define MAX_EXTRA_LITERALS 32
+#define LITERAL_POOL_BYTES ((LITERAL_COUNT + MAX_EXTRA_LITERALS) * 4)
+
+/* Runtime-allocated literal pool slot tracker. */
+typedef struct {
+    u8 *base;
+    u32 next_off;   /* next free byte offset within `base` */
+    u32 limit;      /* end of pool (exclusive) */
+} lit_ctx;
+
+static i32 lit_alloc_u32(lit_ctx *L, u32 value) {
+    if (L->next_off + 4 > L->limit) return -1;
+    u32 off = L->next_off;
+    L->base[off + 0] = (u8)(value & 0xFFu);
+    L->base[off + 1] = (u8)((value >> 8) & 0xFFu);
+    L->base[off + 2] = (u8)((value >> 16) & 0xFFu);
+    L->base[off + 3] = (u8)((value >> 24) & 0xFFu);
+    L->next_off += 4;
+    return (i32)off;
+}
+
+/* Compute the target byte address (= literal value) for a GB memory access
+ * at known address `addr`, if it falls in a JIT-inlinable region (WRAM or
+ * HRAM). Returns 0 if not inlinable. */
+static u32 inlinable_byte_addr(u32 mmu_base, u16 addr) {
+    if (addr >= 0xC000u && addr < 0xE000u) {
+        return mmu_base + (u32)offsetof(mmu, wram) + (u32)(addr - 0xC000u);
+    }
+    if (addr >= 0xFF80u && addr < 0xFFFFu) {
+        return mmu_base + (u32)offsetof(mmu, hram) + (u32)(addr - 0xFF80u);
+    }
+    return 0;
+}
 
 /* L32R helper: encode a load of the literal at `lit_off` into reg `at` when
  * the L32R instruction itself lives at `pc_off`, both being offsets from the
@@ -238,9 +272,19 @@ static void emit_cflag_from_bit8(xt_emit *e, u8 sum_reg, u8 dst_reg, u8 scratch)
     xt_or(e, dst_reg, dst_reg, scratch);
 }
 
+/* Context passed to inline_op so inlined paths can resolve mmu pointers
+ * via the literal pool and emit L32R at the right PC offset. */
+typedef struct {
+    mmu *m;
+    lit_ctx *L;
+    u32 entry_off;
+    u32 mmu_base_value;
+} inline_ctx;
+
 /* Try to inline a GB op. Returns true on success, false to request the
  * helper-fallback path. */
-static bool inline_op(xt_emit *e, u8 opcode, u16 pc, mmu *m) {
+static bool inline_op(xt_emit *e, u8 opcode, u16 pc, inline_ctx *ictx) {
+    mmu *m = ictx->m;
     (void)pc;
     /* NOP */
     if (opcode == 0x00) { emit_advance(e, 1, 4); return true; }
@@ -457,6 +501,58 @@ static bool inline_op(xt_emit *e, u8 opcode, u16 pc, mmu *m) {
         return true;
     }
 
+    /* --- LD A, (a16) (0xFA) / LD (a16), A (0xEA) — absolute 16-bit address.
+     *
+     * Inlined only if a16 lands in a region whose byte storage is just a
+     * flat array on the mmu struct (WRAM or HRAM). IO writes (FF00..FF7F)
+     * stay on the helper because they carry side-effects (serial trap,
+     * timer regs, IF/IE, etc.). Region-check is fully resolved at codegen
+     * time — no runtime branch. */
+    if (opcode == 0xFA || opcode == 0xEA) {
+        u8 lo = m->rom[(pc + 1) & 0x7FFFu];
+        u8 hi = m->rom[(pc + 2) & 0x7FFFu];
+        u16 a16 = (u16)(lo | (hi << 8));
+        u32 byte_addr = inlinable_byte_addr(ictx->mmu_base_value, a16);
+        if (!byte_addr) return false;          /* IO / VRAM / ECHO → helper */
+        i32 lit_off = lit_alloc_u32(ictx->L, byte_addr);
+        if (lit_off < 0) return false;         /* pool full → helper */
+        u32 pc_off = ictx->entry_off + e->len;
+        emit_l32r_at(e, 2, (u32)lit_off, pc_off);
+        if (opcode == 0xFA) {                  /* LD A,(a16) */
+            xt_l8ui(e, 3, 2, 0);
+            xt_s8i(e, 3, 13, OFF_A);
+        } else {                               /* LD (a16),A */
+            xt_l8ui(e, 3, 13, OFF_A);
+            xt_s8i(e, 3, 2, 0);
+        }
+        emit_advance(e, 3, 16);
+        return true;
+    }
+
+    /* --- LDH (n8), A (0xE0)  /  LDH A, (n8) (0xF0).
+     * GB address = 0xFF00 | n8. Only inline when n8 ≥ 0x80 (HRAM range);
+     * leave IO accesses (0xFF00..0xFF7F) on the helper. */
+    if (opcode == 0xE0 || opcode == 0xF0) {
+        u8 n8 = m->rom[(pc + 1) & 0x7FFFu];
+        if (n8 < 0x80) return false;
+        u16 a16 = (u16)(0xFF00u | n8);
+        u32 byte_addr = inlinable_byte_addr(ictx->mmu_base_value, a16);
+        if (!byte_addr) return false;
+        i32 lit_off = lit_alloc_u32(ictx->L, byte_addr);
+        if (lit_off < 0) return false;
+        u32 pc_off = ictx->entry_off + e->len;
+        emit_l32r_at(e, 2, (u32)lit_off, pc_off);
+        if (opcode == 0xF0) {                  /* LDH A,(n8) */
+            xt_l8ui(e, 3, 2, 0);
+            xt_s8i(e, 3, 13, OFF_A);
+        } else {                               /* LDH (n8),A */
+            xt_l8ui(e, 3, 13, OFF_A);
+            xt_s8i(e, 3, 2, 0);
+        }
+        emit_advance(e, 2, 12);
+        return true;
+    }
+
     /* --- LD rr, n16 — 0x01 BC, 0x11 DE, 0x21 HL, 0x31 SP. */
     if (opcode == 0x01 || opcode == 0x11 || opcode == 0x21 || opcode == 0x31) {
         u8 pair = (opcode >> 4) & 3;
@@ -483,6 +579,79 @@ static bool inline_op(xt_emit *e, u8 opcode, u16 pc, mmu *m) {
         return true;
     }
 
+    /* --- ALU operand-in-`a3` body (factored from `ALU A,r` and `ALU A,n8`).
+     * Caller arranges a2=A and a3=operand and supplies the group (0..7
+     * matching the standard SM83 encoding: 0=ADD 1=ADC 2=SUB 3=SBC
+     * 4=AND 5=XOR 6=OR 7=CP). Returns false if the group is unsupported
+     * (ADC/SBC currently not inlined). On success the function writes the
+     * new A (except for CP) and a fresh F. */
+    /* Forward declare via a sentinel return; see end of function. */
+#define ALU_INLINE(group_var)                                              \
+    do {                                                                    \
+        u8 _grp = (group_var);                                              \
+        if (_grp == 1 || _grp == 3) return false;                           \
+        u8 _f = 6;                                                          \
+        xt_movi(e, _f, 0);                                                  \
+        switch (_grp) {                                                     \
+            case 0: /* ADD */                                                \
+                xt_add(e, 4, 2, 3);                                         \
+                xt_extui(e, 5, 4, 0, 7);                                    \
+                xt_s8i(e, 5, 13, OFF_A);                                    \
+                emit_zflag(e, 5, _f, 7);                                    \
+                emit_hflag_add(e, 2, 3, _f, 7, 8);                          \
+                emit_cflag_from_bit8(e, 4, _f, 7);                          \
+                break;                                                      \
+            case 2: /* SUB */                                                \
+                xt_sub(e, 4, 2, 3);                                         \
+                xt_extui(e, 5, 4, 0, 7);                                    \
+                xt_s8i(e, 5, 13, OFF_A);                                    \
+                emit_zflag(e, 5, _f, 7);                                    \
+                emit_setflag_const(e, _f, FLAG_N, 7);                       \
+                emit_hflag_sub(e, 2, 3, _f, 7, 8);                          \
+                emit_cflag_from_bit8(e, 4, _f, 7);                          \
+                break;                                                      \
+            case 4: /* AND */                                                \
+                xt_and(e, 5, 2, 3);                                         \
+                xt_s8i(e, 5, 13, OFF_A);                                    \
+                emit_zflag(e, 5, _f, 7);                                    \
+                emit_setflag_const(e, _f, FLAG_H, 7);                       \
+                break;                                                      \
+            case 5: /* XOR */                                                \
+                xt_xor(e, 5, 2, 3);                                         \
+                xt_s8i(e, 5, 13, OFF_A);                                    \
+                emit_zflag(e, 5, _f, 7);                                    \
+                break;                                                      \
+            case 6: /* OR */                                                 \
+                xt_or(e, 5, 2, 3);                                          \
+                xt_s8i(e, 5, 13, OFF_A);                                    \
+                emit_zflag(e, 5, _f, 7);                                    \
+                break;                                                      \
+            case 7: /* CP — like SUB but no A write */                       \
+                xt_sub(e, 4, 2, 3);                                         \
+                xt_extui(e, 5, 4, 0, 7);                                    \
+                emit_zflag(e, 5, _f, 7);                                    \
+                emit_setflag_const(e, _f, FLAG_N, 7);                       \
+                emit_hflag_sub(e, 2, 3, _f, 7, 8);                          \
+                emit_cflag_from_bit8(e, 4, _f, 7);                          \
+                break;                                                      \
+            default: return false;                                          \
+        }                                                                   \
+        xt_s8i(e, _f, 13, OFF_F);                                           \
+    } while (0)
+
+    /* --- ALU A,n8 — 0xC6 ADD, 0xCE ADC, 0xD6 SUB, 0xDE SBC,
+     *                0xE6 AND, 0xEE XOR, 0xF6 OR,  0xFE CP. */
+    if (opcode == 0xC6 || opcode == 0xCE || opcode == 0xD6 || opcode == 0xDE ||
+        opcode == 0xE6 || opcode == 0xEE || opcode == 0xF6 || opcode == 0xFE) {
+        u8 imm = m->rom[(pc + 1) & 0x7FFFu];
+        u8 group = (opcode >> 3) & 0x7;
+        xt_l8ui(e, 2, 13, OFF_A);
+        xt_movi(e, 3, (i32)imm);
+        ALU_INLINE(group);
+        emit_advance(e, 2, 8);
+        return true;
+    }
+
     /* --- ALU A,r — 0x80..0xBF.
      *
      * Layout: opcodes 0x80+r..0x87+r form a group of 8 (one per source reg).
@@ -498,77 +667,16 @@ static bool inline_op(xt_emit *e, u8 opcode, u16 pc, mmu *m) {
      *   0xB8..0xBF CP  r
      */
     if (opcode >= 0x80 && opcode <= 0xBF) {
-        u8 group = (opcode >> 3) & 0x7;   /* 0..7 → ADD..CP */
+        u8 group = (opcode >> 3) & 0x7;
         u8 src   = opcode & 7;
-        if (src == 6) return false;       /* (HL) variant: helper */
-        if (group == 1 || group == 3) return false; /* ADC/SBC not yet inlined */
+        if (src == 6) return false;     /* (HL) variant: helper */
         int src_off = reg8_offset(src);
 
-        /* Load operands. a2=A, a3=r. For A,A skip the second load. */
         xt_l8ui(e, 2, 13, OFF_A);
         if (src == 7) xt_mov(e, 3, 2);
         else          xt_l8ui(e, 3, 13, (u32)src_off);
 
-        u8 a6_dst = 6;  /* F accumulator */
-        xt_movi(e, a6_dst, 0);
-
-        switch (group) {
-            case 0: /* ADD */ {
-                xt_add(e, 4, 2, 3);                 /* a4 = full sum */
-                xt_extui(e, 5, 4, 0, 7);            /* a5 = sum & 0xFF (new A) */
-                xt_s8i(e, 5, 13, OFF_A);
-                emit_zflag(e, 5, a6_dst, 7);
-                /* N = 0 — already 0 */
-                emit_hflag_add(e, 2, 3, a6_dst, 7, 8);
-                emit_cflag_from_bit8(e, 4, a6_dst, 7);
-                break;
-            }
-            case 2: /* SUB */ {
-                xt_sub(e, 4, 2, 3);                 /* a4 = signed difference */
-                xt_extui(e, 5, 4, 0, 7);
-                xt_s8i(e, 5, 13, OFF_A);
-                emit_zflag(e, 5, a6_dst, 7);
-                emit_setflag_const(e, a6_dst, FLAG_N, 7);
-                emit_hflag_sub(e, 2, 3, a6_dst, 7, 8);
-                /* C: bit 8 of (a4) is 1 iff A < r (negative result) */
-                emit_cflag_from_bit8(e, 4, a6_dst, 7);
-                break;
-            }
-            case 4: /* AND */ {
-                xt_and(e, 5, 2, 3);
-                xt_s8i(e, 5, 13, OFF_A);
-                emit_zflag(e, 5, a6_dst, 7);
-                emit_setflag_const(e, a6_dst, FLAG_H, 7);  /* AND always sets H */
-                break;
-            }
-            case 5: /* XOR */ {
-                xt_xor(e, 5, 2, 3);
-                xt_s8i(e, 5, 13, OFF_A);
-                emit_zflag(e, 5, a6_dst, 7);
-                /* N=0, H=0, C=0 */
-                break;
-            }
-            case 6: /* OR */ {
-                xt_or(e, 5, 2, 3);
-                xt_s8i(e, 5, 13, OFF_A);
-                emit_zflag(e, 5, a6_dst, 7);
-                /* N=0, H=0, C=0 */
-                break;
-            }
-            case 7: /* CP — like SUB but doesn't write A */ {
-                xt_sub(e, 4, 2, 3);
-                xt_extui(e, 5, 4, 0, 7);
-                /* (no S8I) */
-                emit_zflag(e, 5, a6_dst, 7);
-                emit_setflag_const(e, a6_dst, FLAG_N, 7);
-                emit_hflag_sub(e, 2, 3, a6_dst, 7, 8);
-                emit_cflag_from_bit8(e, 4, a6_dst, 7);
-                break;
-            }
-            default: return false;
-        }
-
-        xt_s8i(e, a6_dst, 13, OFF_F);
+        ALU_INLINE(group);
         emit_advance(e, 1, 4);
         return true;
     }
@@ -603,7 +711,8 @@ gbjit_block *gbjit_compile_block(codecache *cc, cpu_state *cpu, u16 pc_start,
     if (!base) return NULL;
     memset(base, 0, total);
 
-    /* Literal pool layout: one u32 per literal_id, in order. */
+    /* Literal pool layout: one u32 per literal_id at fixed offsets, followed
+     * by MAX_EXTRA_LITERALS slots reserved for dynamic per-access literals. */
     u32 lit_off[LITERAL_COUNT];
     u32 wp = 0;
     for (literal_id l = 0; l < LITERAL_COUNT; l++) {
@@ -615,8 +724,11 @@ gbjit_block *gbjit_compile_block(codecache *cc, cpu_state *cpu, u16 pc_start,
         base[wp + 3] = (u8)((v >> 24) & 0xFF);
         wp += 4;
     }
+    lit_ctx L = { base, wp, wp + (u32)(MAX_EXTRA_LITERALS * 4) };
+    wp = L.limit;
     wp = align_up_4(wp);
     u32 entry_off = wp;
+    u32 mmu_base_value = helper_addr(ADDR_MMU_BASE, user);
 
     xt_emit e;
     xt_init(&e, base + entry_off, total - entry_off);
@@ -642,7 +754,8 @@ gbjit_block *gbjit_compile_block(codecache *cc, cpu_state *cpu, u16 pc_start,
         u8 opcode = ops_opcode[i];
         u16 op_pc = ops_pc[i];
 
-        if (inline_op(&e, opcode, op_pc, cpu->mmu)) {
+        inline_ctx ictx = { cpu->mmu, &L, entry_off, mmu_base_value };
+        if (inline_op(&e, opcode, op_pc, &ictx)) {
             /* Any terminator op (HALT/JR/JP/...) — once inlined the block
              * has already set PC + cycles itself, so we can break out and
              * skip straight to the epilogue. */

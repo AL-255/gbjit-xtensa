@@ -37,6 +37,18 @@ static const uint8_t ROM_ALU[] = {
     0x76,                   /* HALT */
 };
 
+/* Memory ROM — exercises inlined LD (a16),A / LD A,(a16) / LDH for WRAM and HRAM. */
+static const uint8_t ROM_MEM[] = {
+    0x3E, 0x42,             /* LD A,$42 */
+    0xEA, 0x00, 0xC1,       /* LD (C100),A */
+    0x3E, 0x00,             /* LD A,$00 */
+    0xFA, 0x00, 0xC1,       /* LD A,(C100) */
+    0xE0, 0x80,             /* LDH (FF80),A */
+    0x3E, 0xAA,             /* LD A,$AA */
+    0xF0, 0x80,             /* LDH A,(FF80) */
+    0x76,                   /* HALT */
+};
+
 /* Fibonacci ROM — exercises the inlined JR cc loop. After 8 iterations
  * starting from a=0,b=1, A=fib(8)=21 ($15), B=fib(7)=13 ($0D). */
 static const uint8_t ROM_FIB[] = {
@@ -119,6 +131,15 @@ void app_main(void) {
             .rom = ROM_ALU, .rom_len = sizeof(ROM_ALU),
             .exp_a = 0x00, .exp_f = 0x70, .exp_b = 0x13,
             .exp_pc = 0x010B, .exp_cycles = 44,
+        },
+        {
+            /* mem: A round-trips $42 through WRAM and HRAM.
+             * ROM is 17 bytes (PC = $100 + 17 = $111 after HALT).
+             * Cycles: 8+16+8+16+12+8+12+4 = 84. */
+            .name = "mem",
+            .rom = ROM_MEM, .rom_len = sizeof(ROM_MEM),
+            .exp_a = 0x42, .exp_f = 0xB0 /* F unchanged from reset */, .exp_b = 0x00,
+            .exp_pc = 0x0111, .exp_cycles = 84,
         },
         {
             .name = "fib",

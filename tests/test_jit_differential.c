@@ -106,6 +106,30 @@ int main(void) {
     run_jit   (alu_prog, sizeof(alu_prog), &cpu_j2, &m_j2);
     check_match("alu rom", &cpu_i2, &cpu_j2);
 
+    /* Memory ROM — exercises inlined LD A,(a16), LD (a16),A, LDH for both
+     * WRAM ($C100) and HRAM ($FF80). */
+    static const u8 mem_prog[] = {
+        0x3E, 0x42,             /* LD A,$42 */
+        0xEA, 0x00, 0xC1,       /* LD (C100),A */
+        0x3E, 0x00,             /* LD A,$00 */
+        0xFA, 0x00, 0xC1,       /* LD A,(C100) */
+        0xE0, 0x80,             /* LDH (FF80),A */
+        0x3E, 0xAA,             /* LD A,$AA  (clobber) */
+        0xF0, 0x80,             /* LDH A,(FF80)  → A back to $42 */
+        0x76,                   /* HALT */
+    };
+    static cpu_state cpu_im, cpu_jm;
+    static mmu m_im, m_jm;
+    run_interp(mem_prog, sizeof(mem_prog), &cpu_im, &m_im);
+    run_jit   (mem_prog, sizeof(mem_prog), &cpu_jm, &m_jm);
+    check_match("mem rom", &cpu_im, &cpu_jm);
+    if (cpu_jm.a != 0x42 || m_jm.wram[0x100] != 0x42 || m_jm.hram[0] != 0x42) {
+        fprintf(stderr,
+                "FAIL mem end: A=%02X wram[$100]=%02X hram[0]=%02X\n",
+                cpu_jm.a, m_jm.wram[0x100], m_jm.hram[0]);
+        failed++;
+    }
+
     /* Fibonacci ROM — exercises the inlined JR cc loop, INC/DEC flags, and
      * cross-iteration register state. After 8 iterations starting from
      * a=0,b=1, A=fib(8)=21 ($15), B=fib(7)=13 ($0D), C=0. */
