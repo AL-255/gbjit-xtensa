@@ -783,7 +783,6 @@ static bool inline_op(xt_emit *e, u8 opcode, u16 pc, inline_ctx *ictx) {
 #define ALU_INLINE(group_var)                                              \
     do {                                                                    \
         u8 _grp = (group_var);                                              \
-        if (_grp == 1 || _grp == 3) return false;                           \
         u8 _f = 6;                                                          \
         xt_movi(e, _f, 0);                                                  \
         switch (_grp) {                                                     \
@@ -795,6 +794,29 @@ static bool inline_op(xt_emit *e, u8 opcode, u16 pc, inline_ctx *ictx) {
                 emit_hflag_add(e, 2, 3, _f, 7, 8);                          \
                 emit_cflag_from_bit8(e, 4, _f, 7);                          \
                 break;                                                      \
+            case 1: /* ADC */ {                                              \
+                /* a7 = old C bit (extracted from F). */                    \
+                xt_l8ui(e, 7, 13, OFF_F);                                   \
+                xt_extui(e, 7, 7, 4, 0);                                    \
+                xt_add(e, 4, 2, 3);                                         \
+                xt_add(e, 4, 4, 7);            /* full sum = A + r + C */   \
+                xt_extui(e, 5, 4, 0, 7);                                    \
+                xt_s8i(e, 5, 13, OFF_A);                                    \
+                emit_zflag(e, 5, _f, 8);                                    \
+                /* H = bit 4 of (lo(A) + lo(r) + C). */                     \
+                xt_extui(e, 8, 2, 0, 3);                                    \
+                xt_extui(e, 9, 3, 0, 3);                                    \
+                xt_add(e, 8, 8, 9);                                         \
+                xt_add(e, 8, 8, 7);                                         \
+                xt_extui(e, 8, 8, 4, 0);                                    \
+                xt_slli(e, 8, 8, 5);                                        \
+                xt_or(e, _f, _f, 8);                                        \
+                /* C = bit 8 of full sum. */                                \
+                xt_extui(e, 8, 4, 8, 0);                                    \
+                xt_slli(e, 8, 8, 4);                                        \
+                xt_or(e, _f, _f, 8);                                        \
+                break;                                                      \
+            }                                                               \
             case 2: /* SUB */                                                \
                 xt_sub(e, 4, 2, 3);                                         \
                 xt_extui(e, 5, 4, 0, 7);                                    \
@@ -804,6 +826,29 @@ static bool inline_op(xt_emit *e, u8 opcode, u16 pc, inline_ctx *ictx) {
                 emit_hflag_sub(e, 2, 3, _f, 7, 8);                          \
                 emit_cflag_from_bit8(e, 4, _f, 7);                          \
                 break;                                                      \
+            case 3: /* SBC */ {                                              \
+                xt_l8ui(e, 7, 13, OFF_F);                                   \
+                xt_extui(e, 7, 7, 4, 0);                                    \
+                xt_sub(e, 4, 2, 3);                                         \
+                xt_sub(e, 4, 4, 7);                                         \
+                xt_extui(e, 5, 4, 0, 7);                                    \
+                xt_s8i(e, 5, 13, OFF_A);                                    \
+                emit_zflag(e, 5, _f, 8);                                    \
+                emit_setflag_const(e, _f, FLAG_N, 8);                       \
+                /* H = bit 4 of (lo(A) - lo(r) - C). */                     \
+                xt_extui(e, 8, 2, 0, 3);                                    \
+                xt_extui(e, 9, 3, 0, 3);                                    \
+                xt_sub(e, 8, 8, 9);                                         \
+                xt_sub(e, 8, 8, 7);                                         \
+                xt_extui(e, 8, 8, 4, 0);                                    \
+                xt_slli(e, 8, 8, 5);                                        \
+                xt_or(e, _f, _f, 8);                                        \
+                /* C = bit 8 of full diff. */                               \
+                xt_extui(e, 8, 4, 8, 0);                                    \
+                xt_slli(e, 8, 8, 4);                                        \
+                xt_or(e, _f, _f, 8);                                        \
+                break;                                                      \
+            }                                                               \
             case 4: /* AND */                                                \
                 xt_and(e, 5, 2, 3);                                         \
                 xt_s8i(e, 5, 13, OFF_A);                                    \
@@ -850,7 +895,6 @@ static bool inline_op(xt_emit *e, u8 opcode, u16 pc, inline_ctx *ictx) {
      * Same WRAM fast-path / helper-fallback pattern as LD r,(HL). */
     if ((opcode >= 0x86 && opcode <= 0xBE) && ((opcode & 7) == 6)) {
         u8 group = (opcode >> 3) & 0x7;
-        if (group == 1 || group == 3) return false;   /* ADC/SBC: helper */
 
         u32 wram_base_minus_C000 =
             ictx->mmu_base_value + (u32)offsetof(mmu, wram) - 0xC000u;
