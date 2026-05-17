@@ -279,6 +279,7 @@ typedef struct {
     lit_ctx *L;
     u32 entry_off;
     u32 mmu_base_value;
+    const u32 *lit_off;        /* fixed-literal offsets (LITERAL_COUNT entries) */
 } inline_ctx;
 
 /* Try to inline a GB op. Returns true on success, false to request the
@@ -300,6 +301,74 @@ static bool inline_op(xt_emit *e, u8 opcode, u16 pc, inline_ctx *ictx) {
         xt_movi(e, 2, (i32)imm);
         xt_s8i(e, 2, 13, (u32)off);
         emit_advance(e, 2, 8);
+        return true;
+    }
+
+    /* --- LD r, (HL) (0x46, 0x4E, 0x56, 0x5E, 0x66, 0x6E, 0x7E) and
+     *     LD (HL), r (0x70..0x77 except 0x76) with WRAM fast-path.
+     *
+     * Real GB code hits (HL) constantly. Helper fallback through sm83_step
+     * is several us per access. Inline a runtime range check: if HL is in
+     * WRAM ($C000..$DFFF), load/store directly from cpu->mmu->wram[]; else
+     * branch to the helper fallback.
+     *
+     * (HRAM-via-(HL) is rare and the range check is more complex, so we
+     * skip that branch and just send HRAM accesses to the helper.) */
+    if ((opcode >= 0x46 && opcode <= 0x7E && (opcode & 7) == 6 && opcode != 0x76) ||
+        (opcode >= 0x70 && opcode <= 0x77 && opcode != 0x76)) {
+        bool is_load = (opcode & 0xF8) != 0x70;
+        u8 reg_idx = is_load ? ((opcode >> 3) & 7) : (opcode & 7);
+        int reg_off = reg8_offset(reg_idx);
+        if (reg_off < 0) return false;
+
+        /* WRAM-base literal: mmu_base + offsetof(mmu, wram) - 0xC000.
+         * Adding HL to this value yields the real byte pointer for any HL
+         * in [0xC000, 0xE000). */
+        u32 wram_base_minus_C000 =
+            ictx->mmu_base_value + (u32)offsetof(mmu, wram) - 0xC000u;
+        i32 wram_lit = lit_alloc_u32(ictx->L, wram_base_minus_C000);
+        if (wram_lit < 0) return false;
+
+        /* Load HL. */
+        xt_l16ui(e, 3, 13, OFF_HL);
+
+        /* WRAM range check: (HL >> 13) == 0b110 = 6. */
+        xt_extui(e, 4, 3, 13, 2);
+        xt_addi(e, 4, 4, -6);
+
+        /* Branch to slow path if NOT in WRAM. */
+        u32 br_to_slow = e->len;
+        xt_bnez(e, 4, 4);   /* placeholder offset */
+
+        /* --- Fast path --- */
+        u32 pc_off = ictx->entry_off + e->len;
+        emit_l32r_at(e, 5, (u32)wram_lit, pc_off);
+        xt_add(e, 4, 5, 3);              /* a4 = wram_base - 0xC000 + HL */
+        if (is_load) {
+            xt_l8ui(e, 2, 4, 0);
+            xt_s8i(e, 2, 13, (u32)reg_off);
+        } else {
+            xt_l8ui(e, 2, 13, (u32)reg_off);
+            xt_s8i(e, 2, 4, 0);
+        }
+        /* Advance for fast path. */
+        xt_addi(e, 11, 11, 1);
+        xt_addi(e, 12, 12, 8);
+
+        /* Jump to end (skip slow path). */
+        u32 j_to_end = e->len;
+        xt_j(e, 4);
+
+        /* --- Slow path: standard helper invocation. --- */
+        u32 slow_pos = e->len;
+        emit_sync_state(e);
+        xt_mov(e, 2, 13);
+        emit_callx0_helper(e, ictx->lit_off[HELPER_SM83_STEP], ictx->entry_off);
+        emit_reload_state(e, ictx->lit_off[ADDR_CPU_BASE], ictx->entry_off);
+
+        u32 end_pos = e->len;
+        patch_branch_to(e, br_to_slow, slow_pos);
+        patch_j_to(e, j_to_end, end_pos);
         return true;
     }
 
@@ -877,7 +946,7 @@ gbjit_block *gbjit_compile_block(codecache *cc, cpu_state *cpu, u16 pc_start,
         u8 opcode = ops_opcode[i];
         u16 op_pc = ops_pc[i];
 
-        inline_ctx ictx = { cpu->mmu, &L, entry_off, mmu_base_value };
+        inline_ctx ictx = { cpu->mmu, &L, entry_off, mmu_base_value, lit_off };
         if (inline_op(&e, opcode, op_pc, &ictx)) {
             /* Any terminator op (HALT/JR/JP/...) — once inlined the block
              * has already set PC + cycles itself, so we can break out and
