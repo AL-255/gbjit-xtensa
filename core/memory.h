@@ -45,11 +45,16 @@ typedef struct mmu {
     u8       rom_bank;
     u16      rom_banks;
 
-    /* Back-pointer used solely to fake the LY (FF44) scanline counter so
-     * Pan-Docs-pattern boot loops ("wait for LY == $94") can progress
-     * without us having to implement an actual PPU. NULL = LY reads
-     * return the raw io[$44] byte. */
+    /* Back-pointer to the CPU. ppu_tick uses cpu->cycles as its time base
+     * and writes back into io[$44]/io[$41]; left NULL the PPU model is
+     * inert and reads return the raw IO bytes. */
     struct cpu_state *cpu;
+
+    /* PPU edge-detection state — last-observed scanline (LY) and STAT mode
+     * bits, used so ppu_tick() can fire VBlank / STAT IRQs exactly once
+     * per transition. */
+    u8 ppu_last_ly;
+    u8 ppu_last_mode;
 
     /* Serial output capture — Blargg test ROMs write ASCII to FF01 then $81 to FF02. */
     void (*serial_sink)(void *ctx, u8 byte);

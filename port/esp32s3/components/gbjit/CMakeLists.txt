@@ -7,6 +7,7 @@ get_filename_component(GBJIT_ROOT "${CMAKE_CURRENT_LIST_DIR}/../../../.." ABSOLU
 idf_component_register(
     SRCS
         "${GBJIT_ROOT}/core/memory.c"
+        "${GBJIT_ROOT}/core/ppu.c"
         "${GBJIT_ROOT}/core/sm83_decoder.c"
         "${GBJIT_ROOT}/core/sm83_interp.c"
         "${GBJIT_ROOT}/jit/emit_xtensa.c"

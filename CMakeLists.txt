@@ -14,6 +14,7 @@ add_compile_options(-Wall -Wextra -Wshadow -Wno-unused-parameter -fno-strict-ali
 # Portable core
 add_library(gbjit_core STATIC
     core/memory.c
+    core/ppu.c
     core/sm83_decoder.c
     core/sm83_interp.c
 )

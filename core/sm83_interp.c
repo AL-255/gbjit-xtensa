@@ -1,6 +1,7 @@
 #include "sm83_interp.h"
 #include "sm83_decoder.h"
 #include "memory.h"
+#include "ppu.h"
 
 /* --- Fetch helpers --- */
 static inline u8 fetch8(cpu_state *cpu) {
@@ -199,6 +200,9 @@ static inline void op_daa(cpu_state *cpu) {
 static const u16 int_vector[5] = { 0x40, 0x48, 0x50, 0x58, 0x60 };
 
 u32 sm83_service_interrupts(cpu_state *cpu) {
+    /* Drive the PPU timing model forward — it reads cpu->cycles and may
+     * raise IF bits ahead of the dispatch check below. */
+    ppu_tick(cpu);
     /* Refresh cached IF/IE from MMU IO + IE byte. */
     cpu->if_reg = cpu->mmu->io[0x0F];
     cpu->ie_reg = cpu->mmu->ie;

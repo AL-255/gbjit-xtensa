@@ -68,12 +68,8 @@ u8 mmu_read8(mmu *m, u16 addr) {
     if (addr < 0xFF00u) return 0xFFu;
     if (addr < 0xFF80u) {
         u8 io_addr = (u8)(addr - 0xFF00u);
-        /* FF44 = LY (current PPU scanline). We don't model the PPU, so
-         * fake the scanline counter using cpu->cycles to keep VBlank-wait
-         * loops progressing through 0..153 like real hardware. */
-        if (addr == 0xFF44u && m->cpu) {
-            return (u8)((m->cpu->cycles / 456u) % 154u);
-        }
+        /* LY ($FF44) and STAT ($FF41) are maintained by ppu_tick from
+         * cpu->cycles; reads just return the cached IO byte. */
         return m->io[io_addr];
     }
     if (addr < 0xFFFFu) return m->hram[addr - 0xFF80u];
