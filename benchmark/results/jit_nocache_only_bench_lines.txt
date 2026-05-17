@@ -1,0 +1,1 @@
+I (431) gbjit: [BENCH] mode=jit_nocache cycles=200020 elapsed_us=378470 mhz=0.528 dmg_x=0.126 pc=0xC7F3 halted=0 blocks_compiled=6552 blocks_executed=6552 chain_hits=0 chain_misses=0

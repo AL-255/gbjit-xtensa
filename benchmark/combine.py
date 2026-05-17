@@ -185,9 +185,39 @@ def main():
             row.append(f"{total(d)/g:.2f}")
         print("| " + " | ".join(row) + " |")
 
-    # ----- If we have both cold and warm JIT, show compile overhead -----
-    cold = next((m for m in modes if m[0] == "jit"), None)
-    warm = next((m for m in modes if m[0] == "jit_warm"), None)
+    # ----- If we have nocache + cold JIT, show the cache's speedup ----
+    nocache = next((m for m in modes if m[0] == "jit_nocache"), None)
+    cold    = next((m for m in modes if m[0] == "jit"), None)
+    warm    = next((m for m in modes if m[0] == "jit_warm"), None)
+    if nocache and cold:
+        print()
+        print("## JIT cache speedup (with vs without)\n")
+        nc_us = int(nocache[1]["elapsed_us"])
+        co_us = int(cold[1]["elapsed_us"])
+        wa_us = int(warm[1]["elapsed_us"]) if warm else None
+        print(f"`mode=jit_nocache` runs the dispatcher with `no_cache=true`: every dispatch")
+        print(f"iteration recompiles the block, the codecache arena is reset before each")
+        print(f"compile, and the predicted-next chain cache is skipped. `mode=jit` is the")
+        print(f"default cached behaviour. `mode=jit_warm` is cached AND pre-compiled (no")
+        print(f"compilations in the measured window).\n")
+        print("| Mode | Wall µs | × DMG | blocks_compiled | Speedup vs `jit_nocache` |")
+        print("|------|--------:|------:|----------------:|-------------------------:|")
+        nc_n = nocache[1].get("blocks_compiled", "?")
+        co_n = cold[1].get("blocks_compiled", "?")
+        wa_n = warm[1].get("blocks_compiled", "?") if warm else "—"
+        print(f"| jit_nocache (no cache) | {nc_us:,} | {nocache[1]['dmg_x']} | {nc_n} | 1.00× (baseline) |")
+        print(f"| jit (cached, cold)     | {co_us:,} | {cold[1]['dmg_x']}    | {co_n} | **{nc_us/co_us:.2f}×** |")
+        if warm:
+            print(f"| jit_warm (cached, pre-compiled) | {wa_us:,} | {warm[1]['dmg_x']} | {wa_n} | **{nc_us/wa_us:.2f}×** |")
+        print()
+        print(f"For the 200 000-GB-cycle window:")
+        print(f"- `jit_nocache` invoked `gbjit_compile_block` ~{nc_n} times (one per dispatch step).")
+        print(f"- `jit` (cached) compiled only {co_n} unique blocks — the cache turned the other")
+        print(f"  ~{int(nocache[1].get('blocks_executed','0'))-int(co_n if str(co_n).isdigit() else 0):,}")
+        print(f"  dispatch iterations into pure lookups + executions.")
+        print(f"- `jit_warm` paid the {co_n}-block compile cost in a discarded warm-up pass, so its")
+        print(f"  measured window was 100% reuse.")
+
     if cold and warm:
         print()
         print("## JIT on-the-fly compilation overhead (the answer to: does the JIT row include translation cost?)\n")

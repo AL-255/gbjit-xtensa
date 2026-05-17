@@ -37,6 +37,12 @@ typedef struct gbjit_dispatcher {
 
     /* Falls back to interpreter when codegen unavailable. */
     bool interp_fallback;
+
+    /* Demonstration toggle: when set, every dispatch iteration recompiles
+     * the block from scratch — the cache (bucket table + predicted_next)
+     * is bypassed and the codecache arena is wiped before each compile.
+     * Used by the bench harness to quantify the JIT cache's value. */
+    bool no_cache;
 } gbjit_dispatcher;
 
 bool gbjit_dispatcher_init(gbjit_dispatcher *d, cpu_state *cpu);

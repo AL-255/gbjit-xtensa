@@ -4,7 +4,7 @@
 
 | Mode | GB cycles | wall (µs) | throughput (MHz of T-cycles) | × DMG real-time |
 |------|-----------|-----------|------------------------------|-----------------|
-| jit | 200020 | 8660 | 23.097 | 5.507 |
+| jit | 200020 | 9126 | 21.918 | 5.226 |
 
 JIT dispatcher: blocks_compiled=25 executed=6552 chain_hits=6494 chain_misses=57
 
@@ -12,10 +12,10 @@ JIT dispatcher: blocks_compiled=25 executed=6552 chain_hits=6494 chain_misses=57
 
 | Region | TBs executed | Instructions | Load instrs | Store instrs |
 |--------|-------------:|-------------:|------------:|-------------:|
-| flash XIP (interp + JIT helpers) | 591,462 | 1,714,782 | 446,223 | 140,812 |
-| IRAM (JIT-emitted code) | 401,324 | 1,490,793 | 391,861 | 162,899 |
-| boot ROM | 1,751,937 | 3,408,507 | 696,818 | 287,775 |
-| **total** | **2,744,723** | **6,614,082** | **1,534,902** | **591,486** |
+| flash XIP (interp + JIT helpers) | 616,418 | 1,768,946 | 464,626 | 140,842 |
+| IRAM (JIT-emitted code) | 402,969 | 1,496,921 | 393,365 | 163,359 |
+| boot ROM | 1,694,309 | 3,326,286 | 709,632 | 287,874 |
+| **total** | **2,713,696** | **6,592,153** | **1,567,623** | **592,075** |
 
 ## Notes
 

@@ -389,17 +389,27 @@ void gbjit_dispatcher_run_until(gbjit_dispatcher *d, u64 until) {
 
         /* Block chaining fast-path: if the previous block recorded its most
          * recent successor and the current PC matches the recorded target,
-         * reuse the cached block pointer and skip the hash lookup. */
+         * reuse the cached block pointer and skip the hash lookup. The
+         * `no_cache` mode disables this — useful for showing the cache's
+         * value vs always-recompile-on-encounter behaviour. */
         gbjit_block *b = NULL;
-        if (prev && prev->predicted_next && prev->predicted_next_pc == cpu->pc) {
-            b = prev->predicted_next;
-            d->chain_hits++;
-        } else {
-            b = find_block(d, cpu->pc);
-            if (prev) d->chain_misses++;
+        if (!d->no_cache) {
+            if (prev && prev->predicted_next && prev->predicted_next_pc == cpu->pc) {
+                b = prev->predicted_next;
+                d->chain_hits++;
+            } else {
+                b = find_block(d, cpu->pc);
+                if (prev) d->chain_misses++;
+            }
         }
 
         if (!b) {
+            if (d->no_cache) {
+                /* Wipe the bump-allocator arena so each compile reuses the
+                 * same bytes. Without this the arena would fill within a
+                 * few hundred iterations on any non-trivial loop. */
+                codecache_reset(&d->cc);
+            }
             resolver_ctx hr = { cpu };
 #if defined(ESP_PLATFORM)
             b = gbjit_compile_block(&d->cc, cpu, cpu->pc, target_helper_addr, &hr);
@@ -411,13 +421,15 @@ void gbjit_dispatcher_run_until(gbjit_dispatcher *d, u64 until) {
                 prev = NULL;
                 continue;
             }
-            insert_block(d, b);
+            if (!d->no_cache) insert_block(d, b);
             d->blocks_compiled++;
         }
 
         /* Record the successor link on the previous block (regardless of
-         * cache-hit status, so a stale link doesn't stick). */
-        if (prev && (!prev->predicted_next || prev->predicted_next_pc != cpu->pc)) {
+         * cache-hit status, so a stale link doesn't stick). Skip in
+         * no_cache mode — the previous block has already been overwritten. */
+        if (!d->no_cache && prev &&
+            (!prev->predicted_next || prev->predicted_next_pc != cpu->pc)) {
             prev->predicted_next = b;
             prev->predicted_next_pc = cpu->pc;
         }
@@ -428,7 +440,16 @@ void gbjit_dispatcher_run_until(gbjit_dispatcher *d, u64 until) {
         enter_block_sim(b, cpu);
 #endif
         d->blocks_executed++;
-        prev = b;
+
+        if (d->no_cache) {
+            /* Don't hand a pointer to a doomed block to the chain cache;
+             * free the gbjit_block struct (the arena gets reset on the
+             * next iteration). */
+            gbjit_block_free(b);
+            prev = NULL;
+        } else {
+            prev = b;
+        }
 
         if (cpu->halted || cpu->stopped) break;
     }

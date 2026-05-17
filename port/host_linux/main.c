@@ -39,12 +39,14 @@ static void usage(const char *argv0) {
 
 int main(int argc, char **argv) {
     bool use_jit = false;
+    bool no_cache = false;
     u64 max_cycles = 200000000ull;
     const char *rom_path = NULL;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--interp") == 0) use_jit = false;
         else if (strcmp(argv[i], "--jit") == 0) use_jit = true;
+        else if (strcmp(argv[i], "--no-cache") == 0) { use_jit = true; no_cache = true; }
         else if (strcmp(argv[i], "--max-cycles") == 0 && i + 1 < argc) {
             max_cycles = strtoull(argv[++i], NULL, 0);
         } else if (argv[i][0] == '-') {
@@ -84,6 +86,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, "JIT init failed\n");
             return 4;
         }
+        disp.no_cache = no_cache;
         gbjit_dispatcher_run_until(&disp, max_cycles);
     } else {
         sm83_run_until(&cpu, max_cycles);
@@ -94,8 +97,11 @@ int main(int argc, char **argv) {
     double mhz = (double)cpu.cycles / elapsed_us;
     double dmg_ratio = mhz / 4.194304;
 
+    const char *mode_label = !use_jit ? "interp"
+                            : no_cache ? "JIT(no_cache)"
+                            : "JIT";
     fprintf(stderr, "\n--- %s halted at PC=%04X cycles=%llu elapsed=%.0f us throughput=%.2f MHz (%.2fx DMG)",
-            use_jit ? "JIT" : "interp",
+            mode_label,
             cpu.pc, (unsigned long long)cpu.cycles, elapsed_us, mhz, dmg_ratio);
     if (use_jit) {
         fprintf(stderr, " blocks=%llu/%llu chain=%llu/%llu",

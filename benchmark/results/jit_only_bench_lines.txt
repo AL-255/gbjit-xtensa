@@ -1,1 +1,1 @@
-I (59) gbjit: [BENCH] mode=jit cycles=200020 elapsed_us=8660 mhz=23.097 dmg_x=5.507 pc=0xC7F3 halted=0 blocks_compiled=25 blocks_executed=6552 chain_hits=6494 chain_misses=57
+I (60) gbjit: [BENCH] mode=jit cycles=200020 elapsed_us=9126 mhz=21.918 dmg_x=5.226 pc=0xC7F3 halted=0 blocks_compiled=25 blocks_executed=6552 chain_hits=6494 chain_misses=57
