@@ -37,6 +37,20 @@ static const uint8_t ROM_ALU[] = {
     0x76,                   /* HALT */
 };
 
+/* CB-prefix ROM — exercises SWAP/SLA/SRL/BIT/SET/RES/RL/RRC. */
+static const uint8_t ROM_CB[] = {
+    0x3E, 0x42,             /* LD A,$42 */
+    0xCB, 0x37,             /* SWAP A */
+    0xCB, 0x27,             /* SLA A */
+    0xCB, 0x3F,             /* SRL A */
+    0xCB, 0x47,             /* BIT 0,A */
+    0xCB, 0xE7,             /* SET 4,A */
+    0xCB, 0xA7,             /* RES 4,A */
+    0xCB, 0x17,             /* RL  A */
+    0xCB, 0x0F,             /* RRC A */
+    0x76,                   /* HALT */
+};
+
 /* Memory ROM — exercises inlined LD (a16),A / LD A,(a16) / LDH for WRAM and HRAM. */
 static const uint8_t ROM_MEM[] = {
     0x3E, 0x42,             /* LD A,$42 */
@@ -140,6 +154,14 @@ void app_main(void) {
             .rom = ROM_MEM, .rom_len = sizeof(ROM_MEM),
             .exp_a = 0x42, .exp_f = 0xB0 /* F unchanged from reset */, .exp_b = 0x00,
             .exp_pc = 0x0111, .exp_cycles = 84,
+        },
+        {
+            /* CB ops: ROM is 19 bytes. Final A=$24, F=$00.
+             * Cycles: 8 (LD) + 8*8 (CB) + 4 (HALT) = 76. */
+            .name = "cb",
+            .rom = ROM_CB, .rom_len = sizeof(ROM_CB),
+            .exp_a = 0x24, .exp_f = 0x00, .exp_b = 0x00,
+            .exp_pc = 0x0113, .exp_cycles = 76,
         },
         {
             .name = "fib",

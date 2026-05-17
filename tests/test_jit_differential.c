@@ -106,6 +106,39 @@ int main(void) {
     run_jit   (alu_prog, sizeof(alu_prog), &cpu_j2, &m_j2);
     check_match("alu rom", &cpu_i2, &cpu_j2);
 
+    /* CB-prefix ROM — exercises SWAP/SLA/SRL/BIT/SET/RES/RL/RRC inlined.
+     * Starting A=$42, traces:
+     *   SWAP A → $24, F=$00
+     *   SLA  A → $48, F=$00 (bit7 of $24 = 0)
+     *   SRL  A → $24, F=$00
+     *   BIT 0,A → Z=1 (bit 0 of $24 = 0), F=$A0 (Z|H)
+     *   SET 4,A → $34, F unchanged $A0
+     *   RES 4,A → $24, F unchanged
+     *   RL   A → $48, F=$00  (old C = 0 from F & 0x10 = 0)
+     *   RRC  A → $24, F=$00 */
+    static const u8 cb_prog[] = {
+        0x3E, 0x42,             /* LD A,$42 */
+        0xCB, 0x37,             /* SWAP A */
+        0xCB, 0x27,             /* SLA A */
+        0xCB, 0x3F,             /* SRL A */
+        0xCB, 0x47,             /* BIT 0,A */
+        0xCB, 0xE7,             /* SET 4,A */
+        0xCB, 0xA7,             /* RES 4,A */
+        0xCB, 0x17,             /* RL  A */
+        0xCB, 0x0F,             /* RRC A */
+        0x76,                   /* HALT */
+    };
+    static cpu_state cpu_ic, cpu_jc;
+    static mmu m_ic, m_jc;
+    run_interp(cb_prog, sizeof(cb_prog), &cpu_ic, &m_ic);
+    run_jit   (cb_prog, sizeof(cb_prog), &cpu_jc, &m_jc);
+    check_match("cb rom", &cpu_ic, &cpu_jc);
+    if (cpu_jc.a != 0x24 || cpu_jc.f != 0x00) {
+        fprintf(stderr, "FAIL cb end: A=%02X F=%02X (expected $24, $00)\n",
+                cpu_jc.a, cpu_jc.f);
+        failed++;
+    }
+
     /* Memory ROM — exercises inlined LD A,(a16), LD (a16),A, LDH for both
      * WRAM ($C100) and HRAM ($FF80). */
     static const u8 mem_prog[] = {

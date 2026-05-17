@@ -579,6 +579,131 @@ static bool inline_op(xt_emit *e, u8 opcode, u16 pc, inline_ctx *ictx) {
         return true;
     }
 
+    /* --- CB-prefix ops (0xCB <sub>).
+     *
+     * The sub-byte's structure:
+     *   bits 6..7 : group  (0 = shift/rotate, 1 = BIT, 2 = RES, 3 = SET)
+     *   bits 3..5 : op-within-group (0..7)
+     *   bits 0..2 : source register (B,C,D,E,H,L,(HL),A)
+     *
+     * Non-(HL) variants are fully inlined with eager flags. (HL) variants
+     * (src==6) fall back to the helper.                                    */
+    if (opcode == 0xCB) {
+        u8 sub = m->rom[(pc + 1) & 0x7FFFu];
+        u8 reg = sub & 7;
+        u8 grp = (sub >> 6) & 3;
+        u8 sub_op = (sub >> 3) & 7;
+        if (reg == 6) return false;        /* (HL) — helper */
+        int reg_off = reg8_offset(reg);
+
+        /* Load operand value into a2. */
+        xt_l8ui(e, 2, 13, (u32)reg_off);
+
+        if (grp == 0) {
+            /* --- Shift/rotate. We compute the new value in a5 and the new
+             * carry bit (0 or 1) in a6. Old F lives in a4 (loaded only
+             * when needed for RL/RR).                                      */
+            switch (sub_op) {
+                case 0: /* RLC */
+                    xt_extui(e, 6, 2, 7, 0);        /* new_C = bit 7 */
+                    xt_slli(e, 5, 2, 1);
+                    xt_or(e, 5, 5, 6);              /* fold bit 7 into bit 0 */
+                    xt_extui(e, 5, 5, 0, 7);        /* mask to 8 bits */
+                    break;
+                case 1: /* RRC */
+                    xt_extui(e, 6, 2, 0, 0);        /* new_C = bit 0 */
+                    xt_srli(e, 5, 2, 1);
+                    xt_slli(e, 7, 6, 7);            /* bit 0 → position 7 */
+                    xt_or(e, 5, 5, 7);
+                    break;
+                case 2: /* RL — through carry */
+                    xt_l8ui(e, 4, 13, OFF_F);
+                    xt_extui(e, 6, 2, 7, 0);        /* new_C = bit 7 */
+                    xt_extui(e, 7, 4, 4, 0);        /* old C from F bit 4 */
+                    xt_slli(e, 5, 2, 1);
+                    xt_or(e, 5, 5, 7);
+                    xt_extui(e, 5, 5, 0, 7);
+                    break;
+                case 3: /* RR — through carry */
+                    xt_l8ui(e, 4, 13, OFF_F);
+                    xt_extui(e, 6, 2, 0, 0);        /* new_C = bit 0 */
+                    xt_extui(e, 7, 4, 4, 0);        /* old C */
+                    xt_srli(e, 5, 2, 1);
+                    xt_slli(e, 7, 7, 7);            /* old_C → bit 7 */
+                    xt_or(e, 5, 5, 7);
+                    break;
+                case 4: /* SLA */
+                    xt_extui(e, 6, 2, 7, 0);        /* new_C = bit 7 */
+                    xt_slli(e, 5, 2, 1);
+                    xt_extui(e, 5, 5, 0, 7);        /* mask to 8 bits */
+                    break;
+                case 5: /* SRA — arithmetic right (preserve bit 7) */
+                    xt_extui(e, 6, 2, 0, 0);        /* new_C = bit 0 */
+                    xt_srli(e, 5, 2, 1);
+                    xt_extui(e, 7, 2, 7, 0);        /* old sign bit */
+                    xt_slli(e, 7, 7, 7);
+                    xt_or(e, 5, 5, 7);
+                    break;
+                case 6: /* SWAP nibbles */
+                    xt_slli(e, 7, 2, 4);
+                    xt_extui(e, 7, 7, 0, 7);
+                    xt_srli(e, 5, 2, 4);
+                    xt_or(e, 5, 5, 7);
+                    xt_movi(e, 6, 0);              /* C = 0 */
+                    break;
+                case 7: /* SRL — logical right */
+                    xt_extui(e, 6, 2, 0, 0);
+                    xt_srli(e, 5, 2, 1);
+                    break;
+                default: return false;
+            }
+
+            xt_s8i(e, 5, 13, (u32)reg_off);
+
+            /* F = Z | (C in position 4). N = 0, H = 0. */
+            xt_movi(e, 4, 0);
+            emit_zflag(e, 5, 4, 7);
+            xt_slli(e, 6, 6, 4);                   /* C bit → F bit 4 */
+            xt_or(e, 4, 4, 6);
+            xt_s8i(e, 4, 13, OFF_F);
+            emit_advance(e, 2, 8);
+            return true;
+        }
+
+        if (grp == 1) {  /* BIT b, r — sets Z if bit b of r is 0, N=0, H=1, C preserved */
+            u8 bit = sub_op;
+            xt_extui(e, 3, 2, bit, 0);             /* a3 = (r >> bit) & 1 */
+            xt_l8ui(e, 4, 13, OFF_F);
+            xt_movi(e, 5, FLAG_C);
+            xt_and(e, 4, 4, 5);                    /* a4 = old F & C */
+            emit_zflag(e, 3, 4, 7);
+            emit_setflag_const(e, 4, FLAG_H, 7);
+            xt_s8i(e, 4, 13, OFF_F);
+            emit_advance(e, 2, 8);
+            return true;
+        }
+
+        if (grp == 2) {  /* RES b, r — clear bit b of r; no flag effects */
+            u8 bit = sub_op;
+            u8 mask = (u8)~(1u << bit);
+            xt_movi(e, 3, (i32)mask);
+            xt_and(e, 2, 2, 3);
+            xt_s8i(e, 2, 13, (u32)reg_off);
+            emit_advance(e, 2, 8);
+            return true;
+        }
+
+        if (grp == 3) {  /* SET b, r */
+            u8 bit = sub_op;
+            u8 mask = (u8)(1u << bit);
+            xt_movi(e, 3, (i32)mask);
+            xt_or(e, 2, 2, 3);
+            xt_s8i(e, 2, 13, (u32)reg_off);
+            emit_advance(e, 2, 8);
+            return true;
+        }
+    }
+
     /* --- ALU operand-in-`a3` body (factored from `ALU A,r` and `ALU A,n8`).
      * Caller arranges a2=A and a3=operand and supplies the group (0..7
      * matching the standard SM83 encoding: 0=ADD 1=ADC 2=SUB 3=SBC
