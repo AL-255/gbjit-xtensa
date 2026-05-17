@@ -387,6 +387,119 @@ static bool inline_op(xt_emit *e, u8 opcode, u16 pc, inline_ctx *ictx) {
         return true;
     }
 
+    /* --- CPL (0x2F): A = ~A; F = (F & (Z|C)) | N | H. */
+    if (opcode == 0x2F) {
+        xt_l8ui(e, 2, 13, OFF_A);
+        xt_movi(e, 3, 0xFF);
+        xt_xor(e, 2, 2, 3);                /* a2 = ~A (low 8) */
+        xt_extui(e, 2, 2, 0, 7);
+        xt_s8i(e, 2, 13, OFF_A);
+        xt_l8ui(e, 4, 13, OFF_F);
+        xt_movi(e, 5, FLAG_Z | FLAG_C);
+        xt_and(e, 4, 4, 5);                 /* preserve Z, C */
+        xt_movi(e, 5, FLAG_N | FLAG_H);
+        xt_or(e, 4, 4, 5);
+        xt_s8i(e, 4, 13, OFF_F);
+        emit_advance(e, 1, 4);
+        return true;
+    }
+
+    /* --- SCF (0x37): F = (F & Z) | C; CCF (0x3F): F = (F & Z) ^ C. */
+    if (opcode == 0x37 || opcode == 0x3F) {
+        bool is_ccf = (opcode == 0x3F);
+        xt_l8ui(e, 4, 13, OFF_F);
+        xt_movi(e, 5, FLAG_Z | (is_ccf ? FLAG_C : 0));
+        xt_and(e, 4, 4, 5);                 /* keep Z, plus C if CCF (to be inverted) */
+        xt_movi(e, 5, FLAG_C);
+        if (is_ccf) {
+            xt_xor(e, 4, 4, 5);             /* toggle C */
+        } else {
+            xt_or(e, 4, 4, 5);              /* set C */
+        }
+        xt_s8i(e, 4, 13, OFF_F);
+        emit_advance(e, 1, 4);
+        return true;
+    }
+
+    /* --- RLCA (0x07) / RRCA (0x0F) / RLA (0x17) / RRA (0x1F).
+     * Like the CB shifts on A, but Z is always 0. */
+    if (opcode == 0x07 || opcode == 0x0F || opcode == 0x17 || opcode == 0x1F) {
+        xt_l8ui(e, 2, 13, OFF_A);
+
+        if (opcode == 0x07) {           /* RLCA */
+            xt_extui(e, 6, 2, 7, 0);
+            xt_slli(e, 5, 2, 1);
+            xt_or(e, 5, 5, 6);
+            xt_extui(e, 5, 5, 0, 7);
+        } else if (opcode == 0x0F) {    /* RRCA */
+            xt_extui(e, 6, 2, 0, 0);
+            xt_srli(e, 5, 2, 1);
+            xt_slli(e, 7, 6, 7);
+            xt_or(e, 5, 5, 7);
+        } else if (opcode == 0x17) {    /* RLA */
+            xt_l8ui(e, 4, 13, OFF_F);
+            xt_extui(e, 6, 2, 7, 0);
+            xt_extui(e, 7, 4, 4, 0);
+            xt_slli(e, 5, 2, 1);
+            xt_or(e, 5, 5, 7);
+            xt_extui(e, 5, 5, 0, 7);
+        } else {                        /* RRA */
+            xt_l8ui(e, 4, 13, OFF_F);
+            xt_extui(e, 6, 2, 0, 0);
+            xt_extui(e, 7, 4, 4, 0);
+            xt_srli(e, 5, 2, 1);
+            xt_slli(e, 7, 7, 7);
+            xt_or(e, 5, 5, 7);
+        }
+        xt_s8i(e, 5, 13, OFF_A);
+
+        /* F: Z=0, N=0, H=0, C from a6. */
+        xt_movi(e, 4, 0);
+        xt_slli(e, 6, 6, 4);
+        xt_or(e, 4, 4, 6);
+        xt_s8i(e, 4, 13, OFF_F);
+        emit_advance(e, 1, 4);
+        return true;
+    }
+
+    /* --- LD (HL), n8 (0x36): write immediate byte to (HL). WRAM fast-path. */
+    if (opcode == 0x36) {
+        u8 imm = mmu_read8(m, (u16)(pc + 1));
+
+        u32 wram_base_minus_C000 =
+            ictx->mmu_base_value + (u32)offsetof(mmu, wram) - 0xC000u;
+        i32 wram_lit = lit_alloc_u32(ictx->L, wram_base_minus_C000);
+        if (wram_lit < 0) return false;
+
+        xt_l16ui(e, 9, 13, OFF_HL);
+        xt_extui(e, 4, 9, 13, 2);
+        xt_addi(e, 4, 4, -6);
+
+        u32 br_to_slow = e->len;
+        xt_bnez(e, 4, 4);
+
+        u32 pc_off = ictx->entry_off + e->len;
+        emit_l32r_at(e, 5, (u32)wram_lit, pc_off);
+        xt_add(e, 4, 5, 9);
+        xt_movi(e, 2, (i32)imm);
+        xt_s8i(e, 2, 4, 0);
+        emit_advance(e, 2, 12);
+
+        u32 j_to_end = e->len;
+        xt_j(e, 4);
+
+        u32 slow_pos = e->len;
+        emit_sync_state(e);
+        xt_mov(e, 2, 13);
+        emit_callx0_helper(e, ictx->lit_off[HELPER_SM83_STEP], ictx->entry_off);
+        emit_reload_state(e, ictx->lit_off[ADDR_CPU_BASE], ictx->entry_off);
+
+        u32 end_pos = e->len;
+        patch_branch_to(e, br_to_slow, slow_pos);
+        patch_j_to(e, j_to_end, end_pos);
+        return true;
+    }
+
     /* HALT — set cpu->halted = 1 and exit. The block exit path is handled
      * by the caller (we just write halted and let emit_advance bump PC). */
     if (opcode == 0x76) {
