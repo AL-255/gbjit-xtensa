@@ -1,0 +1,19 @@
+add_executable(test_interp_smoke test_interp_smoke.c)
+target_link_libraries(test_interp_smoke PRIVATE gbjit_core)
+add_test(NAME interp_smoke COMMAND test_interp_smoke)
+
+add_executable(test_encoder_smoke test_encoder_smoke.c)
+target_link_libraries(test_encoder_smoke PRIVATE gbjit_jit)
+add_test(NAME encoder_smoke COMMAND test_encoder_smoke)
+
+add_executable(test_encoder_bits test_encoder_bits.c)
+target_link_libraries(test_encoder_bits PRIVATE gbjit_jit)
+add_test(NAME encoder_bits COMMAND test_encoder_bits)
+
+add_executable(test_xtensa_sim test_xtensa_sim.c)
+target_link_libraries(test_xtensa_sim PRIVATE gbjit_jit)
+add_test(NAME xtensa_sim COMMAND test_xtensa_sim)
+
+add_executable(test_jit_differential test_jit_differential.c)
+target_link_libraries(test_jit_differential PRIVATE gbjit_jit)
+add_test(NAME jit_differential COMMAND test_jit_differential)

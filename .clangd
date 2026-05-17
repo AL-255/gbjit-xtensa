@@ -1,0 +1,4 @@
+If:
+  PathMatch: [.*\.c, .*\.h]
+CompileFlags:
+  Add: [-xc, -Iinclude, -Icore, -Ijit, -std=c11, -Wall, -Wextra]
