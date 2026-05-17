@@ -44,6 +44,11 @@ typedef struct cpu_state {
     u8 if_reg;
     u8 ie_reg;
 
+    /* Scratch slot used by the JIT block to stash its CALL0 return address
+     * without modifying `a1`. Modifying `a1` inside a windowed Xtensa frame
+     * confuses the window-overflow handler's spill-target calculation. */
+    u32 jit_ret_pc;
+
     /* MMU back-pointer. */
     struct mmu *mmu;
 } cpu_state;

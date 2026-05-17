@@ -52,12 +52,12 @@
 #define OFF_PC   (offsetof(cpu_state, pc))
 #define OFF_HALTED (offsetof(cpu_state, halted))
 #define OFF_CYCLES (offsetof(cpu_state, cycles))
+#define OFF_JITRETPC (offsetof(cpu_state, jit_ret_pc))
 
-/* --- Stack frame (24 bytes, 16-byte aligned).
- *   +20  saved a0       (return address)
- *   +16  unused (alignment) */
-#define FRAME_SIZE 32
-#define FRAME_OFF_A0 28
+/* The JIT block runs *without* its own Xtensa stack frame: it leaves a1
+ * untouched so the host's window-overflow handler keeps spilling to the
+ * caller's (enter_block_native's) save area. The return PC is stashed in
+ * cpu_state->jit_ret_pc instead of on the stack. */
 
 /* Limits. */
 #define MAX_OPS_PER_BLOCK 32
@@ -859,17 +859,15 @@ gbjit_block *gbjit_compile_block(codecache *cc, cpu_state *cpu, u16 pc_start,
     xt_init(&e, base + entry_off, total - entry_off);
 
     /* --- Prologue ---
-     *   addi a1, a1, -FRAME_SIZE
-     *   s32i a0, a1, FRAME_OFF_A0
-     *   l32r a13, =cpu_base
+     *   l32r  a13, =cpu_base
+     *   s32i  a0,  a13, OFF_JITRETPC   ; save return PC into cpu_state
      *   l16ui a11, a13, OFF_PC
-     *   movi  a12, 0                   ; cycles delta = 0          */
-    xt_addi(&e, 1, 1, -FRAME_SIZE);
-    xt_s32i(&e, 0, 1, FRAME_OFF_A0);
+     *   movi  a12, 0                                                 */
     {
         u32 pc_off = entry_off + e.len;
         emit_l32r_at(&e, 13, lit_off[ADDR_CPU_BASE], pc_off);
     }
+    xt_s32i(&e, 0, 13, OFF_JITRETPC);
     xt_l16ui(&e, 11, 13, OFF_PC);
     xt_movi (&e, 12, 0);
 
@@ -897,11 +895,15 @@ gbjit_block *gbjit_compile_block(codecache *cc, cpu_state *cpu, u16 pc_start,
     }
     (void)exited_early;
 
-    /* --- Epilogue --- */
+    /* --- Epilogue: sync PC + cycles, reload return PC, JX. --- */
     emit_sync_state(&e);
-    xt_l32i(&e, 0, 1, FRAME_OFF_A0);
-    xt_addi(&e, 1, 1, FRAME_SIZE);
-    xt_ret(&e);
+    /* Reload cpu_base in case the last op was a helper. */
+    {
+        u32 pc_off = entry_off + e.len;
+        emit_l32r_at(&e, 13, lit_off[ADDR_CPU_BASE], pc_off);
+    }
+    xt_l32i(&e, 0, 13, OFF_JITRETPC);
+    xt_jx(&e, 0);
 
     codecache_finalize(cc, base + entry_off, e.len);
 

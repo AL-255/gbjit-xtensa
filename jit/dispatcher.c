@@ -68,16 +68,21 @@ typedef struct resolver_ctx {
 } resolver_ctx;
 
 #if defined(ESP_PLATFORM)
-/* On the target, literal-pool entries are real 32-bit addresses. The CPU
- * reads cpu_state/mmu directly and calls helpers via CALLX0. */
+/* IDF compiles C with the windowed Xtensa ABI but our JIT emits CALL0.
+ * Helper calls must cross that boundary, so the target resolver hands the
+ * JIT not the raw windowed C functions but the CALL0→CALL8 trampolines
+ * in jit_trampolines.S. */
+extern void sm83_step_call0(void);
+extern void mmu_read8_call0(void);
+extern void mmu_write8_call0(void);
 static u32 target_helper_addr(literal_id id, void *user) {
     resolver_ctx *r = (resolver_ctx *)user;
     switch (id) {
         case ADDR_CPU_BASE:     return (u32)(uintptr_t)r->cpu;
         case ADDR_MMU_BASE:     return (u32)(uintptr_t)r->cpu->mmu;
-        case HELPER_SM83_STEP:  return (u32)(uintptr_t)&sm83_step;
-        case HELPER_MMU_READ8:  return (u32)(uintptr_t)&mmu_read8;
-        case HELPER_MMU_WRITE8: return (u32)(uintptr_t)&mmu_write8;
+        case HELPER_SM83_STEP:  return (u32)(uintptr_t)&sm83_step_call0;
+        case HELPER_MMU_READ8:  return (u32)(uintptr_t)&mmu_read8_call0;
+        case HELPER_MMU_WRITE8: return (u32)(uintptr_t)&mmu_write8_call0;
         default: return 0;
     }
 }
@@ -254,9 +259,15 @@ static void enter_block_native(gbjit_block *b, cpu_state *cpu) {
     register uint32_t a2_cpu asm("a2") = (uint32_t)(uintptr_t)cpu;
     register uint32_t a8_fn  asm("a8") = fn;
     asm volatile (
-        "s32i a0, a1, 0\n"      /* save windowed return PC to our frame */
+        /* Save windowed return PC to offset 16 (NOT 0) — the Xtensa window
+         * overflow handler uses offsets 0..15 of every windowed function's
+         * frame to spill the live a0..a3 if a deeper CALL{N} overflows. If
+         * we saved at offset 0 here, the spill of our (now-clobbered) a0
+         * would overwrite our manual save, and the RETW at function exit
+         * would see CALLINC=0 instead of 2 and trap with IllegalInstr. */
+        "s32i a0, a1, 16\n"     /* save windowed return PC above save-area */
         "callx0 %1\n"           /* CALL0 into the JIT block */
-        "l32i a0, a1, 0\n"      /* restore windowed return PC */
+        "l32i a0, a1, 16\n"     /* restore windowed return PC */
         : "+r"(a2_cpu)
         : "r"(a8_fn)
         : "a3","a4","a5","a6","a7","a9","a10","a11","a12","a13","a14","a15",

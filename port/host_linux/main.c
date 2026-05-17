@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 static void serial_cb(void *ctx, u8 b) {
     (void)ctx;
@@ -74,19 +75,36 @@ int main(int argc, char **argv) {
     cpu_state cpu;
     cpu_reset(&cpu, &m);
 
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+
+    gbjit_dispatcher disp;
     if (use_jit) {
-        gbjit_dispatcher disp;
         if (!gbjit_dispatcher_init(&disp, &cpu) ) {
             fprintf(stderr, "JIT init failed\n");
             return 4;
         }
         gbjit_dispatcher_run_until(&disp, max_cycles);
-        gbjit_dispatcher_shutdown(&disp);
     } else {
         sm83_run_until(&cpu, max_cycles);
     }
 
-    fprintf(stderr, "\n--- halted at PC=%04X cycles=%llu ---\n",
-            cpu.pc, (unsigned long long)cpu.cycles);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    double elapsed_us = (t1.tv_sec - t0.tv_sec) * 1e6 + (t1.tv_nsec - t0.tv_nsec) / 1e3;
+    double mhz = (double)cpu.cycles / elapsed_us;
+    double dmg_ratio = mhz / 4.194304;
+
+    fprintf(stderr, "\n--- %s halted at PC=%04X cycles=%llu elapsed=%.0f us throughput=%.2f MHz (%.2fx DMG)",
+            use_jit ? "JIT" : "interp",
+            cpu.pc, (unsigned long long)cpu.cycles, elapsed_us, mhz, dmg_ratio);
+    if (use_jit) {
+        fprintf(stderr, " blocks=%llu/%llu chain=%llu/%llu",
+                (unsigned long long)disp.blocks_compiled,
+                (unsigned long long)disp.blocks_executed,
+                (unsigned long long)disp.chain_hits,
+                (unsigned long long)disp.chain_misses);
+        gbjit_dispatcher_shutdown(&disp);
+    }
+    fprintf(stderr, " ---\n");
     return 0;
 }

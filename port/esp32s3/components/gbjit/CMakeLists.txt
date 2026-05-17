@@ -13,6 +13,7 @@ idf_component_register(
         "${GBJIT_ROOT}/jit/codecache.c"
         "${GBJIT_ROOT}/jit/codegen.c"
         "${GBJIT_ROOT}/jit/dispatcher.c"
+        "${CMAKE_CURRENT_LIST_DIR}/jit_trampolines.S"
     INCLUDE_DIRS
         "${GBJIT_ROOT}/include"
         "${GBJIT_ROOT}/core"
