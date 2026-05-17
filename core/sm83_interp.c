@@ -562,4 +562,5 @@ void cpu_reset(cpu_state *cpu, struct mmu *m) {
     cpu->halted = 0; cpu->stopped = 0;
     cpu->cycles = 0;
     cpu->mmu = m;
+    if (m) m->cpu = cpu;
 }

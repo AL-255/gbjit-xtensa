@@ -3,15 +3,24 @@
 
 #include "gb_types.h"
 
-/* Minimal MMU for bring-up: 32 KB ROM (MBC0), 8 KB VRAM, 8 KB WRAM, OAM, IO,
-   HRAM. No banking. Enough for Blargg cpu_instrs individual sub-tests
-   (32 KB single-bank variants). MBC1 will be slotted in later. */
+/* MMU: up to 256 KB cartridge ROM (enough for most small commercial titles
+   like Super Mario Land, Tetris, Dr Mario), 8 KB VRAM, 8 KB WRAM, OAM, IO,
+   HRAM. Minimal MBC1 banking: 5-bit low + 2-bit high ROM bank number,
+   ROM-mode only (no RAM bank). MBC0 carts are handled as the degenerate
+   case (rom_bank stays at 1 and writes to $0000..$7FFF are ignored). */
 
-#define ROM_SIZE   (32u * 1024u)
+#define ROM_SIZE   (256u * 1024u)
+#define ROM_BANK_SIZE (16u * 1024u)
 #define VRAM_SIZE  (8u  * 1024u)
 #define WRAM_SIZE  (8u  * 1024u)
 #define OAM_SIZE   160u
 #define HRAM_SIZE  127u
+
+/* MBC types we care about. */
+typedef enum {
+    MBC_NONE = 0,
+    MBC_1    = 1,
+} mbc_type;
 
 typedef struct mmu {
     u8 rom [ROM_SIZE];
@@ -27,6 +36,20 @@ typedef struct mmu {
 
     u8 ie;          /* FF FF interrupt enable */
     u8 boot_rom_disabled;
+
+    /* Cartridge banking state. `rom_bank` is the index of the bank mapped
+     * at $4000..$7FFF (1-based — bank 0 is permanently at $0000..$3FFF).
+     * `rom_banks` is the number of 16 KB banks the loaded ROM actually
+     * has; bank-switch writes are masked to this. */
+    mbc_type mbc;
+    u8       rom_bank;
+    u16      rom_banks;
+
+    /* Back-pointer used solely to fake the LY (FF44) scanline counter so
+     * Pan-Docs-pattern boot loops ("wait for LY == $94") can progress
+     * without us having to implement an actual PPU. NULL = LY reads
+     * return the raw io[$44] byte. */
+    struct cpu_state *cpu;
 
     /* Serial output capture — Blargg test ROMs write ASCII to FF01 then $81 to FF02. */
     void (*serial_sink)(void *ctx, u8 byte);
