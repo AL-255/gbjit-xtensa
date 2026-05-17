@@ -40,6 +40,7 @@ static void usage(const char *argv0) {
 int main(int argc, char **argv) {
     bool use_jit = false;
     bool no_cache = false;
+    bool no_prefetch = false;
     u64 max_cycles = 200000000ull;
     const char *rom_path = NULL;
 
@@ -47,6 +48,7 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "--interp") == 0) use_jit = false;
         else if (strcmp(argv[i], "--jit") == 0) use_jit = true;
         else if (strcmp(argv[i], "--no-cache") == 0) { use_jit = true; no_cache = true; }
+        else if (strcmp(argv[i], "--no-prefetch") == 0) { use_jit = true; no_prefetch = true; }
         else if (strcmp(argv[i], "--max-cycles") == 0 && i + 1 < argc) {
             max_cycles = strtoull(argv[++i], NULL, 0);
         } else if (argv[i][0] == '-') {
@@ -87,6 +89,7 @@ int main(int argc, char **argv) {
             return 4;
         }
         disp.no_cache = no_cache;
+        if (no_prefetch) disp.prefetch_enabled = false;
         gbjit_dispatcher_run_until(&disp, max_cycles);
     } else {
         sm83_run_until(&cpu, max_cycles);
@@ -99,16 +102,20 @@ int main(int argc, char **argv) {
 
     const char *mode_label = !use_jit ? "interp"
                             : no_cache ? "JIT(no_cache)"
+                            : no_prefetch ? "JIT(no_prefetch)"
                             : "JIT";
     fprintf(stderr, "\n--- %s halted at PC=%04X cycles=%llu elapsed=%.0f us throughput=%.2f MHz (%.2fx DMG)",
             mode_label,
             cpu.pc, (unsigned long long)cpu.cycles, elapsed_us, mhz, dmg_ratio);
     if (use_jit) {
-        fprintf(stderr, " blocks=%llu/%llu chain=%llu/%llu",
+        fprintf(stderr,
+                " blocks=%llu/%llu chain=%llu/%llu prefetch=%llu(+%llu_cached)",
                 (unsigned long long)disp.blocks_compiled,
                 (unsigned long long)disp.blocks_executed,
                 (unsigned long long)disp.chain_hits,
-                (unsigned long long)disp.chain_misses);
+                (unsigned long long)disp.chain_misses,
+                (unsigned long long)disp.prefetched_blocks,
+                (unsigned long long)disp.prefetch_already_cached);
         gbjit_dispatcher_shutdown(&disp);
     }
     fprintf(stderr, " ---\n");

@@ -122,6 +122,8 @@ bool gbjit_dispatcher_init(gbjit_dispatcher *d, cpu_state *cpu) {
     if (!d->arena) return false;
     codecache_init(&d->cc, (u8 *)d->arena, d->arena_cap);
     d->interp_fallback = false;
+    d->prefetch_enabled = true;
+    d->prefetch_depth = 4;
     return true;
 }
 
@@ -222,6 +224,40 @@ static void clear_dangling_predictions(gbjit_dispatcher *d, gbjit_block *block) 
             }
             bk = bk->next;
         }
+    }
+}
+
+/* Pre-compile the statically-known successors of a freshly-compiled block,
+ * recursively, up to `depth` levels. Stops at:
+ *   - depth 0
+ *   - blocks already in the cache (just bump the "already cached" stat)
+ *   - dynamic / no-successor terminators (succ_pc == 0xFFFF)
+ *   - allocation failures (codecache arena full)
+ *
+ * Called from the dispatch loop right after a successful compile; the
+ * caller is expected to set `b->predicted_next`/etc. itself for the
+ * triggering block. */
+static void prefetch_successors(gbjit_dispatcher *d, gbjit_block *b, int depth) {
+    if (depth <= 0 || d->no_cache) return;
+    for (int i = 0; i < 2; i++) {
+        u16 pc = b->succ_pc[i];
+        if (pc == 0xFFFFu) continue;
+        if (find_block(d, pc)) {
+            d->prefetch_already_cached++;
+            continue;
+        }
+        resolver_ctx hr = { d->cpu };
+        gbjit_block *nb;
+#if defined(ESP_PLATFORM)
+        nb = gbjit_compile_block(&d->cc, d->cpu, pc, target_helper_addr, &hr);
+#else
+        nb = gbjit_compile_block(&d->cc, d->cpu, pc, host_helper_addr, &hr);
+#endif
+        if (!nb) return;     /* arena full — stop walking */
+        insert_block(d, nb);
+        d->blocks_compiled++;
+        d->prefetched_blocks++;
+        prefetch_successors(d, nb, depth - 1);
     }
 }
 
@@ -423,6 +459,9 @@ void gbjit_dispatcher_run_until(gbjit_dispatcher *d, u64 until) {
             }
             if (!d->no_cache) insert_block(d, b);
             d->blocks_compiled++;
+            if (d->prefetch_enabled) {
+                prefetch_successors(d, b, d->prefetch_depth);
+            }
         }
 
         /* Record the successor link on the previous block (regardless of

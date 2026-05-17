@@ -39,11 +39,12 @@ build_firmware() {
     local mode="$1"
     local extra_def=""
     case "$mode" in
-        interp_only)      extra_def="-DBENCH_MODE_INTERP_ONLY=1" ;;
-        jit_only)         extra_def="-DBENCH_MODE_JIT_ONLY=1" ;;
-        jit_warm_only)    extra_def="-DBENCH_MODE_JIT_WARM_ONLY=1" ;;
-        jit_nocache_only) extra_def="-DBENCH_MODE_JIT_NOCACHE_ONLY=1" ;;
-        both)             extra_def="" ;;
+        interp_only)        extra_def="-DBENCH_MODE_INTERP_ONLY=1" ;;
+        jit_only)           extra_def="-DBENCH_MODE_JIT_ONLY=1" ;;
+        jit_warm_only)      extra_def="-DBENCH_MODE_JIT_WARM_ONLY=1" ;;
+        jit_nocache_only)   extra_def="-DBENCH_MODE_JIT_NOCACHE_ONLY=1" ;;
+        jit_noprefetch_only) extra_def="-DBENCH_MODE_JIT_NOPREFETCH_ONLY=1" ;;
+        both)               extra_def="" ;;
         *) echo "ERR: unknown mode $mode" >&2; exit 1 ;;
     esac
     echo "[bench] building firmware: $mode (budget=$BUDGET)..." >&2
@@ -94,8 +95,8 @@ run_pass() {
     echo "[bench] $mode: trace size = $(du -h "$trace_log" | awk '{print $1}')"
 }
 
-# --- Run all four modes, separately, with rebuilds in between. ----------
-for mode in interp_only jit_nocache_only jit_only jit_warm_only; do
+# --- Run all five modes, separately, with rebuilds in between. ----------
+for mode in interp_only jit_nocache_only jit_noprefetch_only jit_only jit_warm_only; do
     build_firmware "$mode"
     run_pass "$mode"
 done
@@ -111,10 +112,11 @@ done
 
 # Combine into a single summary.
 "$BENCH_DIR/combine.py" \
-    interp        "$RESULTS_DIR/interp_only_bench_lines.txt"      "$RESULTS_DIR/interp_only_qemu_trace.log" \
-    jit_nocache   "$RESULTS_DIR/jit_nocache_only_bench_lines.txt" "$RESULTS_DIR/jit_nocache_only_qemu_trace.log" \
-    jit           "$RESULTS_DIR/jit_only_bench_lines.txt"         "$RESULTS_DIR/jit_only_qemu_trace.log" \
-    jit_warm      "$RESULTS_DIR/jit_warm_only_bench_lines.txt"    "$RESULTS_DIR/jit_warm_only_qemu_trace.log" \
+    interp         "$RESULTS_DIR/interp_only_bench_lines.txt"         "$RESULTS_DIR/interp_only_qemu_trace.log" \
+    jit_nocache    "$RESULTS_DIR/jit_nocache_only_bench_lines.txt"    "$RESULTS_DIR/jit_nocache_only_qemu_trace.log" \
+    jit_noprefetch "$RESULTS_DIR/jit_noprefetch_only_bench_lines.txt" "$RESULTS_DIR/jit_noprefetch_only_qemu_trace.log" \
+    jit            "$RESULTS_DIR/jit_only_bench_lines.txt"            "$RESULTS_DIR/jit_only_qemu_trace.log" \
+    jit_warm       "$RESULTS_DIR/jit_warm_only_bench_lines.txt"       "$RESULTS_DIR/jit_warm_only_qemu_trace.log" \
     > "$RESULTS_DIR/summary.md"
 
 echo "[bench] done — see $RESULTS_DIR/summary.md"

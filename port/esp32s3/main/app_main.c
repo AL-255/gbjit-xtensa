@@ -110,9 +110,11 @@ static void run_jit_labelled(const char *label, bool warm_only) {
         "[BENCH] mode=%s cycles=%" PRIu64 " elapsed_us=%" PRId64
         " mhz=%.3f dmg_x=%.3f pc=0x%04X halted=%d"
         " blocks_compiled=%" PRIu64 " blocks_executed=%" PRIu64
-        " chain_hits=%" PRIu64 " chain_misses=%" PRIu64,
+        " chain_hits=%" PRIu64 " chain_misses=%" PRIu64
+        " prefetched=%" PRIu64,
         label, s_cpu.cycles, us, mhz, mhz / 4.194304, s_cpu.pc, s_cpu.halted,
-        d.blocks_compiled, d.blocks_executed, d.chain_hits, d.chain_misses);
+        d.blocks_compiled, d.blocks_executed, d.chain_hits, d.chain_misses,
+        d.prefetched_blocks);
     /* Intentionally leak the dispatcher's arena: gbjit_dispatcher_shutdown
      * tries to free per-block book-keeping that has dangling predicted_next
      * pointers across multiple runs, and a clean teardown isn't worth a
@@ -121,10 +123,37 @@ static void run_jit_labelled(const char *label, bool warm_only) {
 
 static void run_jit(void)      { run_jit_labelled("jit",      false); }
 static void run_jit_warm(void) { run_jit_labelled("jit_warm", true);  }
+/* (run_jit_noprefetch is defined below the static helper.) */
 
 /* No-cache variant: dispatcher recompiles the block on every iteration
  * (cache lookup disabled, codecache arena reset before each compile).
  * This isolates exactly what the JIT cache buys us. */
+static void run_jit_noprefetch(void) {
+    load_rom_and_reset();
+    gbjit_dispatcher d;
+    if (!gbjit_dispatcher_init(&d, &s_cpu)) {
+        ESP_LOGE(TAG, "jit_noprefetch: dispatcher_init FAILED");
+        return;
+    }
+    d.prefetch_enabled = false;
+    ESP_LOGI(TAG, "jit_noprefetch: starting (budget=%" PRIu64 " GB-cycles)",
+             (uint64_t)BENCH_CYCLES_BUDGET);
+    int64_t t0 = esp_timer_get_time();
+    gbjit_dispatcher_run_until(&d, BENCH_CYCLES_BUDGET);
+    int64_t t1 = esp_timer_get_time();
+    int64_t us = t1 - t0;
+    double mhz = (double)s_cpu.cycles / (double)us;
+    ESP_LOGI(TAG,
+        "[BENCH] mode=jit_noprefetch cycles=%" PRIu64 " elapsed_us=%" PRId64
+        " mhz=%.3f dmg_x=%.3f pc=0x%04X halted=%d"
+        " blocks_compiled=%" PRIu64 " blocks_executed=%" PRIu64
+        " chain_hits=%" PRIu64 " chain_misses=%" PRIu64
+        " prefetched=%" PRIu64,
+        s_cpu.cycles, us, mhz, mhz / 4.194304, s_cpu.pc, s_cpu.halted,
+        d.blocks_compiled, d.blocks_executed, d.chain_hits, d.chain_misses,
+        d.prefetched_blocks);
+}
+
 static void run_jit_nocache(void) {
     load_rom_and_reset();
     gbjit_dispatcher d;
@@ -149,6 +178,7 @@ static void run_jit_nocache(void) {
         d.blocks_compiled, d.blocks_executed, d.chain_hits, d.chain_misses);
 }
 
+
 void app_main(void) {
     ESP_LOGI(TAG, "boot — gbjit-xtensa benchmark");
     ESP_LOGI(TAG, "rom size = %u bytes", (unsigned)(blargg_rom_end - blargg_rom_start));
@@ -161,9 +191,12 @@ void app_main(void) {
     run_jit_warm();
 #elif defined(BENCH_MODE_JIT_NOCACHE_ONLY)
     run_jit_nocache();
+#elif defined(BENCH_MODE_JIT_NOPREFETCH_ONLY)
+    run_jit_noprefetch();
 #else
     run_interp();
     run_jit_nocache();
+    run_jit_noprefetch();
     run_jit();
     run_jit_warm();
 #endif

@@ -1453,6 +1453,53 @@ gbjit_block *gbjit_compile_block(codecache *cc, cpu_state *cpu, u16 pc_start,
     b->code = base;
     b->code_size = total;
     b->entry_off = entry_off;
+    b->succ_pc[0] = 0xFFFFu;
+    b->succ_pc[1] = 0xFFFFu;
+
+    /* Static successor analysis for the prefetcher. The terminator is
+     * ops_opcode[n_ops-1] at ops_pc[n_ops-1]; `cur` is the fall-through PC. */
+    u8 term      = ops_opcode[n_ops - 1];
+    u16 term_pc  = ops_pc[n_ops - 1];
+    u16 fallthru = cur;
+    if (!sm83_terminates_block(term)) {
+        /* Hit MAX_OPS_PER_BLOCK before any branch — straight-line successor. */
+        b->succ_pc[0] = fallthru;
+    } else if (term == 0x18) {                          /* JR n8 */
+        i8 off = (i8)mmu_read8(cpu->mmu, (u16)(term_pc + 1));
+        b->succ_pc[0] = (u16)(term_pc + 2 + off);
+    } else if (term == 0x20 || term == 0x28 ||
+               term == 0x30 || term == 0x38) {          /* JR cc, n8 */
+        i8 off = (i8)mmu_read8(cpu->mmu, (u16)(term_pc + 1));
+        b->succ_pc[0] = (u16)(term_pc + 2 + off);
+        b->succ_pc[1] = fallthru;
+    } else if (term == 0xC3) {                          /* JP a16 */
+        u8 lo = mmu_read8(cpu->mmu, (u16)(term_pc + 1));
+        u8 hi = mmu_read8(cpu->mmu, (u16)(term_pc + 2));
+        b->succ_pc[0] = (u16)(lo | (hi << 8));
+    } else if (term == 0xC2 || term == 0xCA ||
+               term == 0xD2 || term == 0xDA) {          /* JP cc, a16 */
+        u8 lo = mmu_read8(cpu->mmu, (u16)(term_pc + 1));
+        u8 hi = mmu_read8(cpu->mmu, (u16)(term_pc + 2));
+        b->succ_pc[0] = (u16)(lo | (hi << 8));
+        b->succ_pc[1] = fallthru;
+    } else if (term == 0xCD) {                          /* CALL a16 */
+        u8 lo = mmu_read8(cpu->mmu, (u16)(term_pc + 1));
+        u8 hi = mmu_read8(cpu->mmu, (u16)(term_pc + 2));
+        b->succ_pc[0] = (u16)(lo | (hi << 8));
+        /* RET-target (= fallthru) is dynamic in general (callee may not
+         * RET, may RET with modified SP, etc.) — don't prefetch it. */
+    } else if (term == 0xC4 || term == 0xCC ||
+               term == 0xD4 || term == 0xDC) {          /* CALL cc, a16 */
+        u8 lo = mmu_read8(cpu->mmu, (u16)(term_pc + 1));
+        u8 hi = mmu_read8(cpu->mmu, (u16)(term_pc + 2));
+        b->succ_pc[0] = (u16)(lo | (hi << 8));
+        b->succ_pc[1] = fallthru;
+    } else if ((term & 0xC7) == 0xC7) {                 /* RST nn */
+        b->succ_pc[0] = (u16)(term & 0x38);
+    }
+    /* Other terminators (RET, RETI, JP (HL), HALT, STOP) have no static
+     * successor we can prefetch — leave succ_pc as 0xFFFF. */
+
     return b;
 }
 

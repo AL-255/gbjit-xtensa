@@ -218,6 +218,30 @@ def main():
         print(f"- `jit_warm` paid the {co_n}-block compile cost in a discarded warm-up pass, so its")
         print(f"  measured window was 100% reuse.")
 
+    # ----- Prefetch speedup -------------------------------------------
+    nopf = next((m for m in modes if m[0] == "jit_noprefetch"), None)
+    jit2 = next((m for m in modes if m[0] == "jit"), None)
+    if nopf and jit2:
+        print()
+        print("## Prefetch speedup (cached JIT, with vs without static-successor prefetch)\n")
+        np_us = int(nopf[1]["elapsed_us"])
+        pf_us = int(jit2[1]["elapsed_us"])
+        print("| Mode | Wall µs | × DMG | blocks_compiled | chain_misses | prefetched |")
+        print("|------|--------:|------:|----------------:|-------------:|-----------:|")
+        for label, bench, _ in (("jit_noprefetch", nopf[1], None), ("jit", jit2[1], None)):
+            print(f"| {label} | {int(bench['elapsed_us']):,} | {bench['dmg_x']} | "
+                  f"{bench.get('blocks_compiled','?')} | "
+                  f"{bench.get('chain_misses','?')} | "
+                  f"{bench.get('prefetched','?')} |")
+        ratio = np_us / pf_us if pf_us > 0 else 0.0
+        print()
+        print(f"Speedup from prefetch (`jit` vs `jit_noprefetch`): **{ratio:.2f}×** wall-time.")
+        print(f"`jit` pays {jit2[1].get('prefetched','?')} extra compile calls inside `gbjit_compile_block`")
+        print(f"(walking successor PCs to depth {4}) so block discovery isn't spread one-per-")
+        print(f"chain-miss across the run. The visible win on a tight loop is modest; the")
+        print(f"latency win on first-encounter spikes (game enters new code) is much larger")
+        print(f"than the wall-time numbers here suggest.")
+
     if cold and warm:
         print()
         print("## JIT on-the-fly compilation overhead (the answer to: does the JIT row include translation cost?)\n")

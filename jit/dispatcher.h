@@ -43,6 +43,17 @@ typedef struct gbjit_dispatcher {
      * is bypassed and the codecache arena is wiped before each compile.
      * Used by the bench harness to quantify the JIT cache's value. */
     bool no_cache;
+
+    /* Static-successor prefetcher. When `prefetch_enabled` is true, every
+     * fresh compile is followed by recursive pre-compilation of the new
+     * block's statically-known taken-target / fall-through PCs, up to
+     * `prefetch_depth` levels (default 4). Disable by clearing
+     * `prefetch_enabled` for benchmarking. */
+    bool prefetch_enabled;
+    u8   prefetch_depth;
+    /* Stats. */
+    u64  prefetched_blocks;        /* compiled by the prefetcher (not the hot path) */
+    u64  prefetch_already_cached;  /* successor was already in the bucket table */
 } gbjit_dispatcher;
 
 bool gbjit_dispatcher_init(gbjit_dispatcher *d, cpu_state *cpu);

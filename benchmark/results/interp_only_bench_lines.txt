@@ -1,2 +1,2 @@
-I (60) gbjit: [BENCH] mode=interp cycles=200004 elapsed_us=7219 mhz=27.705 dmg_x=6.605 pc=0xC7EF halted=0
-I (60) gbjit: [BENCH] done
+I (59) gbjit: [BENCH] mode=interp cycles=200004 elapsed_us=7153 mhz=27.961 dmg_x=6.666 pc=0xC7EF halted=0
+I (59) gbjit: [BENCH] done
