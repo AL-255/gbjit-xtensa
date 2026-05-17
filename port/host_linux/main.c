@@ -19,7 +19,7 @@ static int read_file(const char *path, u8 **out, size_t *len) {
     fseek(f, 0, SEEK_END);
     long sz = ftell(f);
     fseek(f, 0, SEEK_SET);
-    if (sz <= 0 || sz > (long)ROM_SIZE) { fclose(f); return -2; }
+    if (sz <= 0 || sz > (long)ROM_SIZE_MAX) { fclose(f); return -2; }
     u8 *buf = malloc((size_t)sz);
     if (fread(buf, 1, (size_t)sz, f) != (size_t)sz) { free(buf); fclose(f); return -3; }
     fclose(f);

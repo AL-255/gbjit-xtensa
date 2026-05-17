@@ -23,9 +23,21 @@
 
 #if defined(ESP_PLATFORM)
 #include "esp_heap_caps.h"
+#include "esp_log.h"
 #endif
 
-#define ARENA_CAP_DEFAULT (64u * 1024u)
+/* Upper bound on the JIT exec arena. The host malloc / Linux mmap paths
+ * grab this directly. On ESP32-S3 the runtime queries
+ * heap_caps_get_largest_free_block(MALLOC_CAP_EXEC) and uses the largest
+ * available block clamped to this ceiling — so on the real chip the JIT
+ * grows to whatever exec-capable internal SRAM is actually free (typically
+ * 60-100 KB on the qemu/bench build, much more if the firmware doesn't
+ * statically reserve a big cartridge ROM array). */
+#define ARENA_CAP_MAX     (384u * 1024u)
+#define ARENA_CAP_DEFAULT ( 64u * 1024u)
+/* Leave at least this much heap headroom for the rest of the firmware
+ * (IDF allocs, scratch buffers) when we go above the static default. */
+#define ARENA_HEADROOM    (  4u * 1024u)
 
 /* Host-side address-space sentinels. The JIT-emitted Xtensa code uses these
  * as L32R-loaded base addresses; the sim's translate() routes the range back
@@ -117,22 +129,46 @@ typedef struct smc_page_node {
 bool gbjit_dispatcher_init(gbjit_dispatcher *d, cpu_state *cpu) {
     memset(d, 0, sizeof(*d));
     d->cpu = cpu;
-    /* Try the default arena size first, then degrade. On ESP32-S3 the
-     * largest contiguous block of EXEC-capable internal SRAM is sensitive
-     * to .bss size (our 256 KB cartridge ROM array eats a lot of DRAM,
-     * which fragments the unified IRAM/DRAM pool). For small carts the
-     * JIT only emits a few KB of code, so a 32 KB or even 16 KB arena
-     * still runs everything we benchmark. */
-    static const u32 arena_caps[] = {
-        ARENA_CAP_DEFAULT,  /* 64 KB */
-        32u * 1024u,
-        16u * 1024u,
-        8u  * 1024u,
-    };
-    for (u32 i = 0; i < sizeof(arena_caps)/sizeof(arena_caps[0]); i++) {
-        d->arena_cap = arena_caps[i];
+
+#if defined(ESP_PLATFORM)
+    /* Probe the heap so the arena scales with whatever exec-capable
+     * internal SRAM is actually free at boot. ESP32-S3 unifies IRAM and
+     * DRAM, so the size we get back depends on .bss footprint (chiefly
+     * our 256 KB cartridge ROM array). */
+    size_t avail = heap_caps_get_largest_free_block(
+        MALLOC_CAP_EXEC | MALLOC_CAP_INTERNAL | MALLOC_CAP_32BIT);
+    if (avail > ARENA_HEADROOM) avail -= ARENA_HEADROOM;
+    else                        avail  = 0;
+    avail &= ~(size_t)0xFFFu;            /* 4 KB-align down */
+    if (avail > ARENA_CAP_MAX) avail = ARENA_CAP_MAX;
+    ESP_LOGI("gbjit_jit", "exec arena: largest free EXEC block = %u KB, requesting %u KB",
+             (unsigned)(heap_caps_get_largest_free_block(
+                 MALLOC_CAP_EXEC | MALLOC_CAP_INTERNAL | MALLOC_CAP_32BIT) / 1024u),
+             (unsigned)(avail / 1024u));
+    if (avail >= 8u * 1024u) {
+        d->arena_cap = (u32)avail;
         d->arena = alloc_exec_arena(d->arena_cap);
-        if (d->arena) break;
+    }
+#else
+    d->arena_cap = ARENA_CAP_DEFAULT;
+    d->arena = alloc_exec_arena(d->arena_cap);
+#endif
+
+    /* Fallback ladder if the runtime-sized request failed (or the static
+     * default did on host). Each step halves; we never go below 8 KB. */
+    if (!d->arena) {
+        static const u32 fallback_caps[] = {
+            ARENA_CAP_DEFAULT,
+            32u * 1024u,
+            16u * 1024u,
+            8u  * 1024u,
+        };
+        for (u32 i = 0; i < sizeof(fallback_caps)/sizeof(fallback_caps[0]); i++) {
+            if (fallback_caps[i] >= d->arena_cap) continue;  /* already tried bigger */
+            d->arena_cap = fallback_caps[i];
+            d->arena = alloc_exec_arena(d->arena_cap);
+            if (d->arena) break;
+        }
     }
     if (!d->arena) return false;
     codecache_init(&d->cc, (u8 *)d->arena, d->arena_cap);

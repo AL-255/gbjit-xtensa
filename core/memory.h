@@ -3,14 +3,22 @@
 
 #include "gb_types.h"
 
-/* MMU: up to 256 KB cartridge ROM (enough for most small commercial titles
-   like Super Mario Land, Tetris, Dr Mario), 8 KB VRAM, 8 KB WRAM, OAM, IO,
+/* MMU: cartridge ROM (heap-allocated, sized to the actual cart on
+   mmu_load_rom — see ROM_SIZE_MAX), 8 KB VRAM, 8 KB WRAM, OAM, IO,
    HRAM. Minimal MBC1 banking: 5-bit low + 2-bit high ROM bank number,
    ROM-mode only (no RAM bank). MBC0 carts are handled as the degenerate
-   case (rom_bank stays at 1 and writes to $0000..$7FFF are ignored). */
+   case (rom_bank stays at 1 and writes to $0000..$7FFF are ignored).
 
-#define ROM_SIZE   (256u * 1024u)
+   Why ROM is a pointer rather than a static array: on the ESP32-S3 the
+   JIT exec arena is carved out of internal SRAM, and the worst-case 256
+   KB cartridge would eat most of DRAM if we held it as `.bss`. Going
+   through a pointer lets us either (a) allocate only what the loaded
+   cart needs, or (b) place the cart in PSRAM on real hardware, freeing
+   ~200 KB of internal SRAM for JIT-emitted code. */
+
+#define ROM_SIZE_MAX (256u * 1024u)
 #define ROM_BANK_SIZE (16u * 1024u)
+#define ROM_DEFAULT_BYTES (32u * 1024u)  /* allocated by mmu_init */
 #define VRAM_SIZE  (8u  * 1024u)
 #define WRAM_SIZE  (8u  * 1024u)
 #define OAM_SIZE   160u
@@ -23,7 +31,10 @@ typedef enum {
 } mbc_type;
 
 typedef struct mmu {
-    u8 rom [ROM_SIZE];
+    u8 *rom;            /* heap-backed cart ROM. mmu_init allocates */
+                        /* ROM_DEFAULT_BYTES; mmu_load_rom resizes to */
+                        /* the cart's actual rounded-up bank count. */
+    u32 rom_capacity;   /* bytes actually allocated for *rom */
     u8 vram[VRAM_SIZE];
     u8 wram[WRAM_SIZE];
     u8 oam [OAM_SIZE];
@@ -62,6 +73,7 @@ typedef struct mmu {
 } mmu;
 
 void mmu_init(mmu *m);
+void mmu_destroy(mmu *m);   /* free heap-allocated ROM buffer */
 bool mmu_load_rom(mmu *m, const u8 *data, size_t len);
 
 u8   mmu_read8 (mmu *m, u16 addr);

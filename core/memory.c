@@ -1,20 +1,77 @@
 #include "memory.h"
 #include "cpu_state.h"
+#include <stdlib.h>
 #include <string.h>
+
+#if defined(ESP_PLATFORM)
+#include "esp_heap_caps.h"
+#endif
 
 /* Bring `struct cpu_state` into scope for the LY fake-read in mmu_read8. */
 typedef struct cpu_state cpu_state_t;
 
+/* Cart ROM is heap-allocated so its DRAM footprint matches the actual
+ * cart size, not the worst case. On ESP32-S3 we prefer PSRAM if it's
+ * available — ROM is read-only and accessed via the JIT helper path,
+ * cache-friendly, and moving it out of internal SRAM is what frees up
+ * room for the JIT exec arena. */
+static void *rom_alloc(size_t bytes) {
+#if defined(ESP_PLATFORM)
+    void *p = heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!p) p = heap_caps_malloc(bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    return p;
+#else
+    return malloc(bytes);
+#endif
+}
+
+static void rom_free(void *p) {
+#if defined(ESP_PLATFORM)
+    if (p) heap_caps_free(p);
+#else
+    free(p);
+#endif
+}
+
 void mmu_init(mmu *m) {
+    /* Free any previously-allocated heap rom first — otherwise re-init'ing
+     * the same mmu (the JIT warm-pass harness does this between passes)
+     * leaks the buffer and we eventually exhaust internal SRAM. Safe on
+     * first use because static mmu instances are zero-initialised, and
+     * rom_free(NULL) is a no-op. */
+    rom_free(m->rom);
     memset(m, 0, sizeof(*m));
     m->boot_rom_disabled = 1; /* skip boot ROM — start at $0100 */
     m->mbc = MBC_NONE;
     m->rom_bank = 1;
     m->rom_banks = 2;        /* default: 32 KB single-bank cart */
+    /* Allocate a default-sized buffer so callers that write into m->rom
+     * before mmu_load_rom (the unit tests do) have somewhere to write. */
+    m->rom_capacity = ROM_DEFAULT_BYTES;
+    m->rom = (u8 *)rom_alloc(m->rom_capacity);
+    if (m->rom) memset(m->rom, 0xFF, m->rom_capacity);
+    else        m->rom_capacity = 0;
+}
+
+void mmu_destroy(mmu *m) {
+    if (!m) return;
+    rom_free(m->rom);
+    m->rom = NULL;
+    m->rom_capacity = 0;
 }
 
 bool mmu_load_rom(mmu *m, const u8 *data, size_t len) {
-    if (len == 0 || len > ROM_SIZE) return false;
+    if (len == 0 || len > ROM_SIZE_MAX) return false;
+    /* Round up to a whole 16 KB bank so the high-region access path
+     * (rom_bank * ROM_BANK_SIZE + offset) never reads past the buffer. */
+    size_t need = (len + ROM_BANK_SIZE - 1u) & ~(size_t)(ROM_BANK_SIZE - 1u);
+    if (need > m->rom_capacity) {
+        rom_free(m->rom);
+        m->rom = (u8 *)rom_alloc(need);
+        if (!m->rom) { m->rom_capacity = 0; return false; }
+        m->rom_capacity = (u32)need;
+    }
+    memset(m->rom, 0xFF, m->rom_capacity);
     memcpy(m->rom, data, len);
     /* Decode cartridge header (Pan Docs $0147 / $0148). */
     u8 cart_type = (len > 0x147u) ? data[0x147] : 0;
@@ -57,7 +114,7 @@ u8 mmu_read8(mmu *m, u16 addr) {
     if (addr < 0x4000u) return m->rom[addr];           /* bank 0 fixed */
     if (addr < 0x8000u) {                              /* banked region */
         u32 off = ((u32)m->rom_bank * ROM_BANK_SIZE) + (addr - 0x4000u);
-        if (off >= ROM_SIZE) off &= (ROM_SIZE - 1u);   /* wrap for safety */
+        if (m->rom_capacity && off >= m->rom_capacity) off %= m->rom_capacity;
         return m->rom[off];
     }
     if (addr < 0xA000u) return m->vram[addr - 0x8000u];
