@@ -21,3 +21,7 @@ add_test(NAME jit_differential COMMAND test_jit_differential)
 add_executable(test_smc test_smc.c)
 target_link_libraries(test_smc PRIVATE gbjit_jit)
 add_test(NAME smc COMMAND test_smc)
+
+# Manual diagnostic tool (not registered as a ctest) — point at a .gb ROM.
+add_executable(test_stepwise_diff test_stepwise_diff.c)
+target_link_libraries(test_stepwise_diff PRIVATE gbjit_jit)

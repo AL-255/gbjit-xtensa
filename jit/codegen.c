@@ -295,7 +295,7 @@ static bool inline_op(xt_emit *e, u8 opcode, u16 pc, inline_ctx *ictx) {
         u8 dst = (opcode >> 3) & 7;
         int off = reg8_offset(dst);
         if (off < 0) return false;
-        u8 imm = m->rom[(pc + 1) & 0x7FFFu];
+        u8 imm = mmu_read8(m, (u16)(pc + 1));
         /* movi a2, imm ; s8i a2, a13, off */
         xt_movi(e, 2, (i32)imm);
         xt_s8i(e, 2, 13, (u32)off);
@@ -402,7 +402,7 @@ static bool inline_op(xt_emit *e, u8 opcode, u16 pc, inline_ctx *ictx) {
 
     /* --- JR r8 (0x18, unconditional) — block terminator. */
     if (opcode == 0x18) {
-        i8 off = (i8)m->rom[(pc + 1) & 0x7FFFu];
+        i8 off = (i8)mmu_read8(m, (u16)(pc + 1));
         u16 target = (u16)(pc + 2 + off);
         emit_load_u16(e, 11, target, 2);
         xt_addi(e, 12, 12, 12);
@@ -422,7 +422,7 @@ static bool inline_op(xt_emit *e, u8 opcode, u16 pc, inline_ctx *ictx) {
      *   .end:
      */
     if (opcode == 0x20 || opcode == 0x28 || opcode == 0x30 || opcode == 0x38) {
-        i8 off = (i8)m->rom[(pc + 1) & 0x7FFFu];
+        i8 off = (i8)mmu_read8(m, (u16)(pc + 1));
         u16 target      = (u16)(pc + 2 + off);
         u16 fallthrough = (u16)(pc + 2);
         u8 cc = (opcode >> 3) & 3;
@@ -459,8 +459,8 @@ static bool inline_op(xt_emit *e, u8 opcode, u16 pc, inline_ctx *ictx) {
 
     /* --- JP a16 (0xC3) — unconditional, block terminator. */
     if (opcode == 0xC3) {
-        u8 lo = m->rom[(pc + 1) & 0x7FFFu];
-        u8 hi = m->rom[(pc + 2) & 0x7FFFu];
+        u8 lo = mmu_read8(m, (u16)(pc + 1));
+        u8 hi = mmu_read8(m, (u16)(pc + 2));
         u16 target = (u16)(lo | (hi << 8));
         emit_load_u16(e, 11, target, 2);
         xt_addi(e, 12, 12, 16);
@@ -469,8 +469,8 @@ static bool inline_op(xt_emit *e, u8 opcode, u16 pc, inline_ctx *ictx) {
 
     /* --- JP cc, a16 (0xC2/0xCA/0xD2/0xDA). */
     if (opcode == 0xC2 || opcode == 0xCA || opcode == 0xD2 || opcode == 0xDA) {
-        u8 lo = m->rom[(pc + 1) & 0x7FFFu];
-        u8 hi = m->rom[(pc + 2) & 0x7FFFu];
+        u8 lo = mmu_read8(m, (u16)(pc + 1));
+        u8 hi = mmu_read8(m, (u16)(pc + 2));
         u16 target      = (u16)(lo | (hi << 8));
         u16 fallthrough = (u16)(pc + 3);
         u8 cc = (opcode >> 4) & 1; /* 0=Z-group (NZ/Z), 1=C-group (NC/C) */
@@ -509,8 +509,8 @@ static bool inline_op(xt_emit *e, u8 opcode, u16 pc, inline_ctx *ictx) {
      * timer regs, IF/IE, etc.). Region-check is fully resolved at codegen
      * time — no runtime branch. */
     if (opcode == 0xFA || opcode == 0xEA) {
-        u8 lo = m->rom[(pc + 1) & 0x7FFFu];
-        u8 hi = m->rom[(pc + 2) & 0x7FFFu];
+        u8 lo = mmu_read8(m, (u16)(pc + 1));
+        u8 hi = mmu_read8(m, (u16)(pc + 2));
         u16 a16 = (u16)(lo | (hi << 8));
         u32 byte_addr = inlinable_byte_addr(ictx->mmu_base_value, a16);
         if (!byte_addr) return false;          /* IO / VRAM / ECHO → helper */
@@ -533,7 +533,7 @@ static bool inline_op(xt_emit *e, u8 opcode, u16 pc, inline_ctx *ictx) {
      * GB address = 0xFF00 | n8. Only inline when n8 ≥ 0x80 (HRAM range);
      * leave IO accesses (0xFF00..0xFF7F) on the helper. */
     if (opcode == 0xE0 || opcode == 0xF0) {
-        u8 n8 = m->rom[(pc + 1) & 0x7FFFu];
+        u8 n8 = mmu_read8(m, (u16)(pc + 1));
         if (n8 < 0x80) return false;
         u16 a16 = (u16)(0xFF00u | n8);
         u32 byte_addr = inlinable_byte_addr(ictx->mmu_base_value, a16);
@@ -563,8 +563,8 @@ static bool inline_op(xt_emit *e, u8 opcode, u16 pc, inline_ctx *ictx) {
             case 2: off = OFF_HL; break;
             case 3: off = OFF_SP; break;
         }
-        u8 lo = m->rom[(pc + 1) & 0x7FFFu];
-        u8 hi = m->rom[(pc + 2) & 0x7FFFu];
+        u8 lo = mmu_read8(m, (u16)(pc + 1));
+        u8 hi = mmu_read8(m, (u16)(pc + 2));
         u32 imm16 = ((u32)hi << 8) | lo;
         /* Build imm16 in a2 via two MOVIs (each ≤ 255 fits in MOVI's signed 12). */
         xt_movi(e, 2, (i32)lo);
@@ -589,7 +589,7 @@ static bool inline_op(xt_emit *e, u8 opcode, u16 pc, inline_ctx *ictx) {
      * Non-(HL) variants are fully inlined with eager flags. (HL) variants
      * (src==6) fall back to the helper.                                    */
     if (opcode == 0xCB) {
-        u8 sub = m->rom[(pc + 1) & 0x7FFFu];
+        u8 sub = mmu_read8(m, (u16)(pc + 1));
         u8 reg = sub & 7;
         u8 grp = (sub >> 6) & 3;
         u8 sub_op = (sub >> 3) & 7;
@@ -768,7 +768,7 @@ static bool inline_op(xt_emit *e, u8 opcode, u16 pc, inline_ctx *ictx) {
      *                0xE6 AND, 0xEE XOR, 0xF6 OR,  0xFE CP. */
     if (opcode == 0xC6 || opcode == 0xCE || opcode == 0xD6 || opcode == 0xDE ||
         opcode == 0xE6 || opcode == 0xEE || opcode == 0xF6 || opcode == 0xFE) {
-        u8 imm = m->rom[(pc + 1) & 0x7FFFu];
+        u8 imm = mmu_read8(m, (u16)(pc + 1));
         u8 group = (opcode >> 3) & 0x7;
         xt_l8ui(e, 2, 13, OFF_A);
         xt_movi(e, 3, (i32)imm);
@@ -818,7 +818,7 @@ gbjit_block *gbjit_compile_block(codecache *cc, cpu_state *cpu, u16 pc_start,
     u32 n_ops = 0;
     u16 cur = pc_start;
     while (n_ops < MAX_OPS_PER_BLOCK) {
-        u8 opcode = cpu->mmu->rom[cur & 0x7FFFu];
+        u8 opcode = mmu_read8(cpu->mmu, cur);
         const sm83_op_info *info = sm83_decode(opcode);
         ops_pc[n_ops] = cur;
         ops_opcode[n_ops] = opcode;

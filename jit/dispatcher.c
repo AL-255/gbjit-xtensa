@@ -351,6 +351,26 @@ void gbjit_dispatcher_run_until(gbjit_dispatcher *d, u64 until) {
     gbjit_block *prev = NULL;
 
     while (cpu->cycles < until) {
+        /* Service pending interrupts and wake from HALT before each block.
+         * The JIT inlines HALT as a simple `cpu->halted = 1; exit block`, so
+         * we depend on the dispatcher to re-enter the interrupt path that
+         * the reference interpreter normally runs at the top of sm83_step. */
+        if (sm83_service_interrupts(cpu)) {
+            prev = NULL;
+        }
+        if (cpu->halted) {
+            cpu->cycles += 4;
+            continue;
+        }
+        /* EI delayed-enable: when ime_pending is set, run the next op via
+         * the interpreter so that the reference path handles the ime promotion
+         * (ime becomes 1 after exactly one op following EI). Inlined ops
+         * don't touch ime_pending. */
+        if (cpu->ime_pending) {
+            sm83_step(cpu);
+            prev = NULL;
+            continue;
+        }
         if (d->interp_fallback) {
             sm83_step(cpu);
             continue;

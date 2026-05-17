@@ -37,6 +37,10 @@ static const sm83_op_info table[256] = {
 const sm83_op_info *sm83_decode(u8 opcode) { return &table[opcode]; }
 
 bool sm83_terminates_block(u8 opcode) {
+    /* EI is a terminator from the JIT's perspective: its "delayed enable"
+     * effect (ime becomes 1 after the NEXT instruction) only works if the
+     * dispatcher gets control between EI and that next op. */
     u8 f = table[opcode].flags;
-    return (f & (SM83_OP_FLAG_BRANCH | SM83_OP_FLAG_HALT | SM83_OP_FLAG_STOP)) != 0;
+    return (f & (SM83_OP_FLAG_BRANCH | SM83_OP_FLAG_HALT | SM83_OP_FLAG_STOP
+               | SM83_OP_FLAG_EI)) != 0;
 }

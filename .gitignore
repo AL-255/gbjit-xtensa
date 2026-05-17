@@ -8,6 +8,7 @@ build_*/
 *.map
 *.gb
 *.gbc
+roms/
 .cache/
 .idea/
 .vscode/
