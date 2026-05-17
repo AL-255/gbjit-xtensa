@@ -106,6 +106,32 @@ int main(void) {
     run_jit   (alu_prog, sizeof(alu_prog), &cpu_j2, &m_j2);
     check_match("alu rom", &cpu_i2, &cpu_j2);
 
+    /* Fibonacci ROM — exercises the inlined JR cc loop, INC/DEC flags, and
+     * cross-iteration register state. After 8 iterations starting from
+     * a=0,b=1, A=fib(8)=21 ($15), B=fib(7)=13 ($0D), C=0. */
+    static const u8 fib_prog[] = {
+        0x3E, 0x00,             /* LD A,$00 */
+        0x06, 0x01,             /* LD B,$01 */
+        0x0E, 0x08,             /* LD C,$08 */
+        /* loop @ 0x0106: */
+        0x67,                   /* LD H,A   (temp = a) */
+        0x80,                   /* ADD A,B  (a = a + b) */
+        0x44,                   /* LD B,H   (b = temp)        ; 0x44 = LD B,H */
+        0x0D,                   /* DEC C */
+        0x20, 0xFA,             /* JR NZ,-6  -> back to loop */
+        0x76,                   /* HALT */
+    };
+    static cpu_state cpu_if, cpu_jf;
+    static mmu m_if, m_jf;
+    run_interp(fib_prog, sizeof(fib_prog), &cpu_if, &m_if);
+    run_jit   (fib_prog, sizeof(fib_prog), &cpu_jf, &m_jf);
+    check_match("fib rom", &cpu_if, &cpu_jf);
+    if (cpu_jf.a != 0x15 || cpu_jf.b != 0x0D) {
+        fprintf(stderr, "FAIL fib end: A=%02X B=%02X (expected $15, $0D)\n",
+                cpu_jf.a, cpu_jf.b);
+        failed++;
+    }
+
     /* Loop ROM — multiple blocks, exercises the dispatcher's chain cache. */
     static const u8 loop_prog[] = {
         0x06, 0x00,             /* 0x0100  LD B,$00 */

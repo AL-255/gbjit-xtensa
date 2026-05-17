@@ -91,11 +91,11 @@ int main(void) {
     /* BNEZ a3, +4: sel=5 -> 0x000356 */
     ONE_INSTR(xt_bnez(&e, 3, 4), 0x000356, "BNEZ a3,+4");
 
-    /* J +4: off = (rel-4) = 0, imm18=0; opcode bits 0..5 = 0x26
-       word = (0 << 6) | 0x26 = 0x000026 */
-    ONE_INSTR(xt_j(&e, 4), 0x000026, "J +4");
-    /* J +0x10 -> off=0xC, imm18=0xC; word = (0xC<<6)|0x26 = 0x000326 */
-    ONE_INSTR(xt_j(&e, 0x10), 0x000326, "J +16");
+    /* J +4: off=0, imm18=0, bits 0..5 = 0x06 → word = 0x000006
+       (verified against xtensa-esp32s3-elf-as) */
+    ONE_INSTR(xt_j(&e, 4), 0x000006, "J +4");
+    /* J +0x10: off=0xC, imm18=0xC → word = (0xC<<6)|0x06 = 0x000306 */
+    ONE_INSTR(xt_j(&e, 0x10), 0x000306, "J +16");
 
     /* L32R a3, label at (PC & ~3) - 4: imm16 = 0xFFFF (i.e., -1 in -262140..-4 range)
        Encoding: imm16 in bits 8..23, t in bits 4..7, op0=1.

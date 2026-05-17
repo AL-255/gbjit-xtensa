@@ -170,24 +170,22 @@ u32 xt_bnei(xt_emit *e, u8 as, i32 imm, i32 rel) {
  *   CALLX0: RRR with op0=0, t=0xC, s=as.  (0x0000C0 | (as<<8))
  *   RET:    a fixed encoding 0x000080 in CALL0 ABI.                          */
 u32 xt_j(xt_emit *e, i32 rel) {
+    /* Verified against xtensa-esp32s3-elf-as: bits 0..5 = 0x06, bits 6..23 =
+     * 18-bit signed offset, target = pc + 4 + offset. */
     i32 off = rel - 4;
     assert(off >= -(1 << 17) && off < (1 << 17));
     u32 imm18 = (u32)off & 0x3FFFFu;
-    /* op0=6, n=2 → bits 0..5 = 0b000110 | (2<<4) = 0x26? No:
-     * Actually for J the opcode bits 0..5 = 0b100110 = 0x26 (op0=6 in bits 0..3, n=2 in bits 4..5).
-     * Then bits 6..23 = imm18.                                              */
-    return emit24(e, ((imm18 & 0x3FFFFu) << 6) | 0x26u);
+    return emit24(e, (imm18 << 6) | 0x06u);
 }
 u32 xt_call0(xt_emit *e, i32 rel) {
-    /* Target must be 4-byte aligned. */
+    /* CALL0: bits 0..5 = 0x05 (op0=5, n=0). Target must be 4-aligned. */
     assert((rel & 3) == 0);
     i32 off = rel - 4;
     assert((off & 3) == 0);
     off >>= 2;
     assert(off >= -(1 << 17) && off < (1 << 17));
     u32 imm18 = (u32)off & 0x3FFFFu;
-    /* op0=5, n=0 → bits 0..5 = 0b000101 = 0x05. Then bits 6..23 = imm18. */
-    return emit24(e, ((imm18 & 0x3FFFFu) << 6) | 0x05u);
+    return emit24(e, (imm18 << 6) | 0x05u);
 }
 u32 xt_jx(xt_emit *e, u8 as) {
     /* JX as: op0=0, op1=0, op2=0, r=0, s=as, t=0xA. */

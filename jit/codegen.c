@@ -139,6 +139,57 @@ static void emit_advance(xt_emit *e, u8 n_bytes, u8 n_cycles) {
     xt_addi(e, 12, 12, n_cycles);
 }
 
+/* Load a 16-bit unsigned value into `dst`. Uses `scratch` (must differ from
+ * dst) when the value doesn't fit in MOVI's 12-bit signed range. Emits
+ * either 1 or 4 Xtensa instructions. */
+static void emit_load_u16(xt_emit *e, u8 dst, u16 value, u8 scratch) {
+    if (value <= 2047) {
+        xt_movi(e, dst, (i32)value);
+        return;
+    }
+    u8 lo = (u8)(value & 0xFFu);
+    u8 hi = (u8)((value >> 8) & 0xFFu);
+    xt_movi(e, dst, (i32)lo);
+    xt_movi(e, scratch, (i32)hi);
+    xt_slli(e, scratch, scratch, 8);
+    xt_or(e, dst, dst, scratch);
+}
+
+/* Patch a previously-emitted BEQZ/BNEZ at byte offset `br_pos` (within e->buf)
+ * so that its branch target lands at byte offset `target_pos`.
+ *
+ * The encoded imm12 field is at bits 12..23 of the 24-bit instruction word,
+ * and the target = (br_pc + 4 + imm12).  We solve for imm12 = target - br_pc - 4. */
+static void patch_branch_to(xt_emit *e, u32 br_pos, u32 target_pos) {
+    i32 imm12 = (i32)target_pos - (i32)br_pos - 4;
+    assert(imm12 >= -2048 && imm12 <= 2047);
+    u32 imm12_u = (u32)imm12 & 0xFFFu;
+    u32 w = (u32)e->buf[br_pos]
+          | ((u32)e->buf[br_pos + 1] << 8)
+          | ((u32)e->buf[br_pos + 2] << 16);
+    w &= ~(0xFFFu << 12);
+    w |= (imm12_u << 12);
+    e->buf[br_pos + 0] = (u8)(w & 0xFFu);
+    e->buf[br_pos + 1] = (u8)((w >> 8) & 0xFFu);
+    e->buf[br_pos + 2] = (u8)((w >> 16) & 0xFFu);
+}
+
+/* Patch a previously-emitted J at `j_pos` so it lands at `target_pos`.
+ * J encodes the 18-bit signed offset in bits 6..23 with target = pc + 4 + imm18. */
+static void patch_j_to(xt_emit *e, u32 j_pos, u32 target_pos) {
+    i32 imm18 = (i32)target_pos - (i32)j_pos - 4;
+    assert(imm18 >= -(1 << 17) && imm18 < (1 << 17));
+    u32 imm18_u = (u32)imm18 & 0x3FFFFu;
+    u32 w = (u32)e->buf[j_pos]
+          | ((u32)e->buf[j_pos + 1] << 8)
+          | ((u32)e->buf[j_pos + 2] << 16);
+    w &= ~(0x3FFFFu << 6);
+    w |= (imm18_u << 6);
+    e->buf[j_pos + 0] = (u8)(w & 0xFFu);
+    e->buf[j_pos + 1] = (u8)((w >> 8) & 0xFFu);
+    e->buf[j_pos + 2] = (u8)((w >> 16) & 0xFFu);
+}
+
 /* --- Flag-bit helpers used by the ALU inliners.
  *
  * Each pushes its computed flag bit (already in the correct F position) into
@@ -302,6 +353,107 @@ static bool inline_op(xt_emit *e, u8 opcode, u16 pc, mmu *m) {
         xt_addi(e, 2, 2, is_dec ? -1 : 1);
         xt_s16i(e, 2, 13, off);                          /* writes only low 16 bits */
         emit_advance(e, 1, 8);
+        return true;
+    }
+
+    /* --- JR r8 (0x18, unconditional) — block terminator. */
+    if (opcode == 0x18) {
+        i8 off = (i8)m->rom[(pc + 1) & 0x7FFFu];
+        u16 target = (u16)(pc + 2 + off);
+        emit_load_u16(e, 11, target, 2);
+        xt_addi(e, 12, 12, 12);
+        return true;
+    }
+
+    /* --- JR cc, r8 (0x20/0x28/0x30/0x38) — conditional, block terminator.
+     *
+     * Layout emitted:
+     *   l8ui  a4, a13, OFF_F            ; load F
+     *   movi  a5, flag_mask
+     *   and   a4, a4, a5                ; a4 = F & flag_mask  (Z or C bit isolated)
+     *   B(N)EZ a4, .fallthrough          ; skip taken-block if branch NOT taken
+     *   <taken-block>: load target into a11, addi a12, 12
+     *   J     .end
+     *   .fallthrough: load fallthrough into a11, addi a12, 8
+     *   .end:
+     */
+    if (opcode == 0x20 || opcode == 0x28 || opcode == 0x30 || opcode == 0x38) {
+        i8 off = (i8)m->rom[(pc + 1) & 0x7FFFu];
+        u16 target      = (u16)(pc + 2 + off);
+        u16 fallthrough = (u16)(pc + 2);
+        u8 cc = (opcode >> 3) & 3;
+        u8 flag_mask = (cc < 2) ? FLAG_Z : FLAG_C;
+        bool taken_when_zero = ((cc & 1) == 0);   /* NZ/NC vs Z/C */
+
+        xt_l8ui(e, 4, 13, OFF_F);
+        xt_movi(e, 5, (i32)flag_mask);
+        xt_and(e, 4, 4, 5);
+
+        /* Branch over taken-block when condition NOT met. */
+        u32 br_pos = e->len;
+        if (taken_when_zero) xt_bnez(e, 4, 4);    /* taken=a4==0 → skip when a4!=0 */
+        else                 xt_beqz(e, 4, 4);    /* taken=a4!=0 → skip when a4==0 */
+
+        /* Taken-block. */
+        emit_load_u16(e, 11, target, 2);
+        xt_addi(e, 12, 12, 12);
+
+        /* Jump to end. */
+        u32 j_pos = e->len;
+        xt_j(e, 4);
+
+        /* Fallthrough-block (target of the conditional branch). */
+        u32 fallthrough_pos = e->len;
+        emit_load_u16(e, 11, fallthrough, 2);
+        xt_addi(e, 12, 12, 8);
+
+        u32 end_pos = e->len;
+        patch_branch_to(e, br_pos, fallthrough_pos);
+        patch_j_to(e, j_pos, end_pos);
+        return true;
+    }
+
+    /* --- JP a16 (0xC3) — unconditional, block terminator. */
+    if (opcode == 0xC3) {
+        u8 lo = m->rom[(pc + 1) & 0x7FFFu];
+        u8 hi = m->rom[(pc + 2) & 0x7FFFu];
+        u16 target = (u16)(lo | (hi << 8));
+        emit_load_u16(e, 11, target, 2);
+        xt_addi(e, 12, 12, 16);
+        return true;
+    }
+
+    /* --- JP cc, a16 (0xC2/0xCA/0xD2/0xDA). */
+    if (opcode == 0xC2 || opcode == 0xCA || opcode == 0xD2 || opcode == 0xDA) {
+        u8 lo = m->rom[(pc + 1) & 0x7FFFu];
+        u8 hi = m->rom[(pc + 2) & 0x7FFFu];
+        u16 target      = (u16)(lo | (hi << 8));
+        u16 fallthrough = (u16)(pc + 3);
+        u8 cc = (opcode >> 4) & 1; /* 0=Z-group (NZ/Z), 1=C-group (NC/C) */
+        u8 flag_mask = cc ? FLAG_C : FLAG_Z;
+        bool taken_when_zero = ((opcode & 0x08) == 0); /* 0xC2/0xD2 = NZ/NC */
+
+        xt_l8ui(e, 4, 13, OFF_F);
+        xt_movi(e, 5, (i32)flag_mask);
+        xt_and(e, 4, 4, 5);
+
+        u32 br_pos = e->len;
+        if (taken_when_zero) xt_bnez(e, 4, 4);
+        else                 xt_beqz(e, 4, 4);
+
+        emit_load_u16(e, 11, target, 2);
+        xt_addi(e, 12, 12, 16);
+
+        u32 j_pos = e->len;
+        xt_j(e, 4);
+
+        u32 fallthrough_pos = e->len;
+        emit_load_u16(e, 11, fallthrough, 2);
+        xt_addi(e, 12, 12, 12);
+
+        u32 end_pos = e->len;
+        patch_branch_to(e, br_pos, fallthrough_pos);
+        patch_j_to(e, j_pos, end_pos);
         return true;
     }
 
@@ -491,9 +643,10 @@ gbjit_block *gbjit_compile_block(codecache *cc, cpu_state *cpu, u16 pc_start,
         u16 op_pc = ops_pc[i];
 
         if (inline_op(&e, opcode, op_pc, cpu->mmu)) {
-            /* HALT exits the block early to give the dispatcher a chance to
-             * notice cpu->halted. */
-            if (opcode == 0x76) { exited_early = true; break; }
+            /* Any terminator op (HALT/JR/JP/...) — once inlined the block
+             * has already set PC + cycles itself, so we can break out and
+             * skip straight to the epilogue. */
+            if (sm83_terminates_block(opcode)) { exited_early = true; break; }
             continue;
         }
 

@@ -149,8 +149,8 @@ static void step(xt_sim *s) {
         return;
     }
 
-    /* J: bits 0..5 = 0x26. */
-    if ((w & 0x3F) == 0x26) {
+    /* J: bits 0..5 = 0x06 (op0=6, n=0). */
+    if ((w & 0x3F) == 0x06) {
         i32 off = (i32)sign_extend((w >> 6) & 0x3FFFF, 18);
         s->pc = pc_start + 4 + (u32)off;
         return;
