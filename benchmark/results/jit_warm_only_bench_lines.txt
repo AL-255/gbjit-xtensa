@@ -1,0 +1,1 @@
+I (59) gbjit: [BENCH] mode=jit_warm cycles=200020 elapsed_us=3558 mhz=56.217 dmg_x=13.403 pc=0xC7F3 halted=0 blocks_compiled=0 blocks_executed=6552 chain_hits=6517 chain_misses=34

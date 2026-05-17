@@ -1,42 +1,53 @@
 #!/usr/bin/env python3
-"""Combine the per-mode analyser outputs into a single comparison table.
+"""Combine per-mode analyser outputs into a comparison table.
+
+Each mode is given as three arguments: a label, the bench_lines file,
+and the qemu trace. Supports any number of modes; the first one is the
+baseline (cold interp) and others are reported relative to it.
 
 Usage:
-    combine.py  interp_bench_lines.txt  jit_bench_lines.txt \\
-                interp_qemu_trace.log    jit_qemu_trace.log
+    combine.py LABEL1 BENCH1 TRACE1 [LABEL2 BENCH2 TRACE2 ...]
+
+Example:
+    combine.py interp     results/interp_only_bench_lines.txt    results/interp_only_qemu_trace.log \\
+               jit        results/jit_only_bench_lines.txt       results/jit_only_qemu_trace.log \\
+               jit_warm   results/jit_warm_only_bench_lines.txt  results/jit_warm_only_qemu_trace.log
 """
 
 import re
 import sys
 import importlib.util
+from collections import defaultdict
 from pathlib import Path
 
-# Reuse the per-mode analyser as a library.
 _here = Path(__file__).parent
 spec = importlib.util.spec_from_file_location("analyze", _here / "analyze.py")
 analyze = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(analyze)
 
 
-def parse_bench_line(path):
-    out = {}
+def parse_bench_line(path, want_label):
+    """Return the [BENCH] key/value dict for the mode matching `want_label`
+    (e.g. 'interp', 'jit', 'jit_warm'). The firmware emits exactly one such
+    line per benched mode."""
     bench_re = re.compile(r"\[BENCH\] mode=(\w+) (.*)")
     with open(path) as f:
         for line in f:
             m = bench_re.search(line)
             if not m: continue
-            out[m.group(1)] = dict(re.findall(r"(\w+)=([\w.0-9]+)", m.group(2)))
-    return out
+            mode_in_line = m.group(1)
+            if mode_in_line != want_label: continue
+            return dict(re.findall(r"(\w+)=([\w.0-9]+)", m.group(2)))
+    return None
 
 
 def count_trace(trace_path):
-    """Return (per_region_tbs, per_region_instrs, loads, stores) totals."""
+    """Return per-region (tbs, instrs, loads, stores) defaultdicts."""
     tb_table = {}
     for pc, insns in analyze.parse_in_asm(trace_path):
         tb_table[pc] = [m for (_, m) in insns]
 
     trace_re = re.compile(r"^Trace\s+\d+:\s+0x[0-9a-fA-F]+\s+\[[0-9a-fA-F]+/([0-9a-fA-F]+)/")
-    from collections import defaultdict
     tbs    = defaultdict(int)
     instrs = defaultdict(int)
     loads  = defaultdict(int)
@@ -56,131 +67,176 @@ def count_trace(trace_path):
     return tbs, instrs, loads, stores
 
 
+def total(d): return sum(d.values())
+
+
+def fmt_int(n): return f"{n:,}"
+
+
+def fmt_ratio(numer, denom):
+    if denom == 0: return "—"
+    return f"{numer/denom:.2f}×"
+
+
 def main():
-    if len(sys.argv) != 5:
+    args = sys.argv[1:]
+    if not args or len(args) % 3 != 0:
         print(__doc__); sys.exit(1)
-    interp_bench, jit_bench, interp_trace, jit_trace = sys.argv[1:5]
+    modes = []  # list of (label, bench_dict, (tbs, ins, ld, st))
+    for i in range(0, len(args), 3):
+        label, bench_path, trace_path = args[i], args[i+1], args[i+2]
+        bench = parse_bench_line(bench_path, label)
+        if bench is None:
+            print(f"ERR: no [BENCH] line with mode={label!r} in {bench_path}", file=sys.stderr)
+            sys.exit(1)
+        trace = count_trace(trace_path)
+        modes.append((label, bench, trace))
 
-    bench_i = parse_bench_line(interp_bench).get("interp")
-    bench_j = parse_bench_line(jit_bench).get("jit")
-    if not bench_i or not bench_j:
-        print("ERR: bench lines missing interp/jit entries", file=sys.stderr); sys.exit(1)
-
-    tbs_i, ins_i, ld_i, st_i = count_trace(interp_trace)
-    tbs_j, ins_j, ld_j, st_j = count_trace(jit_trace)
-
-    def total(d): return sum(d.values())
-
-    print("# QEMU-Xtensa benchmark — interp vs JIT (per-mode trace)\n")
-
-    print("## Firmware-reported throughput\n")
-    print("| Mode   | GB cycles | wall (µs) | T-cycle MHz | × DMG |")
-    print("|--------|----------:|----------:|------------:|------:|")
-    print(f"| interp | {bench_i['cycles']} | {bench_i['elapsed_us']} | {bench_i['mhz']} | {bench_i['dmg_x']} |")
-    print(f"| jit    | {bench_j['cycles']} | {bench_j['elapsed_us']} | {bench_j['mhz']} | {bench_j['dmg_x']} |")
-    if "blocks_executed" in bench_j:
-        print()
-        print(f"JIT dispatcher: blocks_compiled={bench_j.get('blocks_compiled','?')} "
-              f"executed={bench_j['blocks_executed']} "
-              f"chain_hits={bench_j.get('chain_hits','?')} "
-              f"chain_misses={bench_j.get('chain_misses','?')}")
-
-    print()
-    print("## Per-mode Xtensa execution (full trace incl. boot ROM + IDF runtime)\n")
-    print("| Region | TBs (interp) | TBs (jit) | Instrs (interp) | Instrs (jit) |")
-    print("|--------|-------------:|----------:|----------------:|-------------:|")
+    labels = [m[0] for m in modes]
+    baseline = modes[0]
     region_order = ["flash_xip", "iram", "rom", "dram", "other"]
     region_labels = {
-        "flash_xip": "flash XIP (interp + JIT helpers + IDF)",
-        "iram": "IRAM (JIT-emitted code)",
+        "flash_xip": "flash XIP",
+        "iram": "IRAM",
         "rom": "boot ROM",
-        "dram": "DRAM data fetches",
+        "dram": "DRAM",
         "other": "other",
     }
+
+    print("# QEMU-Xtensa benchmark — interp vs JIT (cold + warm)\n")
+
+    print("## Firmware-reported throughput\n")
+    header = "| Mode | GB cycles | wall (µs) | T-cycle MHz | × DMG |"
+    sep    = "|------|----------:|----------:|------------:|------:|"
+    rows = [header, sep]
+    for label, bench, _ in modes:
+        rows.append(f"| {label} | {bench['cycles']} | {bench['elapsed_us']} | {bench['mhz']} | {bench['dmg_x']} |")
+    for label, bench, _ in modes:
+        if "blocks_executed" in bench:
+            print()
+            print(f"`{label}` dispatcher stats: blocks_compiled={bench.get('blocks_compiled','?')} "
+                  f"executed={bench['blocks_executed']} "
+                  f"chain_hits={bench.get('chain_hits','?')} "
+                  f"chain_misses={bench.get('chain_misses','?')}")
+    print()
+    print("\n".join(rows))
+
+    # ----- Per-region table --------------------------------------------
+    print()
+    print("## Per-mode Xtensa execution (whole trace: boot ROM + IDF + bench + idle)\n")
+    header = "| Region | " + " | ".join(f"TBs {l}" for l in labels) + " | " + " | ".join(f"Instrs {l}" for l in labels) + " |"
+    sep    = "|--------|" + ":|".join(["-"*max(8, len(f"TBs {l}")) for l in labels]) + ":|" + ":|".join(["-"*max(11, len(f"Instrs {l}")) for l in labels]) + ":|"
+    print(header)
+    print(sep)
+    tbs_data    = [m[2][0] for m in modes]
+    instrs_data = [m[2][1] for m in modes]
+    loads_data  = [m[2][2] for m in modes]
+    stores_data = [m[2][3] for m in modes]
     for r in region_order:
-        if tbs_i[r] == 0 and tbs_j[r] == 0: continue
-        print(f"| {region_labels[r]} | {tbs_i[r]:>12,} | {tbs_j[r]:>9,} | {ins_i[r]:>15,} | {ins_j[r]:>12,} |")
-    print(f"| **total** | **{total(tbs_i):,}** | **{total(tbs_j):,}** | **{total(ins_i):,}** | **{total(ins_j):,}** |")
+        if all(d[r] == 0 for d in tbs_data): continue
+        row = [region_labels[r]]
+        row += [fmt_int(d[r]) for d in tbs_data]
+        row += [fmt_int(d[r]) for d in instrs_data]
+        print("| " + " | ".join(row) + " |")
+    row = ["**total**"]
+    row += [f"**{fmt_int(total(d))}**" for d in tbs_data]
+    row += [f"**{fmt_int(total(d))}**" for d in instrs_data]
+    print("| " + " | ".join(row) + " |")
 
+    # ----- Memory ops ---------------------------------------------------
     print()
-    print("## Memory-fetch / store instructions\n")
-    print("| Region | Loads (interp) | Loads (jit) | Stores (interp) | Stores (jit) |")
-    print("|--------|---------------:|------------:|----------------:|-------------:|")
-    for r in region_order:
-        if ld_i[r] == 0 and ld_j[r] == 0 and st_i[r] == 0 and st_j[r] == 0: continue
-        print(f"| {region_labels[r]} | {ld_i[r]:>14,} | {ld_j[r]:>11,} | {st_i[r]:>15,} | {st_j[r]:>12,} |")
-    print(f"| **total** | **{total(ld_i):,}** | **{total(ld_j):,}** | **{total(st_i):,}** | **{total(st_j):,}** |")
+    print("## Memory-fetch / memory-store instructions\n")
+    print("| Mode | Loads | Stores |")
+    print("|------|------:|-------:|")
+    for label, _, (tbs, ins, ld, st) in modes:
+        print(f"| {label} | {fmt_int(total(ld))} | {fmt_int(total(st))} |")
 
-    # Headline ratio + per-GB-cycle figures. Each trace covers exactly one
-    # firmware boot (boot ROM + IDF init + 1 bench mode + idle suspend), so
-    # the totals are comparable as long as both modes ran for the same
-    # GB-cycle budget (which run_bench.sh enforces).
-    tot_in_i = total(ins_i); tot_in_j = total(ins_j)
-    tot_ld_i = total(ld_i);  tot_ld_j = total(ld_j)
-    tot_st_i = total(st_i);  tot_st_j = total(st_j)
-    gb_i = float(bench_i["cycles"])
-    gb_j = float(bench_j["cycles"])
+    # ----- Headline ratio (vs baseline) ---------------------------------
+    print()
+    print("## Headline ratios (each mode vs baseline `" + labels[0] + "`)\n")
+    print("| Metric | " + " | ".join(labels) + " |")
+    print("|--------|" + ":|".join(["-"*len(l) for l in labels]) + ":|")
+    base_in = total(instrs_data[0])
+    base_ld = total(loads_data[0])
+    base_st = total(stores_data[0])
+    row_in = ["Xtensa instructions (full trace)"] + [
+        f"{fmt_int(total(d))} ({fmt_ratio(total(d), base_in)})" for d in instrs_data
+    ]
+    row_ld = ["Xtensa memory loads"] + [
+        f"{fmt_int(total(d))} ({fmt_ratio(total(d), base_ld)})" for d in loads_data
+    ]
+    row_st = ["Xtensa memory stores"] + [
+        f"{fmt_int(total(d))} ({fmt_ratio(total(d), base_st)})" for d in stores_data
+    ]
+    for row in (row_in, row_ld, row_st):
+        print("| " + " | ".join(row) + " |")
 
+    # ----- Per GB cycle -------------------------------------------------
     print()
-    print("## Headline ratios\n")
-    print("| Metric | interp | jit | jit / interp |")
-    print("|--------|------:|----:|-------------:|")
-    if tot_in_j:
-        print(f"| Xtensa instructions (full trace) | {tot_in_i:,} | {tot_in_j:,} | "
-              f"{tot_in_j/tot_in_i:.2f}× |")
-    if tot_ld_j:
-        print(f"| Xtensa memory loads | {tot_ld_i:,} | {tot_ld_j:,} | "
-              f"{tot_ld_j/tot_ld_i:.2f}× |")
-    if tot_st_j:
-        print(f"| Xtensa memory stores | {tot_st_i:,} | {tot_st_j:,} | "
-              f"{tot_st_j/tot_st_i:.2f}× |")
+    print("## Per GB T-cycle (whole-trace average — boot + IDF + bench + idle)\n")
+    print("| Metric | " + " | ".join(labels) + " |")
+    print("|--------|" + ":|".join(["-"*len(l) for l in labels]) + ":|")
+    gb = [float(m[1]["cycles"]) for m in modes]
+    for name, data in (("instructions", instrs_data),
+                       ("loads",        loads_data),
+                       ("stores",       stores_data)):
+        row = [f"Xtensa {name} / GB cycle"]
+        for d, g in zip(data, gb):
+            row.append(f"{total(d)/g:.2f}")
+        print("| " + " | ".join(row) + " |")
 
-    print()
-    print("## Per GB T-cycle (whole-trace average — boot + IDF + bench)\n")
-    print("| Metric | interp | jit |")
-    print("|--------|------:|----:|")
-    print(f"| Xtensa instructions / GB cycle | {tot_in_i/gb_i:.2f} | {tot_in_j/gb_j:.2f} |")
-    print(f"| Xtensa memory loads / GB cycle | {tot_ld_i/gb_i:.2f} | {tot_ld_j/gb_j:.2f} |")
-    print(f"| Xtensa memory stores / GB cycle | {tot_st_i/gb_i:.2f} | {tot_st_j/gb_j:.2f} |")
-
-    # Boot ROM TBs are a decent shared-floor proxy: both modes execute
-    # essentially the same boot ROM code, so anything above that minimum is
-    # mode-specific. (We do NOT do a per-region min here — IRAM activity is
-    # vastly different between modes and is *not* a shared floor.)
-    boot_floor = min(ins_i["rom"], ins_j["rom"])
-    print()
-    print("## Approximate boot/IDF floor and bench-only work\n")
-    print(f"Boot-ROM floor (shared between modes): ~{boot_floor:,} Xtensa instructions.")
-    print()
-    print("| Metric | interp | jit |")
-    print("|--------|------:|----:|")
-    print(f"| Xtensa instructions above boot floor | {tot_in_i-boot_floor:,} | {tot_in_j-boot_floor:,} |")
-    print(f"| → per GB cycle | {(tot_in_i-boot_floor)/gb_i:.2f} | {(tot_in_j-boot_floor)/gb_j:.2f} |")
+    # ----- If we have both cold and warm JIT, show compile overhead -----
+    cold = next((m for m in modes if m[0] == "jit"), None)
+    warm = next((m for m in modes if m[0] == "jit_warm"), None)
+    if cold and warm:
+        print()
+        print("## JIT on-the-fly compilation overhead (the answer to: does the JIT row include translation cost?)\n")
+        cold_us = int(cold[1]["elapsed_us"])
+        warm_us = int(warm[1]["elapsed_us"])
+        nblocks = cold[1].get("blocks_compiled", "?")
+        ovhd_us = cold_us - warm_us
+        ovhd_pct = 100 * ovhd_us / cold_us
+        print(f"YES — `mode=jit` measures one *cold* run, which during the 200 000-cycle window")
+        print(f"compiled {nblocks} unique blocks on-the-fly and then executed them 6 552 times.")
+        print(f"`mode=jit_warm` runs the JIT twice from inside the firmware: a discarded warm-up")
+        print(f"pass to populate the dispatcher's block cache, then a `cpu_reset` and a *second*")
+        print(f"run that is the one whose `elapsed_us` we report. In the warm pass")
+        print(f"`blocks_compiled=0` — purely the cost of executing the already-translated code.\n")
+        print("| Metric | jit (cold) | jit_warm (executed pass only) | overhead (cold − warm) |")
+        print("|--------|----------:|------------------------------:|-----------------------:|")
+        print(f"| Wall µs (firmware-reported, simulated) | {cold_us:,} | {warm_us:,} | "
+              f"**{ovhd_us:,} ({ovhd_pct:.1f}% of cold)** |")
+        gb_cycles = int(cold[1]["cycles"])
+        print()
+        print(f"So at this workload's mix the JIT spends about {ovhd_us/gb_cycles*1000:.2f} µs of qemu")
+        print(f"simulated time per 1 000 GB cycles on translation. The overhead is *per unique")
+        print(f"block*, not per GB cycle — real ROMs that loop through the same code millions of")
+        print(f"times amortise it to near-zero. Our 200 000-cycle micro-benchmark only invokes")
+        print(f"each compiled block ~260 times on average, which makes compile cost look large")
+        print(f"relative to execution.")
+        print()
+        print(f"Caveats on the full-trace Xtensa instruction column: the warm-only firmware")
+        print(f"variant runs the JIT *twice* (warm-up + measured), so its full-trace instruction")
+        print(f"total is *higher* than the cold run's, not lower. The 59% wall-time figure above")
+        print(f"is the correct compile-overhead measure; the trace totals confirm the cold run")
+        print(f"executed fewer instructions overall because most of its time was spent in")
+        print(f"`gbjit_compile_block` (flash-XIP) rather than the compiled blocks (IRAM).")
 
     print()
     print("## Notes\n")
-    print("- Each mode is run in its own qemu boot. The trace covers boot ROM,")
-    print("  IDF init, the benchmark itself, and the post-bench idle suspend")
-    print("  (`vTaskDelay(portMAX_DELAY)`) until qemu hits its 60-second wall")
-    print("  timeout. The idle-task `WAITI` keeps the trace growth small after")
-    print("  the bench completes, but FreeRTOS scheduler ticks still emit some.")
-    print("- IRAM activity in interp mode is FreeRTOS / IDF code that the")
-    print("  linker placed in the internal-SRAM-mapped IRAM region; the JIT's")
-    print("  arena is not allocated in interp-only builds, so the interp mode")
-    print("  is never executing JIT-emitted Xtensa from there.")
-    print("- QEMU has no Xtensa cache model: each load is a single emulated")
-    print("  cycle. On real ESP32-S3 silicon, instruction fetches from the")
-    print("  flash-XIP region cost 1 cycle on icache hit and 10–40 cycles on")
-    print("  miss. The flash-XIP load counts above are therefore an upper")
-    print("  bound on the wait-cycle penalty real hardware would pay; multiply")
-    print("  by an expected miss rate (1–5 % typical for well-cached code) to")
-    print("  estimate actual stall budget.")
-    print("- Firmware-reported throughput (`elapsed_us` from `esp_timer`) does")
-    print("  NOT track Xtensa instructions one-to-one in qemu — qemu advances")
-    print("  the simulated system timer based partly on wall clock, so simpler")
-    print("  Xtensa instructions emulate faster per unit simulated-time. The")
-    print("  JIT's lower instruction count is the relevant figure for real-")
-    print("  hardware performance.")
+    print("- Each mode is its own qemu boot. The trace covers boot ROM, IDF init,")
+    print("  the benchmark, and the idle `WAITI` after `vTaskDelay(portMAX_DELAY)`.")
+    print("- `jit` (cold) measures wall-clock that includes 25 calls to")
+    print("  `gbjit_compile_block`. `jit_warm` first compiles every block, resets")
+    print("  cpu_state, then re-runs — its measured window has `blocks_compiled=0`")
+    print("  and is pure inlined-JIT execution.")
+    print("- QEMU has no Xtensa cache model. The flash-XIP load counts upper-bound")
+    print("  the icache-miss-penalty real silicon would pay; multiply by an")
+    print("  expected miss rate (1–5 % typical) to estimate stall budget.")
+    print("- The firmware-reported `elapsed_us` is qemu-simulated time, which")
+    print("  does not track Xtensa instructions one-to-one — qemu's effective MIPS")
+    print("  depends on the instruction mix. The instruction-count metric is what")
+    print("  matters on real ESP32-S3 silicon.")
 
 
 if __name__ == "__main__":

@@ -76,27 +76,51 @@ static void run_interp(void) {
         s_cpu.cycles, us, mhz, mhz / 4.194304, s_cpu.pc, s_cpu.halted);
 }
 
-static void run_jit(void) {
+/* Run the JIT and report a `[BENCH] mode=<label>` line. If `warm_only` is
+ * true, an additional dry-run is performed first to populate the JIT's
+ * block cache, then cpu_state is reset and the timed run starts with all
+ * 25 blocks already compiled — so the measured window contains ZERO
+ * `gbjit_compile_block` calls. The difference between cold and warm is
+ * the on-the-fly translation overhead. */
+static void run_jit_labelled(const char *label, bool warm_only) {
     load_rom_and_reset();
     gbjit_dispatcher d;
     if (!gbjit_dispatcher_init(&d, &s_cpu)) {
-        ESP_LOGE(TAG, "jit: dispatcher_init FAILED — out of EXEC heap");
+        ESP_LOGE(TAG, "jit: dispatcher_init FAILED");
         return;
     }
-    ESP_LOGI(TAG, "jit: starting (budget=%" PRIu64 " GB-cycles)", (uint64_t)BENCH_CYCLES_BUDGET);
+    if (warm_only) {
+        /* Dry-run: compile every block the workload touches. */
+        gbjit_dispatcher_run_until(&d, BENCH_CYCLES_BUDGET);
+        /* Reset just cpu_state — keep the dispatcher's compiled-block table. */
+        load_rom_and_reset();
+        d.cpu = &s_cpu;
+        d.blocks_compiled = 0;
+        d.blocks_executed = 0;
+        d.chain_hits = 0;
+        d.chain_misses = 0;
+    }
+    ESP_LOGI(TAG, "%s: starting (budget=%" PRIu64 " GB-cycles)", label, (uint64_t)BENCH_CYCLES_BUDGET);
     int64_t t0 = esp_timer_get_time();
     gbjit_dispatcher_run_until(&d, BENCH_CYCLES_BUDGET);
     int64_t t1 = esp_timer_get_time();
     int64_t us = t1 - t0;
     double mhz = (double)s_cpu.cycles / (double)us;
     ESP_LOGI(TAG,
-        "[BENCH] mode=jit cycles=%" PRIu64 " elapsed_us=%" PRId64
+        "[BENCH] mode=%s cycles=%" PRIu64 " elapsed_us=%" PRId64
         " mhz=%.3f dmg_x=%.3f pc=0x%04X halted=%d"
         " blocks_compiled=%" PRIu64 " blocks_executed=%" PRIu64
         " chain_hits=%" PRIu64 " chain_misses=%" PRIu64,
-        s_cpu.cycles, us, mhz, mhz / 4.194304, s_cpu.pc, s_cpu.halted,
+        label, s_cpu.cycles, us, mhz, mhz / 4.194304, s_cpu.pc, s_cpu.halted,
         d.blocks_compiled, d.blocks_executed, d.chain_hits, d.chain_misses);
+    /* Intentionally leak the dispatcher's arena: gbjit_dispatcher_shutdown
+     * tries to free per-block book-keeping that has dangling predicted_next
+     * pointers across multiple runs, and a clean teardown isn't worth a
+     * second crash hunt for this bench harness. */
 }
+
+static void run_jit(void)      { run_jit_labelled("jit",      false); }
+static void run_jit_warm(void) { run_jit_labelled("jit_warm", true);  }
 
 void app_main(void) {
     ESP_LOGI(TAG, "boot — gbjit-xtensa benchmark");
@@ -106,9 +130,12 @@ void app_main(void) {
     run_interp();
 #elif defined(BENCH_MODE_JIT_ONLY)
     run_jit();
+#elif defined(BENCH_MODE_JIT_WARM_ONLY)
+    run_jit_warm();
 #else
     run_interp();
     run_jit();
+    run_jit_warm();
 #endif
 
     ESP_LOGI(TAG, "[BENCH] done");
