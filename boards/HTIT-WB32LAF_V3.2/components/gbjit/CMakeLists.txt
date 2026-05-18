@@ -46,26 +46,31 @@ target_compile_definitions(${COMPONENT_LIB} PRIVATE DEBUG=1)
 
 # PPU placement.
 #
-# Async (default): ppu_tick runs on Core 1 as a pinned FreeRTOS task,
-# keeping Core 0 uncontested for the dispatcher. The historical
-# cross-core race that broke BG scrolling — Core 1's per-scanline
-# reads of SCX/SCY/BGP/LCDC seeing Core 0's writes intended for some
-# other frame — is fixed in core/ppu.c by latching all BG-relevant IO
-# regs into ppu_latched_* fields at end-of-VBlank (and at LCD enable).
-# ppu_draw_line then renders the next frame against the snapshot, so
-# every scanline of one frame sees the same SCX/etc., regardless of
-# what Core 0 has written in the meantime. WY was already latched the
-# same way. Per-line raster effects (mid-frame SCX) are NOT supported
-# while latched — SML and the rest of our compat targets don't do
-# them. Sprites read OAM live (atomic via OAM DMA on the CPU side).
+# `async` ran ppu_tick on Core 1 (pinned FreeRTOS task) so Core 0's
+# dispatcher kept an uncontested busy loop, but the BG-rendering path
+# reads SCX/SCY/LCDC/BGP from mmu->io at draw time, while Core 0 writes
+# those bytes from CPU code. The two cores see each other's stores
+# without a timing relationship to cpu->cycles — for any IO reg that
+# the PPU consumes per-scanline, that's a real race: Core 1 can draw
+# frame F's BG using SCX written by Core 0 for frame F+1 (or vice
+# versa), producing visibly broken BG scrolling. Sprites are immune
+# because OAM is written atomically by the DMA copy in mmu_write8
+# during the game's VBlank handler — every byte lands on Core 0 before
+# Core 1's next OAM-scan.
 #
-# Sync fallback (set GBJIT_PPU_ASYNC=0): runs ppu_tick on Core 0
-# inside sm83_service_interrupts. Same call site as the reference
-# interpreter. Drops throughput on this workload by ~40% (PPU work
-# shares Core 0 with the dispatcher) but is the most conservative
-# correctness option if a new IO-related race shows up.
+# Sync mode runs ppu_tick on Core 0 inside sm83_service_interrupts —
+# the same call site the reference interpreter uses — so IO reads and
+# the cpu->cycles that triggered them happen on the same core in
+# program order. Throughput is lower (PPU work now competes with the
+# dispatcher loop on Core 0), but SML in HALT spends most cycles in
+# the halt loop anyway, so the hit is modest.
+#
+# To go back to async: set GBJIT_PPU_ASYNC=1 in the cmake cache (or in
+# the calling project file). The cross-core race is unsolved upstream
+# — see core/ppu.c for the IO regs that would need cycle-stamped
+# write queues before async is safe.
 if(NOT DEFINED GBJIT_PPU_ASYNC)
-    set(GBJIT_PPU_ASYNC 1)
+    set(GBJIT_PPU_ASYNC 0)
 endif()
 if(GBJIT_PPU_ASYNC)
     target_compile_definitions(${COMPONENT_LIB} PRIVATE GBJIT_PPU_ASYNC=1)

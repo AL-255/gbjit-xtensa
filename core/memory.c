@@ -59,15 +59,6 @@ void gb_mmu_init(mmu *m) {
     m->io[0x47] = 0xFC; /* BGP   — default grey palette */
     m->io[0x48] = 0xFF; /* OBP0  */
     m->io[0x49] = 0xFF; /* OBP1  */
-    /* Seed the per-frame PPU snapshot from these defaults so the very
-     * first frame (drawn before VBlank has happened) renders with
-     * something coherent. After that, ppu.c re-latches at every
-     * VBlank-end and at LCD enable. */
-    m->ppu_latched_lcdc = m->io[0x40];
-    m->ppu_latched_bgp  = m->io[0x47];
-    m->ppu_latched_obp0 = m->io[0x48];
-    m->ppu_latched_obp1 = m->io[0x49];
-    m->ppu_latched_wx   = m->io[0x4B];
     m->rom_bank = 1;
     m->rom_banks = 2;        /* default: 32 KB single-bank cart */
     /* Allocate a default-sized buffer so callers that write into m->rom

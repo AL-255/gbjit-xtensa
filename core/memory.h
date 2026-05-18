@@ -91,22 +91,6 @@ typedef struct mmu {
     u8  ppu_stat_line;
     u8  ppu_last_lcdc;
     u8  ppu_latched_wy;
-
-    /* BG/window/sprite render uses a per-frame snapshot of the IO regs
-     * it consumes. Without this, async PPU mode (PPU thread on Core 1,
-     * dispatcher on Core 0) sees the IO bytes Core 0 wrote at the
-     * moment of the read — which can be from a different frame than
-     * the one PPU is currently drawing. Latched at the end of VBlank
-     * (LY=0 → mode 2) alongside ppu_latched_wy. Sprites read OAM
-     * which is filled atomically by the OAM-DMA path so no latch
-     * needed there. */
-    u8  ppu_latched_lcdc;
-    u8  ppu_latched_scx;
-    u8  ppu_latched_scy;
-    u8  ppu_latched_bgp;
-    u8  ppu_latched_obp0;
-    u8  ppu_latched_obp1;
-    u8  ppu_latched_wx;
     u16 ppu_lcd_count;
     u16 ppu_mode3_cycles;
     u16 ppu_mode0_cycles;
