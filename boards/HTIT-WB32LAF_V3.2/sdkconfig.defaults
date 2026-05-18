@@ -31,6 +31,6 @@ CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
 # Keeping the default DIO @ 80 MHz; the JIT win from faster flash is
 # small relative to chasing that breakage.
 
-# --- Profiling mode --------------------------------------------------
-# INFO logs back on so the per-second jit_fps + counter dump from
-# oled_task lands on the UART and we can identify hot paths.
+# INFO-level logs stay on — the oled_task once-per-second fps print is
+# useful even in release builds and the UART cost is negligible at one
+# line per second.

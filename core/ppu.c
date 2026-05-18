@@ -226,20 +226,34 @@ static void ppu_draw_line(mmu *m, u8 ly) {
         u8 bg_y = (u8)(ly + scy);
         u8 tile_row = (u8)(bg_y >> 3);
         u8 pixel_row = (u8)(bg_y & 7);
-        for (int x = 0; x < 160; x++) {
-            u8 bg_x = (u8)(x + scx);
-            u8 tile_col = (u8)(bg_x >> 3);
-            u8 pixel_col = (u8)(bg_x & 7);
-            u8 tile_id = m->vram[tilemap_base + tile_row * 32 + tile_col];
+        const u8 *tilemap_row = &m->vram[tilemap_base + tile_row * 32];
+        u16 row_off = (u16)(pixel_row * 2);
+        /* Render a tile (8 pixels) at a time. Each tile contributes
+         * 2 bytes of bitplane data shared by all its pixels, so doing
+         * the lookup + 2-byte load once per 8 px instead of once per
+         * px cuts BG cost roughly in half. The inner per-pixel work
+         * is just a bit shift + two stores. */
+        int x = 0;
+        u8 bg_x = scx;
+        u8 pc   = (u8)(bg_x & 7u);     /* starting pixel-column inside the first tile */
+        while (x < 160) {
+            u8 tile_col = (u8)((bg_x >> 3) & 0x1Fu);
+            u8 tile_id  = tilemap_row[tile_col];
             u16 tile_addr;
             if (unsigned_tiles) {
                 tile_addr = (u16)(tile_id * 16);                /* base $8000 */
             } else {
                 tile_addr = (u16)(0x1000 + (i8)tile_id * 16);   /* base $9000 */
             }
-            u8 cid = fetch_tile_pixel(m->vram, tile_addr, pixel_row, pixel_col);
-            bg_color_id[x] = cid;
-            line[x] = bg_shade[cid];
+            u8 b0 = m->vram[tile_addr + row_off];
+            u8 b1 = m->vram[tile_addr + row_off + 1u];
+            for (; pc < 8 && x < 160; pc++, x++, bg_x++) {
+                u8 bit = (u8)(7u - pc);
+                u8 cid = (u8)((((b1 >> bit) & 1u) << 1) | ((b0 >> bit) & 1u));
+                bg_color_id[x] = cid;
+                line[x] = bg_shade[cid];
+            }
+            pc = 0;
         }
     } else {
         for (int x = 0; x < 160; x++) {
@@ -261,21 +275,29 @@ static void ppu_draw_line(mmu *m, u8 ly) {
             u8 wy_internal = m->window_line;
             u8 tile_row = (u8)(wy_internal >> 3);
             u8 pixel_row = (u8)(wy_internal & 7);
-            for (int x = start_x; x < 160; x++) {
-                int win_x = x - (int)wx + 7;
-                if (win_x < 0) continue;
+            const u8 *tilemap_row = &m->vram[tilemap_base + tile_row * 32];
+            u16 row_off = (u16)(pixel_row * 2);
+            int x = start_x;
+            int win_x = x - (int)wx + 7;
+            u8 pc = (u8)(win_x & 7);
+            while (x < 160) {
                 u8 tile_col = (u8)((win_x >> 3) & 0x1F);
-                u8 pixel_col = (u8)(win_x & 7);
-                u8 tile_id = m->vram[tilemap_base + tile_row * 32 + tile_col];
+                u8 tile_id  = tilemap_row[tile_col];
                 u16 tile_addr;
                 if (unsigned_tiles) {
                     tile_addr = (u16)(tile_id * 16);
                 } else {
                     tile_addr = (u16)(0x1000 + (i8)tile_id * 16);
                 }
-                u8 cid = fetch_tile_pixel(m->vram, tile_addr, pixel_row, pixel_col);
-                bg_color_id[x] = cid;
-                line[x] = bg_shade[cid];
+                u8 b0 = m->vram[tile_addr + row_off];
+                u8 b1 = m->vram[tile_addr + row_off + 1u];
+                for (; pc < 8 && x < 160; pc++, x++, win_x++) {
+                    u8 bit = (u8)(7u - pc);
+                    u8 cid = (u8)((((b1 >> bit) & 1u) << 1) | ((b0 >> bit) & 1u));
+                    bg_color_id[x] = cid;
+                    line[x] = bg_shade[cid];
+                }
+                pc = 0;
             }
             m->window_line++;
         }
@@ -325,14 +347,22 @@ static void ppu_draw_line(mmu *m, u8 ly) {
             u8 pal_shade[4] = {
                 0, (u8)((pal >> 2) & 3), (u8)((pal >> 4) & 3), (u8)((pal >> 6) & 3),
             };
+            /* Load the row's two bitplane bytes once; bit-extract per
+             * pixel below. Same logic as fetch_tile_pixel but pulled
+             * out of the 8-iteration inner loop. */
+            u16 row_addr = (u16)(tile_addr + (u16)(row_in_sprite * 2));
+            u8 b0 = m->vram[row_addr];
+            u8 b1 = m->vram[row_addr + 1u];
+            bool flip_x = (vis[s].attr & OAM_FLIP_X) != 0;
+            bool bg_prio = (vis[s].attr & OAM_BG_PRIO) != 0;
             for (int px = 0; px < 8; px++) {
                 int x = left + px;
                 if (x < 0 || x >= 160) continue;
-                u8 col_in_sprite = (vis[s].attr & OAM_FLIP_X) ? (u8)(7 - px) : (u8)px;
-                u8 cid = fetch_tile_pixel(m->vram, tile_addr,
-                                          (u8)row_in_sprite, col_in_sprite);
+                u8 col_in_sprite = flip_x ? (u8)(7 - px) : (u8)px;
+                u8 bit = (u8)(7u - col_in_sprite);
+                u8 cid = (u8)((((b1 >> bit) & 1u) << 1) | ((b0 >> bit) & 1u));
                 if (cid == 0) continue;                    /* sprite color 0 = transparent */
-                if ((vis[s].attr & OAM_BG_PRIO) && bg_color_id[x] != 0) continue;
+                if (bg_prio && bg_color_id[x] != 0) continue;
                 line[x] = pal_shade[cid];
             }
         }

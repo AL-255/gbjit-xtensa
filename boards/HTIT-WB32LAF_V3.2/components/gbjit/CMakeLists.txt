@@ -37,12 +37,13 @@ target_compile_options(${COMPONENT_LIB} PRIVATE -Wall -Wextra -Wno-shadow)
 # include/gbjit_debug.h).
 target_compile_options(${COMPONENT_LIB} PRIVATE -O3)
 
-# Profiling mode: enable the dispatcher's stat counters so the board's
-# oled_task can log them once a second. The increments are cheap (a
-# few extra u64 stores per block call) and we need them to identify
-# bottlenecks; flip back off (drop the DEBUG=1 line) once the data is
-# in hand.
-target_compile_definitions(${COMPONENT_LIB} PRIVATE DEBUG=1)
+# Production firmware: DEBUG is OFF. The per-block stat counters
+# (chain hits/misses, blocks executed/compiled, prefetch hits, ...)
+# all compile out via include/gbjit_debug.h's GBJIT_STAT_INC, removing
+# the u64 stores from the inner dispatcher loop and the helper-call
+# bookkeeping. Re-add `target_compile_definitions(... PRIVATE DEBUG=1)`
+# temporarily if you need the oled_task per-second log to dump
+# dispatcher counters again.
 
 # PPU placement.
 #
