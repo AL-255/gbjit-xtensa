@@ -50,29 +50,28 @@ static mmu s_mmu;
 static char  s_serial_buf[128];
 static int   s_serial_len;
 #endif
-/* --- 60 fps wall-clock pacer ----------------------------------------
+/* --- Optional wall-clock frame-rate pacer ---------------------------
  *
- * Without throttling the emulator runs as fast as Core 0 can dispatch
- * (~65-75 fps in sync-PPU mode for SML). That's faster than the real
- * DMG (59.7 fps) and makes scrolling games look slightly sped-up. The
- * pacer fires from inside ppu_tick at every frame boundary (right
- * after frame_seq increments) and busy-waits until the next 16.667 ms
- * tick of an anchor monotonic clock, so frame N completes at
- * anchor + N * FRAME_PERIOD_US. If the emulator falls genuinely
- * behind (> 2 frames of slip), re-anchor so we don't burn time
- * sprinting to catch up — locks the long-term rate to 60 fps
- * without amplifying transient stalls.
+ * Compile-time enabled via -DGBJIT_FRAME_LIMIT_FPS=<n> (see
+ * main/CMakeLists.txt). Default 0 = disabled, no code emitted, no
+ * runtime cost. When non-zero, the pacer fires from inside ppu_tick at
+ * every frame boundary (right after frame_seq increments) and busy-
+ * waits until the next 1/FPS-second tick of an anchor monotonic
+ * clock, so frame N completes at anchor + N * PERIOD. If the
+ * emulator falls more than 2 frames behind (genuine workload slip),
+ * re-anchor at the current time so we don't sprint to catch up.
  *
  * The wait is a busy spin on esp_timer_get_time() rather than
- * vTaskDelay. The dispatcher's only Core 0 task at this point is
- * itself, so a vTaskDelay would just hand control back to the idle
- * task; busy-waiting is no more wasteful and is precise to the
- * microsecond. (FreeRTOS tick at 100 Hz can't represent the sub-tick
- * waits this loop produces anyway.) */
-#define PACER_FRAME_PERIOD_US 16667   /* 1e6 / 59.97; one DMG frame */
+ * vTaskDelay. The dispatcher is the only Core 0 task in our app, so
+ * vTaskDelay would just hand control back to the idle task; busy-
+ * waiting is no more wasteful and is precise to the microsecond.
+ * (FreeRTOS tick at 100 Hz can't represent the sub-tick waits this
+ * loop produces anyway.) */
+#if GBJIT_FRAME_LIMIT_FPS > 0
+#define PACER_FRAME_PERIOD_US (1000000 / GBJIT_FRAME_LIMIT_FPS)
 static int64_t s_pacer_anchor_us;
 static uint32_t s_pacer_frame_count;
-static void frame_pacer_60fps(struct mmu *m) {
+static void frame_pacer(struct mmu *m) {
     (void)m;
     s_pacer_frame_count++;
     int64_t target = s_pacer_anchor_us +
@@ -89,6 +88,7 @@ static void frame_pacer_60fps(struct mmu *m) {
         now = esp_timer_get_time();
     }
 }
+#endif
 
 #ifdef DEBUG
 static void serial_sink(void *ctx, uint8_t b) {
@@ -120,10 +120,12 @@ void app_main(void) {
      * SML doesn't use FF02/FF01 anyway. */
     s_mmu.serial_sink = serial_sink;
 #endif
-    /* Lock emulation to 60 fps. See frame_pacer_60fps above. */
+#if GBJIT_FRAME_LIMIT_FPS > 0
+    /* Wall-clock frame-rate cap, opt-in at build time. */
     s_pacer_anchor_us = esp_timer_get_time();
     s_pacer_frame_count = 0;
-    s_mmu.frame_complete_cb = frame_pacer_60fps;
+    s_mmu.frame_complete_cb = frame_pacer;
+#endif
     cpu_reset(&s_cpu, &s_mmu);
 
     /* Bring up the OLED task first (Core 1, low prio) — it'll sleep

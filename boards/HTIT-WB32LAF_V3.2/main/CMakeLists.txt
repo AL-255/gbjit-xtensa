@@ -29,3 +29,16 @@ idf_component_register(
 )
 target_compile_definitions(${COMPONENT_LIB} PRIVATE ${_rom_define})
 target_compile_options(${COMPONENT_LIB} PRIVATE -Wall -Wextra -O3)
+
+# Optional wall-clock frame-rate cap. The pacer (in app_main.c) busy-
+# waits at every frame boundary to hold emulation at the requested
+# fps. Set to 60 (or any positive value) to lock to that rate; leave
+# at 0 (the default) to let the dispatcher run as fast as Core 0 can
+# carry it. The pacer code itself is #if'd out at 0 — no runtime cost
+# when disabled.
+#   idf.py -DGBJIT_FRAME_LIMIT_FPS=60 build
+if(NOT DEFINED GBJIT_FRAME_LIMIT_FPS)
+    set(GBJIT_FRAME_LIMIT_FPS 0)
+endif()
+target_compile_definitions(${COMPONENT_LIB} PRIVATE
+    GBJIT_FRAME_LIMIT_FPS=${GBJIT_FRAME_LIMIT_FPS})
