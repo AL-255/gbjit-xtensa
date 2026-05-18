@@ -180,12 +180,14 @@ static void oled_task(void *arg) {
 
 void oled_task_start(struct cpu_state *cpu) {
     s_cpu = cpu;
-    /* Pin to Core 0: Core 1 already hosts ppu_thread (with PPU async
-     * enabled). Core 0 runs the dispatcher; the OLED task here only
-     * wakes up every ~16ms to push a frame, so the dispatcher's hot
-     * loop is barely impacted. */
+    /* Pin to Core 1, sharing with ppu_thread. Both are mostly idle —
+     * ppu_tick early-returns on every call where cpu->cycles hasn't
+     * crossed the next state-machine deadline, and oled_task spends
+     * most of its time in vTaskDelay between frames + blocked on the
+     * I2C-master semaphore during a blit. Putting them both on Core 1
+     * gives the dispatcher uncontested Core 0 for its busy loop. */
     xTaskCreatePinnedToCore(
         oled_task, "gbjit_oled", 4096, NULL,
         tskIDLE_PRIORITY + 1, NULL,
-        0 /* Core 0 */);
+        1 /* Core 1 */);
 }

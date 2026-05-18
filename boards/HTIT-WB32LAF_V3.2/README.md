@@ -15,9 +15,9 @@ I2C0 at 400 kHz, address 0x3C. See `main/board.h` to change pins.
 
 | Core | Task | What it does |
 |------|------|-------------:|
-| 0 | `app_main` → `gbjit_dispatcher_run_until` | GB CPU emulation (JIT) |
-| 0 | `oled_task` | Polls `mmu->frame_seq`, crops 128×64 from the centre of the GB framebuffer, blits via I2C (~15 ms / frame) |
+| 0 | `app_main` → `gbjit_dispatcher_run_until` | GB CPU emulation (JIT) — uncontested |
 | 1 | `ppu_thread` | Runs `ppu_tick` in a tight loop (the `GBJIT_PPU_ASYNC` design from `core/ppu_thread.c`) — produces the framebuffer scanlines this board displays |
+| 1 | `oled_task` | Polls `mmu->frame_seq`, crops 128×64 from the centre of the GB framebuffer, blits via I2C (~15 ms / frame). Shares Core 1 with `ppu_thread`; both are mostly idle (early-return / vTaskDelay / semaphore-blocked on I2C) so they coexist fine. |
 
 The PPU's per-scanline renderer (`core/ppu.c::ppu_draw_line`) covers BG,
 window, and DMG sprites (BG/OBJ palettes, 8×8 and 8×16, X/Y flip, BG

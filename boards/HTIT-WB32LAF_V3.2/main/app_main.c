@@ -2,10 +2,11 @@
  * and stream the PPU output to the onboard I2C SSD1306 OLED.
  *
  *   Core 0:  app_main → gbjit_dispatcher_run_until (the GB CPU)
- *   Core 0:  oled_task (sleeps until PPU bumps frame_seq, then pushes)
  *   Core 1:  ppu_thread (spins on ppu_tick, generating scanlines)
+ *   Core 1:  oled_task (sleeps until PPU bumps frame_seq, then pushes)
  *
- * The dispatcher and the OLED task share Core 0; the OLED task is low
+ * Core 0 is reserved for the dispatcher's tight loop. Core 1 hosts
+ * both the PPU thread and the OLED display task; the OLED task is low
  * priority and yields between frames, so the dispatcher dominates.
  */
 
@@ -73,12 +74,12 @@ void app_main(void) {
     s_mmu.serial_sink = serial_sink;
     cpu_reset(&s_cpu, &s_mmu);
 
-    /* Bring up the OLED task first (Core 0, low prio) — it'll sleep
+    /* Bring up the OLED task first (Core 1, low prio) — it'll sleep
      * until the PPU bumps frame_seq. */
     oled_task_start(&s_cpu);
 
-    /* Move ppu_tick to Core 1. The dispatcher loop on Core 0 won't
-     * call ppu_tick under GBJIT_PPU_ASYNC; Core 1's task does. */
+    /* PPU on Core 1 alongside the OLED task. The dispatcher on Core 0
+     * won't call ppu_tick under GBJIT_PPU_ASYNC; Core 1's task does. */
     ppu_thread_start(&s_cpu);
 
     /* Run the GB CPU forever. The dispatcher self-terminates on HALT
@@ -99,7 +100,7 @@ void app_main(void) {
      * cost outweighs the first-encounter latency it saves. The lazy
      * chain-miss compile path picks up new blocks on demand. */
     disp.prefetch_enabled = false;
-    ESP_LOGI(TAG, "starting CPU — PPU on Core 1, OLED on Core 0, prefetch off");
+    ESP_LOGI(TAG, "starting CPU — Core 0 dispatcher, Core 1 PPU+OLED, prefetch off");
     gbjit_dispatcher_run_until(&disp, ~(uint64_t)0);
     ESP_LOGI(TAG, "dispatcher returned (pc=%04X halted=%d cycles=%" PRIu64 ")",
              s_cpu.pc, s_cpu.halted, s_cpu.cycles);
