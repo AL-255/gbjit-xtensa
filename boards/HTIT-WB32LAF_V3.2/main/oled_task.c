@@ -123,17 +123,18 @@ static void oled_task(void *arg) {
 
     uint32_t last_seq = 0;
 
-    /* JIT-rendered fps = how fast the PPU completes frames, sampled
-     * over a sliding 1-second window of mmu->frame_seq increments.
-     * Updated once per second and held until the next sample. This is
-     * the GB-emulation rate, NOT the OLED push rate (which is bounded
-     * by I2C throughput). */
+    /* JIT-rendered fps sampled over a sliding 1-second window of
+     * mmu->frame_seq increments, rendered as the top-left overlay on
+     * the OLED. Kept in release builds — the overlay is the user's
+     * only visible health indicator. */
     int64_t fps_window_start_us = esp_timer_get_time();
     uint32_t fps_window_seq_start = s_cpu->mmu->frame_seq;
     int current_fps = 0;
-
+#ifdef DEBUG
+    /* Per-second UART status line. Debug builds only. */
     uint32_t next_log_ms = 1000;
     uint32_t boot_ms = (uint32_t)(esp_log_timestamp());
+#endif
     while (1) {
         uint32_t cur = s_cpu->mmu->frame_seq;
 
@@ -152,15 +153,15 @@ static void oled_task(void *arg) {
         if (cur != last_seq) {
             last_seq = cur;
             compose_frame(s_cpu->mmu->framebuffer);
-            /* Overlay the JIT-rendered fps in the top-left corner BEFORE
-             * blitting. This intentionally clobbers the underlying PPU
-             * pixels in that 18x7 region — small price for a live perf
-             * readout. */
+            /* Overlay the JIT-rendered fps in the top-left corner
+             * before blitting. Clobbers the underlying PPU pixels in
+             * that 18x7 region — small price for a live perf readout. */
             draw_fps(s_page_buf, current_fps);
             ssd1306_blit(s_page_buf);
         } else {
             vTaskDelay(pdMS_TO_TICKS(4));
         }
+#ifdef DEBUG
         uint32_t now_ms = (uint32_t)(esp_log_timestamp());
         if (now_ms - boot_ms >= next_log_ms) {
             if (g_dispatcher) {
@@ -187,6 +188,7 @@ static void oled_task(void *arg) {
             }
             next_log_ms += 1000;
         }
+#endif
     }
 }
 

@@ -46,8 +46,10 @@ static const char *ROM_LABEL = "sml";
 static cpu_state s_cpu;
 static mmu s_mmu;
 
+#ifdef DEBUG
 static char  s_serial_buf[128];
 static int   s_serial_len;
+#endif
 /* --- 60 fps wall-clock pacer ----------------------------------------
  *
  * Without throttling the emulator runs as fast as Core 0 can dispatch
@@ -88,6 +90,7 @@ static void frame_pacer_60fps(struct mmu *m) {
     }
 }
 
+#ifdef DEBUG
 static void serial_sink(void *ctx, uint8_t b) {
     (void)ctx;
     if (b == '\n' || s_serial_len >= (int)sizeof(s_serial_buf) - 1) {
@@ -100,6 +103,7 @@ static void serial_sink(void *ctx, uint8_t b) {
         s_serial_buf[s_serial_len++] = (char)b;
     }
 }
+#endif
 
 void app_main(void) {
     ESP_LOGI(TAG, "boot — gbjit-xtensa @ HTIT-WB32LAF_V3.2");
@@ -111,7 +115,11 @@ void app_main(void) {
         ESP_LOGE(TAG, "mmu_load_rom failed");
         return;
     }
+#ifdef DEBUG
+    /* Blargg test-ROM serial sink to UART. Release builds drop this —
+     * SML doesn't use FF02/FF01 anyway. */
     s_mmu.serial_sink = serial_sink;
+#endif
     /* Lock emulation to 60 fps. See frame_pacer_60fps above. */
     s_pacer_anchor_us = esp_timer_get_time();
     s_pacer_frame_count = 0;

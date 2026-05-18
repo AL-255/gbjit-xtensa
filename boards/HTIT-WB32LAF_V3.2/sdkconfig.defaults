@@ -31,6 +31,12 @@ CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
 # Keeping the default DIO @ 80 MHz; the JIT win from faster flash is
 # small relative to chasing that breakage.
 
-# INFO-level logs stay on — the oled_task once-per-second fps print is
-# useful even in release builds and the UART cost is negligible at one
-# line per second.
+# --- Release build: silence the log subsystem -------------------------
+# Drop both the bootloader and the runtime default log level to ERROR.
+# ESP_LOGI / ESP_LOGW from IDF and from our code (boot banner, OLED
+# init, per-second oled_task line, serial-trap dump) all get filtered
+# out at the format-call site. Genuine failures still print via
+# ESP_LOGE. UART writes are blocking on Core 0 so silencing the noisy
+# levels removes a real wall-clock cost. Flip back to INFO to debug.
+CONFIG_LOG_DEFAULT_LEVEL_ERROR=y
+CONFIG_BOOTLOADER_LOG_LEVEL_ERROR=y
