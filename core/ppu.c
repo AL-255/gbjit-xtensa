@@ -41,10 +41,24 @@
 #define STAT_USER_BITS   0xF8
 
 /* LCDC bits. */
-#define LCDC_ENABLE        0x80
-#define LCDC_WINDOW_ENABLE 0x20
-#define LCDC_OBJ_SIZE      0x04
-#define LCDC_BG_ENABLE     0x01
+#define LCDC_ENABLE              0x80
+#define LCDC_WINDOW_TILEMAP_HI   0x40
+#define LCDC_WINDOW_ENABLE       0x20
+#define LCDC_BG_TILEDATA_LO      0x10
+#define LCDC_BG_TILEMAP_HI       0x08
+#define LCDC_OBJ_SIZE            0x04
+#define LCDC_OBJ_ENABLE          0x02
+#define LCDC_BG_ENABLE           0x01
+
+#define BGP_REG                  0x47
+#define OBP0_REG                 0x48
+#define OBP1_REG                 0x49
+
+/* OAM attribute bits. */
+#define OAM_BG_PRIO              0x80
+#define OAM_FLIP_Y               0x40
+#define OAM_FLIP_X               0x20
+#define OAM_PAL_1                0x10  /* DMG palette select (0=OBP0, 1=OBP1) */
 
 /* Mode IDs (= STAT bits 1:0). */
 #define LCD_HBLANK         0
@@ -174,6 +188,157 @@ static void ppu_lcdc_edge(mmu *m, u8 prev, u8 curr) {
     }
 }
 
+/* --- Scanline renderer ------------------------------------------------- */
+
+/* Fetch a pixel (0..3 color index, pre-palette) from a tile at the
+ * supplied VRAM-relative tile-data address. `row` is 0..7. `col` is 0..7
+ * counted left-to-right (bit 7 of byte is leftmost pixel on DMG). */
+static inline u8 fetch_tile_pixel(const u8 *vram, u16 tile_addr_vram_rel,
+                                  u8 row, u8 col) {
+    u16 line_addr = (u16)(tile_addr_vram_rel + row * 2);
+    u8 b0 = vram[line_addr];
+    u8 b1 = vram[line_addr + 1];
+    u8 bit = (u8)(7 - col);
+    return (u8)(((b1 >> bit) & 1) << 1 | ((b0 >> bit) & 1));
+}
+
+/* Render scanline `ly` into m->framebuffer. Called at LCD_TRANSFER →
+ * LCD_HBLANK; reads OAM, VRAM, BGP/OBP0/OBP1, LCDC, SCY/SCX, WY/WX
+ * which must reflect the final state for this line. */
+static void ppu_draw_line(mmu *m, u8 ly) {
+    u8 *line = &m->framebuffer[(u32)ly * 160];
+    u8 lcdc = m->io[LCDC_REG];
+
+    /* DMG: if BG_ENABLE is clear, BG (and window) render as color 0. We
+     * fill the line with shade-0 (BGP[0]) up front so sprites can still
+     * draw over it. */
+    u8 bgp = m->io[BGP_REG];
+    u8 bg_shade[4] = {
+        (u8)(bgp & 3), (u8)((bgp >> 2) & 3),
+        (u8)((bgp >> 4) & 3), (u8)((bgp >> 6) & 3),
+    };
+    u8 bg_color_id[160];                /* raw 0..3 before palette, for sprite/bg priority */
+
+    if (lcdc & LCDC_BG_ENABLE) {
+        u8 scx = m->io[SCX_REG], scy = m->io[SCY_REG];
+        u16 tilemap_base = (lcdc & LCDC_BG_TILEMAP_HI) ? 0x1C00 : 0x1800;
+        bool unsigned_tiles = (lcdc & LCDC_BG_TILEDATA_LO) != 0;
+        u8 bg_y = (u8)(ly + scy);
+        u8 tile_row = (u8)(bg_y >> 3);
+        u8 pixel_row = (u8)(bg_y & 7);
+        for (int x = 0; x < 160; x++) {
+            u8 bg_x = (u8)(x + scx);
+            u8 tile_col = (u8)(bg_x >> 3);
+            u8 pixel_col = (u8)(bg_x & 7);
+            u8 tile_id = m->vram[tilemap_base + tile_row * 32 + tile_col];
+            u16 tile_addr;
+            if (unsigned_tiles) {
+                tile_addr = (u16)(tile_id * 16);                /* base $8000 */
+            } else {
+                tile_addr = (u16)(0x1000 + (i8)tile_id * 16);   /* base $9000 */
+            }
+            u8 cid = fetch_tile_pixel(m->vram, tile_addr, pixel_row, pixel_col);
+            bg_color_id[x] = cid;
+            line[x] = bg_shade[cid];
+        }
+    } else {
+        for (int x = 0; x < 160; x++) {
+            bg_color_id[x] = 0;
+            line[x] = bg_shade[0];
+        }
+    }
+
+    /* Window — same tile-data base as BG (LCDC bit 4), distinct tile-
+     * map (LCDC bit 6). DMG: window only renders if BG_ENABLE is set
+     * too (yes, the BG_ENABLE bit gates the window in DMG mode). */
+    if ((lcdc & LCDC_WINDOW_ENABLE) && (lcdc & LCDC_BG_ENABLE)
+            && ly >= m->ppu_latched_wy) {
+        u8 wx = m->io[WX_REG];
+        if (wx < 167) {
+            int start_x = (wx >= 7) ? (wx - 7) : 0;
+            u16 tilemap_base = (lcdc & LCDC_WINDOW_TILEMAP_HI) ? 0x1C00 : 0x1800;
+            bool unsigned_tiles = (lcdc & LCDC_BG_TILEDATA_LO) != 0;
+            u8 wy_internal = m->window_line;
+            u8 tile_row = (u8)(wy_internal >> 3);
+            u8 pixel_row = (u8)(wy_internal & 7);
+            for (int x = start_x; x < 160; x++) {
+                int win_x = x - (int)wx + 7;
+                if (win_x < 0) continue;
+                u8 tile_col = (u8)((win_x >> 3) & 0x1F);
+                u8 pixel_col = (u8)(win_x & 7);
+                u8 tile_id = m->vram[tilemap_base + tile_row * 32 + tile_col];
+                u16 tile_addr;
+                if (unsigned_tiles) {
+                    tile_addr = (u16)(tile_id * 16);
+                } else {
+                    tile_addr = (u16)(0x1000 + (i8)tile_id * 16);
+                }
+                u8 cid = fetch_tile_pixel(m->vram, tile_addr, pixel_row, pixel_col);
+                bg_color_id[x] = cid;
+                line[x] = bg_shade[cid];
+            }
+            m->window_line++;
+        }
+    }
+
+    /* Sprites — OAM walk, pick up to 10 visible on this scanline by
+     * OAM index order, then render in OAM-index order with later (lower
+     * OAM index) sprites overwriting earlier ones at equal X, except
+     * lower X wins. DMG: stable-sort by X ascending; render in reverse
+     * so lowest-X is on top. Color 0 of the sprite palette is always
+     * transparent. */
+    if (lcdc & LCDC_OBJ_ENABLE) {
+        u8 obj_h = (lcdc & LCDC_OBJ_SIZE) ? 16 : 8;
+        typedef struct { u8 y, x, tile, attr, oam_idx; } visible_obj;
+        visible_obj vis[10];
+        int nvis = 0;
+        for (int i = 0; i < 40 && nvis < 10; i++) {
+            u8 sy = m->oam[i * 4 + 0];
+            int top = (int)sy - 16;
+            if ((int)ly < top || (int)ly >= top + obj_h) continue;
+            vis[nvis].y    = sy;
+            vis[nvis].x    = m->oam[i * 4 + 1];
+            vis[nvis].tile = m->oam[i * 4 + 2];
+            vis[nvis].attr = m->oam[i * 4 + 3];
+            vis[nvis].oam_idx = (u8)i;
+            nvis++;
+        }
+        /* Sort by X ascending, stable on OAM index. Insertion sort,
+         * nvis <= 10 so cheap. */
+        for (int i = 1; i < nvis; i++) {
+            for (int j = i; j > 0 && vis[j].x < vis[j-1].x; j--) {
+                visible_obj t = vis[j];
+                vis[j] = vis[j-1]; vis[j-1] = t;
+            }
+        }
+        /* Render in reverse (lower X / earlier OAM wins). */
+        u8 obp0 = m->io[OBP0_REG], obp1 = m->io[OBP1_REG];
+        for (int s = nvis - 1; s >= 0; s--) {
+            int top = (int)vis[s].y - 16;
+            int left = (int)vis[s].x - 8;
+            int row_in_sprite = (int)ly - top;
+            if (vis[s].attr & OAM_FLIP_Y) row_in_sprite = (obj_h - 1) - row_in_sprite;
+            u8 tile = vis[s].tile;
+            if (obj_h == 16) tile &= 0xFE;            /* low bit cleared in 8x16 mode */
+            u16 tile_addr = (u16)(tile * 16);
+            u8 pal = (vis[s].attr & OAM_PAL_1) ? obp1 : obp0;
+            u8 pal_shade[4] = {
+                0, (u8)((pal >> 2) & 3), (u8)((pal >> 4) & 3), (u8)((pal >> 6) & 3),
+            };
+            for (int px = 0; px < 8; px++) {
+                int x = left + px;
+                if (x < 0 || x >= 160) continue;
+                u8 col_in_sprite = (vis[s].attr & OAM_FLIP_X) ? (u8)(7 - px) : (u8)px;
+                u8 cid = fetch_tile_pixel(m->vram, tile_addr,
+                                          (u8)row_in_sprite, col_in_sprite);
+                if (cid == 0) continue;                    /* sprite color 0 = transparent */
+                if ((vis[s].attr & OAM_BG_PRIO) && bg_color_id[x] != 0) continue;
+                line[x] = pal_shade[cid];
+            }
+        }
+    }
+}
+
 /* --- Main entry -------------------------------------------------------- */
 
 void ppu_tick(struct cpu_state *cpu) {
@@ -243,6 +408,13 @@ void ppu_tick(struct cpu_state *cpu) {
                 m->ppu_lcd_count = (u16)(m->ppu_lcd_count - m->ppu_mode3_cycles);
                 m->ppu_lcd_mode = LCD_HBLANK;
                 m->io[STAT_REG] = (u8)((m->io[STAT_REG] & ~STAT_MODE) | LCD_HBLANK);
+                /* Scanline is now stable — push pixels into the
+                 * framebuffer. Cheap to skip on lines where there's no
+                 * downstream consumer (frame_seq goes unread); we'd
+                 * still pay for the LY/STAT machinery either way. */
+                if (m->io[LY_REG] < LCD_HEIGHT) {
+                    ppu_draw_line(m, m->io[LY_REG]);
+                }
                 ppu_update_stat_irq(m);
                 transitioned = true;
             }
@@ -259,6 +431,9 @@ void ppu_tick(struct cpu_state *cpu) {
 #else
                     m->io[IF_REG] |= INT_VBLANK_BIT;
 #endif
+                    /* Frame complete — bump the seq so display tasks
+                     * waiting on it can pull the freshly-drawn frame. */
+                    m->frame_seq++;
                     ppu_update_stat_irq(m);
                     ppu_check_lyc(m);
                     ppu_update_stat_irq(m);
@@ -275,8 +450,10 @@ void ppu_tick(struct cpu_state *cpu) {
             if (m->ppu_lcd_count >= LCD_LINE_CYCLES) {
                 m->ppu_lcd_count = (u16)(m->ppu_lcd_count - LCD_LINE_CYCLES);
                 if (m->io[LY_REG] == 0) {
-                    /* End of VBlank — latch WY for the next frame. */
+                    /* End of VBlank — latch WY and reset the window-
+                     * line counter for the next frame. */
                     m->ppu_latched_wy = m->io[WY_REG];
+                    m->window_line = 0;
                     m->ppu_lcd_mode = LCD_SEARCH_OAM;
                     m->io[STAT_REG] = (u8)((m->io[STAT_REG] & ~STAT_MODE) | LCD_SEARCH_OAM);
                     ppu_check_lyc(m);

@@ -1,0 +1,23 @@
+# HTIT-WB32LAF_V3.2 — ESP32-S3 dev board with onboard I2C SSD1306 OLED.
+# Pin map (see main/board.h): OLED_SDA=GPIO17, OLED_SCL=GPIO18, OLED_RST=GPIO20.
+
+CONFIG_IDF_TARGET="esp32s3"
+
+# Console on UART0.
+CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+
+# Release build.
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+
+# Keep memprot off — the JIT codecache lives in static IRAM, writes via
+# the data path, and would trip memprot if it were on.
+CONFIG_ESP_SYSTEM_MEMPROT_FEATURE=n
+
+# Disable both watchdogs — the dispatcher's busy-loop does no yields.
+CONFIG_ESP_INT_WDT=n
+CONFIG_ESP_TASK_WDT_EN=n
+
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+
+# Run the core at its rated max (240 MHz).
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y

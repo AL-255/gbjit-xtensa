@@ -109,6 +109,21 @@ typedef struct mmu {
      * without crossing any boundary and skip the heavy work. */
     u64 ppu_next_event_cycles;
 
+    /* Software framebuffer — one byte per pixel, value 0..3 is the GB
+     * shade *after* palette translation (0 = white, 3 = black). Filled
+     * one scanline at a time at the mode-3 → mode-0 transition in
+     * ppu_draw_line(). The display layer (boards/<board>/oled_task.c
+     * for the Heltec board) reads this at VBlank.
+     *
+     * `window_line` is the GB PPU's internal window line counter: it
+     * only advances on scanlines where the window is actually drawn,
+     * and is reset at the start of every frame. The frame_seq counter
+     * is incremented at the LCD_HBLANK → LCD_VBLANK transition so the
+     * display task can detect "new frame ready". */
+    u8  framebuffer[160 * 144];
+    u8  window_line;
+    u32 frame_seq;
+
     /* Serial output capture — Blargg test ROMs write ASCII to FF01 then $81 to FF02. */
     void (*serial_sink)(void *ctx, u8 byte);
     void *serial_sink_ctx;
