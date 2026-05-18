@@ -578,6 +578,16 @@ static void enter_block_sim(gbjit_block *b, cpu_state *cpu) {
 }
 #endif
 
+/* Branch-prediction macros for the dispatcher hot loop. These are
+ * compile-time hints only — GCC uses them to lay out the generated
+ * code so the predicted path is straight-line and the unlikely arms
+ * become branch-taken-cold. No runtime behavioural change. */
+#ifndef likely
+#define likely(x)   __builtin_expect(!!(x), 1)
+#define unlikely(x) __builtin_expect(!!(x), 0)
+#endif
+
+__attribute__((hot))
 void gbjit_dispatcher_run_until(gbjit_dispatcher *d, u64 until) {
 #if defined(ESP_PLATFORM) && !defined(CONFIG_IDF_TARGET_ESP32S3)
     /* Xtensa LX6 windowed-ABI workaround: when this function does its
@@ -609,7 +619,7 @@ void gbjit_dispatcher_run_until(gbjit_dispatcher *d, u64 until) {
          * executing them after a bank flip leads to wrong PCs (SML
          * loses control at ~668k cycles otherwise). The banked region
          * covers SMC pages [0x40 .. 0x7F] (each page is 256 GB bytes). */
-        if (cpu->mmu->rom_bank_dirty) {
+        if (unlikely(cpu->mmu->rom_bank_dirty)) {
             for (u32 a = 0x4000u; a < 0x8000u; a += (1u << GBJIT_SMC_PAGE_SHIFT)) {
                 gbjit_dispatcher_invalidate_addr(d, (u16)a);
             }
@@ -617,13 +627,32 @@ void gbjit_dispatcher_run_until(gbjit_dispatcher *d, u64 until) {
             prev = NULL;
         }
         /* Service pending interrupts and wake from HALT before each block.
-         * The JIT inlines HALT as a simple `cpu->halted = 1; exit block`, so
-         * we depend on the dispatcher to re-enter the interrupt path that
-         * the reference interpreter normally runs at the top of sm83_step. */
-        if (sm83_service_interrupts(cpu)) {
+         * The JIT inlines HALT as a simple `cpu->halted = 1; exit block`,
+         * so we depend on the dispatcher to re-enter the interrupt path
+         * that the reference interpreter normally runs at the top of
+         * sm83_step.
+         *
+         * Fast path under GBJIT_PPU_ASYNC: the PPU runs on Core 1 and
+         * Core 0's sm83_service_interrupts is a pure IF/IE check + IRQ
+         * dispatch — no PPU work to do. Skip the function call entirely
+         * when (io[$0F] & ie & 0x1F) is 0 AND we're not halted. This
+         * removes a ~10-instruction call sequence from every dispatcher
+         * iteration in the steady-state-no-IRQ case (which is most of
+         * them — IF bits land roughly once per scanline at most).
+         *
+         * Sync mode keeps calling unconditionally because ppu_tick is
+         * inside sm83_service_interrupts and must always run there. */
+#ifdef GBJIT_PPU_ASYNC
+        u8 if_pending = (u8)(cpu->mmu->io[0x0F] & cpu->mmu->ie & 0x1Fu);
+        if (unlikely(if_pending || cpu->halted)) {
+            if (sm83_service_interrupts(cpu)) prev = NULL;
+        }
+#else
+        if (unlikely(sm83_service_interrupts(cpu))) {
             prev = NULL;
         }
-        if (cpu->halted) {
+#endif
+        if (unlikely(cpu->halted)) {
             cpu->cycles += 4;
             continue;
         }
@@ -631,12 +660,12 @@ void gbjit_dispatcher_run_until(gbjit_dispatcher *d, u64 until) {
          * the interpreter so that the reference path handles the ime promotion
          * (ime becomes 1 after exactly one op following EI). Inlined ops
          * don't touch ime_pending. */
-        if (cpu->ime_pending) {
+        if (unlikely(cpu->ime_pending)) {
             sm83_step(cpu);
             prev = NULL;
             continue;
         }
-        if (d->interp_fallback) {
+        if (unlikely(d->interp_fallback)) {
             sm83_step(cpu);
             continue;
         }
@@ -647,8 +676,8 @@ void gbjit_dispatcher_run_until(gbjit_dispatcher *d, u64 until) {
          * `no_cache` mode disables this — useful for showing the cache's
          * value vs always-recompile-on-encounter behaviour. */
         gbjit_block *b = NULL;
-        if (!d->no_cache) {
-            if (prev && prev->predicted_next && prev->predicted_next_pc == cpu->pc) {
+        if (likely(!d->no_cache)) {
+            if (likely(prev && prev->predicted_next && prev->predicted_next_pc == cpu->pc)) {
                 b = prev->predicted_next;
                 GBJIT_STAT_INC(d, chain_hits);
             } else {
@@ -657,7 +686,7 @@ void gbjit_dispatcher_run_until(gbjit_dispatcher *d, u64 until) {
             }
         }
 
-        if (!b) {
+        if (unlikely(!b)) {
             if (d->no_cache) {
                 /* Wipe the bump-allocator arena so each compile reuses the
                  * same bytes. Without this the arena would fill within a
@@ -741,6 +770,6 @@ void gbjit_dispatcher_run_until(gbjit_dispatcher *d, u64 until) {
          * sm83_service_interrupts will tick the PPU and may raise an
          * IRQ that clears `halted` and resumes execution. Don't break
          * on halted — sm83_run_until handles it the same way. */
-        if (cpu->stopped) break;
+        if (unlikely(cpu->stopped)) break;
     }
 }
