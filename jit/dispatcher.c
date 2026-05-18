@@ -661,6 +661,11 @@ void gbjit_dispatcher_run_until(gbjit_dispatcher *d, u64 until) {
             prev = b;
         }
 
-        if (cpu->halted || cpu->stopped) break;
+        /* `stopped` is unrecoverable — STOP halts the CPU clock until
+         * reset. HALT alone is not terminal: the next iteration's
+         * sm83_service_interrupts will tick the PPU and may raise an
+         * IRQ that clears `halted` and resumes execution. Don't break
+         * on halted — sm83_run_until handles it the same way. */
+        if (cpu->stopped) break;
     }
 }

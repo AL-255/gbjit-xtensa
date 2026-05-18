@@ -339,11 +339,69 @@ static void ppu_draw_line(mmu *m, u8 ly) {
     }
 }
 
+/* --- Timer (FF04..FF07) ------------------------------------------------ */
+
+#define DIV_REG       0x04
+#define TIMA_REG      0x05
+#define TMA_REG       0x06
+#define TAC_REG       0x07
+#define INT_TIMER_BIT 0x04
+
+/* TIMA period in T-cycles, indexed by TAC bits 1..0. Pan Docs §"Timer
+ * Registers": 00→1024 (4096Hz), 01→16 (262144Hz), 10→64 (65536Hz),
+ * 11→256 (16384Hz). DIV (FF04) is always 16384Hz = period 256... wait
+ * no, DIV is 16384Hz = period 64 T-cycles per increment of the visible
+ * register, which corresponds to a /256 prescaler on the internal
+ * 16-bit DIV that ticks every T-cycle. We model the visible byte
+ * directly: it ticks every 64 T-cycles. */
+static const u16 tima_period_lookup[4] = { 1024, 16, 64, 256 };
+
+static void timer_tick(mmu *m, u64 cycles_now) {
+    u32 delta = (u32)(cycles_now - m->timer_last_cycles);
+    m->timer_last_cycles = cycles_now;
+    if (delta == 0) return;
+
+    /* DIV — always ticking, every 64 T-cycles bumps the visible byte. */
+    m->timer_div_acc += delta;
+    if (m->timer_div_acc >= 64) {
+        u32 ticks = m->timer_div_acc / 64;
+        m->timer_div_acc %= 64;
+        m->io[DIV_REG] = (u8)(m->io[DIV_REG] + ticks);
+    }
+
+    /* TIMA — only if TAC bit 2 is set. Overflow reloads from TMA and
+     * raises IF.TIMER. */
+    u8 tac = m->io[TAC_REG];
+    if (tac & 0x04) {
+        u16 period = tima_period_lookup[tac & 3];
+        m->timer_tima_acc += delta;
+        while (m->timer_tima_acc >= period) {
+            m->timer_tima_acc -= period;
+            if (m->io[TIMA_REG] == 0xFF) {
+                m->io[TIMA_REG] = m->io[TMA_REG];
+#ifdef GBJIT_PPU_ASYNC
+                __atomic_fetch_or(&m->io[IF_REG], INT_TIMER_BIT, __ATOMIC_RELAXED);
+#else
+                m->io[IF_REG] |= INT_TIMER_BIT;
+#endif
+            } else {
+                m->io[TIMA_REG]++;
+            }
+        }
+    }
+}
+
 /* --- Main entry -------------------------------------------------------- */
 
 void ppu_tick(struct cpu_state *cpu) {
     if (!cpu || !cpu->mmu) return;
     mmu *m = cpu->mmu;
+
+    /* Timer first — runs every tick regardless of the PPU early-return,
+     * because SML and others poll DIV / wait for TIMA-overflow IRQ even
+     * when no PPU state transition is due. The cost is just two adds +
+     * a compare on the fast path. */
+    timer_tick(m, cpu->cycles);
 
     /* Fast-path early-return — most dispatcher iterations span fewer
      * cycles than the next state transition. The deadline is reset

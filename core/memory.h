@@ -101,6 +101,15 @@ typedef struct mmu {
      * PPU state machine by. */
     u64 ppu_last_cpu_cycles;
 
+    /* Timer state — DIV (FF04) ticks at 16384 Hz unconditionally; TIMA
+     * (FF05) ticks at the rate selected by TAC (FF07) bits 0..1 when
+     * bit 2 is set, overflowing into IF.TIMER. Driven from the same
+     * cpu->cycles delta as the PPU, accumulated in these counters so we
+     * don't have to schedule per-tick callbacks. */
+    u64 timer_last_cycles;
+    u32 timer_div_acc;
+    u32 timer_tima_acc;
+
     /* Cycle deadline past which ppu_tick MUST run its state machine;
      * until then it can early-return. ppu_tick() runs on every dispatch
      * iteration via sm83_service_interrupts, but most iterations span

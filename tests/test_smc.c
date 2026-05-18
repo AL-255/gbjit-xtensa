@@ -78,11 +78,11 @@ static int test_loop_block_invalidation(void) {
     static cpu_state cpu_a, cpu_b;
     static mmu m_a, m_b;
 
-    /* Reference run via interpreter — step until HALT, matching the
-     * JIT dispatcher's behaviour (it stops at HALT and doesn't tick
-     * halted iterations). */
+    /* Reference run via interpreter — run to the same 5000-cycle budget
+     * the JIT uses; both keep ticking 4 cycles per iteration while
+     * halted so cycles agree at the budget. */
     setup(&cpu_a, &m_a, prog, sizeof(prog));
-    while (!cpu_a.halted) sm83_step(&cpu_a);
+    sm83_run_until(&cpu_a, 5000);
 
     /* JIT run with invalidation injected partway through. */
     setup(&cpu_b, &m_b, prog, sizeof(prog));

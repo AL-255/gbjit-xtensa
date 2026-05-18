@@ -28,8 +28,11 @@ static void run_interp(const u8 *prog, size_t prog_len, cpu_state *out_cpu, mmu 
     gb_mmu_init(out_mmu);
     memcpy(out_mmu->rom + 0x0100, prog, prog_len);
     cpu_reset(out_cpu, out_mmu);
-    int steps = 0;
-    while (!out_cpu->halted && steps < 1000) { sm83_step(out_cpu); steps++; }
+    /* Match the JIT path's 100 000-cycle budget so cycles agree post-
+     * HALT: both sides keep ticking 4 cycles per iteration while halted
+     * (real DMG HALT waits for IRQ; here no IRQ source exists for these
+     * minimal ROMs, so we just drain the budget). */
+    sm83_run_until(out_cpu, 100000);
 }
 
 static void run_jit(const u8 *prog, size_t prog_len, cpu_state *out_cpu, mmu *out_mmu) {

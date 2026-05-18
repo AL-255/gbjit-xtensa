@@ -43,6 +43,22 @@ void gb_mmu_init(mmu *m) {
     memset(m, 0, sizeof(*m));
     m->boot_rom_disabled = 1; /* skip boot ROM — start at $0100 */
     m->mbc = MBC_NONE;
+    /* Post-boot DMG IO defaults (Pan Docs §"Power-Up Sequence"). Most
+     * games tolerate zero-init but a few read these regs before writing
+     * them. The joypad ($FF00) in particular must read "no buttons,
+     * no row selected" or SML's main loop interprets the all-zero
+     * default as "all buttons + both rows" which short-circuits its
+     * scene/menu logic. */
+    m->io[0x00] = 0xCF; /* JOYP — high bits 1 by ISA, low 4 bits = 1 (no key) */
+    m->io[0x05] = 0x00; /* TIMA  */
+    m->io[0x06] = 0x00; /* TMA   */
+    m->io[0x07] = 0x00; /* TAC   */
+    m->io[0x40] = 0x91; /* LCDC — post-DMG-boot (LCD on, BG on, win/obj off) */
+    m->io[0x41] = 0x85; /* STAT  */
+    m->io[0x44] = 0x00; /* LY    */
+    m->io[0x47] = 0xFC; /* BGP   — default grey palette */
+    m->io[0x48] = 0xFF; /* OBP0  */
+    m->io[0x49] = 0xFF; /* OBP1  */
     m->rom_bank = 1;
     m->rom_banks = 2;        /* default: 32 KB single-bank cart */
     /* Allocate a default-sized buffer so callers that write into m->rom
@@ -125,6 +141,19 @@ u8 mmu_read8(mmu *m, u16 addr) {
     if (addr < 0xFF00u) return 0xFFu;
     if (addr < 0xFF80u) {
         u8 io_addr = (u8)(addr - 0xFF00u);
+        /* JOYP ($FF00) — Pan Docs §"Joypad Input". The CPU writes bits
+         * 4 (P14) and 5 (P15) to select direction or action row; reads
+         * return the row-select bits PLUS the 4 button bits of the
+         * selected row (0 = pressed). Bits 6,7 are always 1.
+         *
+         * We have no physical input, so all four button bits read as
+         * 1 (none pressed). SML's polling routine at bank-3 $4800
+         * depends on this — if reads return the raw stored byte, the
+         * low nibble is 0 and SML interprets it as "all buttons held"
+         * which trips the soft-reset check at $07DA. */
+        if (io_addr == 0x00) {
+            return (u8)(m->io[0x00] | 0xCFu);
+        }
         /* LY ($FF44) and STAT ($FF41) are maintained by ppu_tick from
          * cpu->cycles; reads just return the cached IO byte. */
         return m->io[io_addr];
@@ -171,6 +200,15 @@ void mmu_write8(mmu *m, u16 addr, u8 v) {
     if (addr < 0xFF00u) return;
     if (addr < 0xFF80u) {
         u8 io_addr = (u8)(addr - 0xFF00u);
+        /* Timer write quirks (Pan Docs §"Timer Registers"):
+         *  - FF04 (DIV): any write resets the visible byte to 0; also
+         *    reset the prescaler accumulator so the next tick uses the
+         *    fresh baseline. SML uses this to zero DIV between init
+         *    passes.
+         *  - FF05 (TIMA): a write replaces TIMA and clears the period
+         *    accumulator so overflow timing reflects the new value. */
+        if (addr == 0xFF04u) { m->io[io_addr] = 0; m->timer_div_acc = 0; return; }
+        if (addr == 0xFF05u) { m->io[io_addr] = v; m->timer_tima_acc = 0; return; }
         m->io[io_addr] = v;
         /* Blargg serial trap: writing $81 to FF02 transmits FF01. */
         if (addr == 0xFF02u && v == 0x81u && m->serial_sink) {

@@ -1202,7 +1202,16 @@ static bool inline_op(xt_emit *e, u8 opcode, u16 pc, inline_ctx *ictx) {
         u8 n8 = mmu_read8(m, (u16)(pc + 1));
         u32 byte_addr = 0;
         if (opcode == 0xF0) {
-            /* LDH A,(n8): inline IO and HRAM reads. */
+            /* LDH A,(n8): inline IO and HRAM reads.
+             *
+             * Skip $FF00 — JOYP reads aren't a straight io[] fetch; the
+             * mmu helper OR's in the always-high bits + non-pressed
+             * button bits. Inlining here would return the raw stored
+             * byte, which SML's polling routine interprets as "all
+             * buttons held" and soft-resets. */
+            if (n8 == 0x00) {
+                return false;
+            }
             if (n8 < 0x80) {
                 byte_addr = ictx->mmu_base_value + (u32)offsetof(mmu, io) + n8;
             } else if (n8 < 0xFF) {
