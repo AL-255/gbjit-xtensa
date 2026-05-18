@@ -11,6 +11,13 @@ endif()
 
 add_compile_options(-Wall -Wextra -Wshadow -Wno-unused-parameter -fno-strict-aliasing)
 
+# Host build: define DEBUG so the dispatcher's per-block counters
+# (blocks_compiled, chain_hits, smc_invalidations, ...) are populated.
+# gbjit_host's printf line and the unit tests both read these. The
+# production board firmware (boards/*) intentionally does NOT define
+# DEBUG, so those increments are compiled out of the hot path.
+add_compile_definitions(DEBUG=1)
+
 # Portable core
 add_library(gbjit_core STATIC
     core/memory.c

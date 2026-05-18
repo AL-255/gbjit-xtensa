@@ -117,7 +117,9 @@ static void oled_task(void *arg) {
     ssd1306_clear();
 
     uint32_t last_seq = 0;
+#ifdef DEBUG
     uint32_t frames_pushed = 0;
+#endif
 
     /* JIT-rendered fps = how fast the PPU completes frames, sampled
      * over a sliding 1-second window of mmu->frame_seq increments.
@@ -128,8 +130,10 @@ static void oled_task(void *arg) {
     uint32_t fps_window_seq_start = s_cpu->mmu->frame_seq;
     int current_fps = 0;
 
+#ifdef DEBUG
     uint32_t next_log_ms = 1000;
     uint32_t boot_ms = (uint32_t)(esp_log_timestamp());
+#endif
     while (1) {
         uint32_t cur = s_cpu->mmu->frame_seq;
 
@@ -154,10 +158,13 @@ static void oled_task(void *arg) {
              * readout. */
             draw_fps(s_page_buf, current_fps);
             ssd1306_blit(s_page_buf);
+#ifdef DEBUG
             frames_pushed++;
+#endif
         } else {
             vTaskDelay(pdMS_TO_TICKS(4));
         }
+#ifdef DEBUG
         uint32_t now_ms = (uint32_t)(esp_log_timestamp());
         if (now_ms - boot_ms >= next_log_ms) {
             ESP_LOGI(TAG, "jit_fps=%d  pushed=%lu  ppu_seq=%lu  pc=0x%04X",
@@ -167,6 +174,7 @@ static void oled_task(void *arg) {
                      (unsigned)s_cpu->pc);
             next_log_ms += 1000;
         }
+#endif
     }
 }
 

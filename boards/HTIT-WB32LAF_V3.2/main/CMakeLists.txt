@@ -28,4 +28,4 @@ idf_component_register(
     INCLUDE_DIRS "."
 )
 target_compile_definitions(${COMPONENT_LIB} PRIVATE ${_rom_define})
-target_compile_options(${COMPONENT_LIB} PRIVATE -Wall -Wextra)
+target_compile_options(${COMPONENT_LIB} PRIVATE -Wall -Wextra -O3)

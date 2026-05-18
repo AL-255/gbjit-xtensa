@@ -102,11 +102,14 @@ bool ssd1306_init(void) {
     }
 
     /* Confirm the OLED actually answered before sending init bytes. If
-     * the targeted address doesn't ACK, sweep the bus once for a
-     * diagnostic — wiring/Vext/pull-up problems show up here instead of
+     * the targeted address doesn't ACK there's no recovery — fail fast.
+     * In DEBUG builds we also sweep the bus and log every responding
+     * address, so wiring/Vext/pull-up problems show up here instead of
      * as a confusing init-stream failure further down. */
     if (i2c_master_probe(s_bus, BOARD_OLED_I2C_ADDR, 50) != ESP_OK) {
-        ESP_LOGW(TAG, "no ACK at 0x%02X — bus scan follows:", BOARD_OLED_I2C_ADDR);
+        ESP_LOGE(TAG, "no ACK at 0x%02X", BOARD_OLED_I2C_ADDR);
+#ifdef DEBUG
+        ESP_LOGW(TAG, "scanning the bus:");
         int found = 0;
         for (uint8_t a = 0x08; a < 0x78; a++) {
             if (i2c_master_probe(s_bus, a, 30) == ESP_OK) {
@@ -115,6 +118,7 @@ bool ssd1306_init(void) {
             }
         }
         if (!found) ESP_LOGE(TAG, "  bus silent — check Vext / pull-ups / RST pin");
+#endif
         return false;
     }
 

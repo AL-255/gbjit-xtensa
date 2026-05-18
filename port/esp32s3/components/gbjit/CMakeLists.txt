@@ -26,6 +26,12 @@ idf_component_register(
 # Suppress shadow warnings IDF's headers trigger; keep -Wall otherwise.
 target_compile_options(${COMPONENT_LIB} PRIVATE -Wall -Wextra -Wno-shadow)
 
+# Qemu bench harness reads dispatcher.blocks_compiled / chain_hits /
+# .blocks_executed for its [BENCH] line, so it needs the counters
+# populated. The boards/* firmwares (which don't print stats) opt out
+# of this define and get a faster hot loop.
+target_compile_definitions(${COMPONENT_LIB} PRIVATE DEBUG=1)
+
 # Move ppu_tick onto Core 1. See core/ppu_thread.h for the design and
 # the synchronisation contract with sm83_service_interrupts. Opt-out by
 # passing -DGBJIT_PPU_ASYNC=0 to fall back to the in-line PPU tick.

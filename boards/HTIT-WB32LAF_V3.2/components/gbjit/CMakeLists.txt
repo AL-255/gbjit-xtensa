@@ -28,6 +28,15 @@ idf_component_register(
 
 target_compile_options(${COMPONENT_LIB} PRIVATE -Wall -Wextra -Wno-shadow)
 
+# Production firmware: -O3 on the hot path (codegen, dispatcher,
+# interp, PPU). This component owns the dispatcher's busy loop, so the
+# higher optimisation level pays off most here. IDF's default is -O2
+# via CONFIG_COMPILER_OPTIMIZATION_PERF; we override per-component to
+# keep the upgrade scoped. DEBUG is intentionally NOT defined here, so
+# the per-block stat-counter increments compile out (see
+# include/gbjit_debug.h).
+target_compile_options(${COMPONENT_LIB} PRIVATE -O3)
+
 # Move ppu_tick onto Core 1 by default. See core/ppu_thread.h.
 if(NOT DEFINED GBJIT_PPU_ASYNC)
     set(GBJIT_PPU_ASYNC 1)

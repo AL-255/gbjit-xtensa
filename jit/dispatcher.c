@@ -11,6 +11,7 @@
 #include "memory.h"
 #include "xtensa_sim.h"
 #include "emit_xtensa.h"
+#include "gbjit_debug.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -345,7 +346,7 @@ static void prefetch_successors(gbjit_dispatcher *d, gbjit_block *b, int depth) 
         u16 pc = b->succ_pc[i];
         if (pc == 0xFFFFu) continue;
         if (find_block(d, pc)) {
-            d->prefetch_already_cached++;
+            GBJIT_STAT_INC(d, prefetch_already_cached);
             continue;
         }
         resolver_ctx hr = { d->cpu };
@@ -357,8 +358,8 @@ static void prefetch_successors(gbjit_dispatcher *d, gbjit_block *b, int depth) 
 #endif
         if (!nb) return;     /* arena full — stop walking */
         insert_block(d, nb);
-        d->blocks_compiled++;
-        d->prefetched_blocks++;
+        GBJIT_STAT_INC(d, blocks_compiled);
+        GBJIT_STAT_INC(d, prefetched_blocks);
         prefetch_successors(d, nb, depth - 1);
     }
 }
@@ -376,7 +377,7 @@ void gbjit_dispatcher_invalidate_addr(gbjit_dispatcher *d, u16 gb_addr) {
         clear_dangling_predictions(d, blk);
         gbjit_block_free(blk);
         free(node);
-        d->smc_invalidations++;
+        GBJIT_STAT_INC(d, smc_invalidations);
         node = next;
     }
 }
@@ -589,10 +590,10 @@ void gbjit_dispatcher_run_until(gbjit_dispatcher *d, u64 until) {
         if (!d->no_cache) {
             if (prev && prev->predicted_next && prev->predicted_next_pc == cpu->pc) {
                 b = prev->predicted_next;
-                d->chain_hits++;
+                GBJIT_STAT_INC(d, chain_hits);
             } else {
                 b = find_block(d, cpu->pc);
-                if (prev) d->chain_misses++;
+                if (prev) GBJIT_STAT_INC(d, chain_misses);
             }
         }
 
@@ -615,7 +616,7 @@ void gbjit_dispatcher_run_until(gbjit_dispatcher *d, u64 until) {
                 continue;
             }
             if (!d->no_cache) insert_block(d, b);
-            d->blocks_compiled++;
+            GBJIT_STAT_INC(d, blocks_compiled);
             if (d->prefetch_enabled) {
                 prefetch_successors(d, b, d->prefetch_depth);
             }
@@ -649,7 +650,7 @@ void gbjit_dispatcher_run_until(gbjit_dispatcher *d, u64 until) {
 #else
         enter_block_sim(b, cpu);
 #endif
-        d->blocks_executed++;
+        GBJIT_STAT_INC(d, blocks_executed);
 
         if (d->no_cache) {
             /* Don't hand a pointer to a doomed block to the chain cache;

@@ -161,10 +161,12 @@ static bool op_touches_mmu(u8 op) {
  * SIZE_MAX. The walker uses this to decide whether to keep walking past
  * a JR cc, and inline_op uses it to decide whether to emit a back-branch
  * vs. a block-terminator. */
-/* Diagnostic counters — bumped from gbjit_compile_block whenever
- * detect_back_edge_target returns a hit. Useful for confirming the
- * optimisation fires on the expected loops (HRAM polling, OAM-DMA wait,
- * etc.) without rerunning under a tracer. */
+#ifdef DEBUG
+/* Generic JR-cc back-edge detection — left in for future re-enablement
+ * (the path the call site takes is currently hard-disabled because it
+ * caused a measurable real-S3 regression in SML, see the walker). The
+ * `g_back_edge_hits` counter is a development aid only and isn't
+ * exposed in release builds. */
 static u32 g_back_edge_hits = 0;
 u32 gbjit_back_edge_hit_count(void) { return g_back_edge_hits; }
 
@@ -186,6 +188,7 @@ static u32 detect_back_edge_target(const u8 *ops_opcode, const u16 *ops_pc,
     g_back_edge_hits++;
     return target_idx;
 }
+#endif
 
 /* --- Code-emission helpers ---------------------------------------------- */
 
@@ -1599,13 +1602,12 @@ gbjit_block *gbjit_compile_block(codecache *cc, cpu_state *cpu, u16 pc_start,
         n_ops++;
         u16 next_pc = (u16)(cur + info->length);
 
-        /* Generic loop-internalisation (DISABLED — caused a measurable
+        /* Generic loop-internalisation is DISABLED — caused a measurable
          * regression on real S3 SML even when the hot loop didn't match
-         * its veto rules. Re-enable after instrumenting which blocks
-         * actually got back-edge-emitted code). The narrower DEC-A-loop
-         * fast path below catches the OAM-DMA wait pattern that's
-         * SML/Tetris's actual hot HRAM block. */
-        (void)detect_back_edge_target;
+         * its veto rules. The narrower DEC-A-loop fast path below
+         * catches the OAM-DMA wait pattern that's SML/Tetris's actual
+         * hot HRAM block. detect_back_edge_target is only compiled in
+         * DEBUG builds (see #ifdef above). */
 
         /* IO-write ops with PPU/timer side effects: terminate the block
          * after the write so the next dispatcher iteration calls ppu_tick
