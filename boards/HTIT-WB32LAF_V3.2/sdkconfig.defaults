@@ -30,3 +30,27 @@ CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
 # components/spi_flash/spi_flash_hpm_enable.c on this toolchain.
 # Keeping the default DIO @ 80 MHz; the JIT win from faster flash is
 # small relative to chasing that breakage.
+
+# --- Release-mode debug-feature stripping ----------------------------
+# Lower the ESP-IDF runtime log level past ERROR. Boot banners go
+# away; ERROR-level prints (which are real failures we want to see)
+# still come through. Production firmware shouldn't spam INFO logs
+# at any rate.
+CONFIG_LOG_DEFAULT_LEVEL_ERROR=y
+CONFIG_LOG_DEFAULT_LEVEL=1
+# Maximum compile-time log level — the LOG_LOCAL_LEVEL guards in IDF
+# headers gate ESP_LOG* expansion on this; setting it to ERROR makes
+# the INFO/WARN macros expand to nothing, dropping the strings out of
+# .rodata.
+CONFIG_LOG_MAXIMUM_EQUALS_DEFAULT=y
+CONFIG_LOG_MAXIMUM_LEVEL_ERROR=y
+CONFIG_LOG_MAXIMUM_LEVEL=1
+# Compile out assert() — the JIT's emit_xtensa.c has many asserts on
+# encoder invariants that we hit thousands of times per block compile.
+# At -O3 they fold into nothing but assert() itself still emits a
+# function-call boundary; NDEBUG removes that path entirely.
+CONFIG_COMPILER_OPTIMIZATION_ASSERTIONS_DISABLE=y
+# Strip the bootloader's INFO logs too. Saves a few ms of boot time
+# (cosmetic) and a couple of KB of bootloader .rodata.
+CONFIG_BOOTLOADER_LOG_LEVEL_WARN=y
+CONFIG_BOOTLOADER_LOG_LEVEL=2
