@@ -59,6 +59,23 @@ static void usage(const char *argv0) {
         argv0);
 }
 
+/* Write the 160x144 framebuffer as a 4-shade PGM. The PPU stores raw
+ * shade values 0..3; we map 0→255 (lightest) 3→0 (darkest) to match
+ * conventional DMG screenshots. Caller is responsible for the file's
+ * existence and writability. */
+static int dump_framebuffer_pgm(const mmu *m, const char *path) {
+    FILE *f = fopen(path, "wb");
+    if (!f) return -1;
+    fprintf(f, "P5\n160 144\n255\n");
+    for (int i = 0; i < 160 * 144; i++) {
+        u8 shade = m->framebuffer[i] & 3;
+        u8 px = (u8)(255 - (shade * 85));   /* 0→255, 1→170, 2→85, 3→0 */
+        fputc(px, f);
+    }
+    fclose(f);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     install_memory_guard();
     bool use_jit = false;
@@ -66,6 +83,8 @@ int main(int argc, char **argv) {
     bool no_prefetch = false;
     u64 max_cycles = 200000000ull;
     const char *rom_path = NULL;
+    const char *dump_path = NULL;
+    u64 dump_at_cycles = 0;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--interp") == 0) use_jit = false;
@@ -74,6 +93,13 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--no-prefetch") == 0) { use_jit = true; no_prefetch = true; }
         else if (strcmp(argv[i], "--max-cycles") == 0 && i + 1 < argc) {
             max_cycles = strtoull(argv[++i], NULL, 0);
+        } else if (strcmp(argv[i], "--dump-fb") == 0 && i + 2 < argc) {
+            /* `--dump-fb <cycles> <file.pgm>`: run until cycles, then
+             * write the 160x144 framebuffer as a P5 PGM. Used by the
+             * a/b comparison pipeline against a golden emulator. */
+            dump_at_cycles = strtoull(argv[++i], NULL, 0);
+            dump_path = argv[++i];
+            if (max_cycles < dump_at_cycles) max_cycles = dump_at_cycles;
         } else if (argv[i][0] == '-') {
             usage(argv[0]);
             return 1;
@@ -113,9 +139,35 @@ int main(int argc, char **argv) {
         }
         disp.no_cache = no_cache;
         if (no_prefetch) disp.prefetch_enabled = false;
-        gbjit_dispatcher_run_until(&disp, max_cycles);
+        if (dump_path) {
+            /* Run to the dump cycle, snapshot the framebuffer, then
+             * continue to max_cycles. */
+            gbjit_dispatcher_run_until(&disp, dump_at_cycles);
+            if (dump_framebuffer_pgm(&m, dump_path) == 0) {
+                fprintf(stderr, "[dump-fb] %s at cycles=%llu pc=%04X\n",
+                        dump_path, (unsigned long long)cpu.cycles, cpu.pc);
+            } else {
+                fprintf(stderr, "[dump-fb] failed to write %s\n", dump_path);
+            }
+            if (max_cycles > dump_at_cycles) {
+                gbjit_dispatcher_run_until(&disp, max_cycles);
+            }
+        } else {
+            gbjit_dispatcher_run_until(&disp, max_cycles);
+        }
     } else {
-        sm83_run_until(&cpu, max_cycles);
+        if (dump_path) {
+            sm83_run_until(&cpu, dump_at_cycles);
+            if (dump_framebuffer_pgm(&m, dump_path) == 0) {
+                fprintf(stderr, "[dump-fb] %s at cycles=%llu pc=%04X\n",
+                        dump_path, (unsigned long long)cpu.cycles, cpu.pc);
+            }
+            if (max_cycles > dump_at_cycles) {
+                sm83_run_until(&cpu, max_cycles);
+            }
+        } else {
+            sm83_run_until(&cpu, max_cycles);
+        }
     }
 
     clock_gettime(CLOCK_MONOTONIC, &t1);
