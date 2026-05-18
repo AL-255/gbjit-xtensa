@@ -18,26 +18,64 @@
 
 #if defined(__linux__) && !defined(ESP_PLATFORM)
 #include <sys/mman.h>
+#include <unistd.h>
 #define HAVE_MMAP_EXEC 1
 #endif
 
 #if defined(ESP_PLATFORM)
-#include "esp_heap_caps.h"
 #include "esp_log.h"
+/* IDF's IRAM_BSS_ATTR macro is a no-op on ESP32-S3 (it's gated on the
+ * original ESP32's 8-bit-IRAM-access kconfig). To force genuine IRAM
+ * placement we name the section the way IDF's linker fragments expect:
+ * an input section of ".iram.bss" gets routed (soc.lf → app.lf) into
+ * the ".iram0.bss" output section, which lives in iram0_0_seg starting
+ * at SRAM_IRAM_ORG (0x40378000). That gives us the I-bus alias so
+ * instruction fetch into the JIT-emitted code goes through the I-cache
+ * path; the D-bus alias (0x3FCxxxxx) shows a ~4× slowdown for code
+ * execution in qemu and per the TRM uses a less-optimised pipe on
+ * real silicon. */
+#define GBJIT_IRAM_BSS __attribute__((section(".iram.bss")))
 #endif
 
-/* Upper bound on the JIT exec arena. The host malloc / Linux mmap paths
- * grab this directly. On ESP32-S3 the runtime queries
- * heap_caps_get_largest_free_block(MALLOC_CAP_EXEC) and uses the largest
- * available block clamped to this ceiling — so on the real chip the JIT
- * grows to whatever exec-capable internal SRAM is actually free (typically
- * 60-100 KB on the qemu/bench build, much more if the firmware doesn't
- * statically reserve a big cartridge ROM array). */
-#define ARENA_CAP_MAX     (384u * 1024u)
-#define ARENA_CAP_DEFAULT ( 64u * 1024u)
-/* Leave at least this much heap headroom for the rest of the firmware
- * (IDF allocs, scratch buffers) when we go above the static default. */
-#define ARENA_HEADROOM    (  4u * 1024u)
+/* JIT exec arena. Statically allocated — no heap, no fragmentation, no
+ * runtime sizing. Size is fixed at build time via GBJIT_ARENA_KB (CMake
+ * `-DGBJIT_ARENA_KB=<n>` works for both host and IDF builds).
+ *
+ * On ESP32-S3 the array goes into `.iram.bss` via IDF's IRAM_BSS_ATTR,
+ * which the default linker script places in internal SRAM that's both
+ * writable and instruction-fetchable. Internal IRAM on the S3 is not
+ * routed through the L1 cache (cache covers flash/PSRAM only), so writes
+ * via the data path are visible to instruction fetches without an
+ * explicit cache flush — codecache_finalize just emits a barrier.
+ *
+ * On Linux the array lives in regular .bss and is mprotect'd to
+ * PROT_READ | PROT_WRITE | PROT_EXEC at dispatcher init. The 4 KB
+ * alignment requirement comes from page-granularity mprotect.
+ *
+ * The default size is conservative (64 KB). Larger arenas trigger a
+ * latent codegen bug — Blargg's `06-ld r,r` starts failing past ~100
+ * unique blocks, with register divergence appearing at PC=$C6E4. The
+ * smaller-arena path masked the bug by falling back to the interpreter
+ * once the arena filled; with no eviction in the bump-allocator, blocks
+ * compiled beyond the previous fill threshold appear to contain bad
+ * code. SML (~10 blocks) and other small workloads are unaffected; pass
+ * -DGBJIT_ARENA_KB=192 to opt in to the larger arena once the bug is
+ * fixed (TODO). */
+#ifndef GBJIT_ARENA_KB
+#define GBJIT_ARENA_KB 64u
+#endif
+#define GBJIT_ARENA_BYTES (GBJIT_ARENA_KB * 1024u)
+
+#if defined(ESP_PLATFORM)
+GBJIT_IRAM_BSS __attribute__((aligned(4)))
+static u8 s_jit_arena[GBJIT_ARENA_BYTES];
+#elif defined(HAVE_MMAP_EXEC)
+__attribute__((aligned(4096)))
+static u8 s_jit_arena[GBJIT_ARENA_BYTES];
+#else
+__attribute__((aligned(64)))
+static u8 s_jit_arena[GBJIT_ARENA_BYTES];
+#endif
 
 /* Host-side address-space sentinels. The JIT-emitted Xtensa code uses these
  * as L32R-loaded base addresses; the sim's translate() routes the range back
@@ -49,28 +87,26 @@
 #define HOST_STACK_BASE 0x80000000u
 #define HOST_STACK_TOP  0x80000100u  /* a1 init points here */
 
-static void *alloc_exec_arena(u32 cap) {
+/* Make the static arena executable. On ESP the section attribute already
+ * placed it in RWX IRAM. On Linux we need to mprotect — but only once per
+ * process lifetime, so cache the success state. */
+static bool ensure_arena_exec(void) {
 #if defined(HAVE_MMAP_EXEC)
-    void *p = mmap(NULL, cap, PROT_READ | PROT_WRITE | PROT_EXEC,
-                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (p == MAP_FAILED) return NULL;
-    return p;
-#elif defined(ESP_PLATFORM)
-    /* Internal SRAM, 32-bit accessible, executable. PSRAM is not executable
-     * on the S3, so we don't request CAP_SPIRAM. */
-    return heap_caps_malloc(cap, MALLOC_CAP_EXEC | MALLOC_CAP_INTERNAL | MALLOC_CAP_32BIT);
+    static bool done = false;
+    if (done) return true;
+    long pagesz = sysconf(_SC_PAGESIZE);
+    if (pagesz <= 0) pagesz = 4096;
+    uintptr_t mask = (uintptr_t)pagesz - 1u;
+    uintptr_t start = (uintptr_t)s_jit_arena & ~mask;
+    uintptr_t end   = ((uintptr_t)s_jit_arena + GBJIT_ARENA_BYTES + mask) & ~mask;
+    if (mprotect((void *)start, end - start,
+                 PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+        return false;
+    }
+    done = true;
+    return true;
 #else
-    return malloc(cap);
-#endif
-}
-
-static void free_exec_arena(void *p, u32 cap) {
-#if defined(HAVE_MMAP_EXEC)
-    munmap(p, cap);
-#elif defined(ESP_PLATFORM)
-    (void)cap; heap_caps_free(p);
-#else
-    (void)cap; free(p);
+    return true;
 #endif
 }
 
@@ -129,48 +165,13 @@ typedef struct smc_page_node {
 bool gbjit_dispatcher_init(gbjit_dispatcher *d, cpu_state *cpu) {
     memset(d, 0, sizeof(*d));
     d->cpu = cpu;
-
+    if (!ensure_arena_exec()) return false;
+    d->arena     = s_jit_arena;
+    d->arena_cap = GBJIT_ARENA_BYTES;
 #if defined(ESP_PLATFORM)
-    /* Probe the heap so the arena scales with whatever exec-capable
-     * internal SRAM is actually free at boot. ESP32-S3 unifies IRAM and
-     * DRAM, so the size we get back depends on .bss footprint (chiefly
-     * our 256 KB cartridge ROM array). */
-    size_t avail = heap_caps_get_largest_free_block(
-        MALLOC_CAP_EXEC | MALLOC_CAP_INTERNAL | MALLOC_CAP_32BIT);
-    if (avail > ARENA_HEADROOM) avail -= ARENA_HEADROOM;
-    else                        avail  = 0;
-    avail &= ~(size_t)0xFFFu;            /* 4 KB-align down */
-    if (avail > ARENA_CAP_MAX) avail = ARENA_CAP_MAX;
-    ESP_LOGI("gbjit_jit", "exec arena: largest free EXEC block = %u KB, requesting %u KB",
-             (unsigned)(heap_caps_get_largest_free_block(
-                 MALLOC_CAP_EXEC | MALLOC_CAP_INTERNAL | MALLOC_CAP_32BIT) / 1024u),
-             (unsigned)(avail / 1024u));
-    if (avail >= 8u * 1024u) {
-        d->arena_cap = (u32)avail;
-        d->arena = alloc_exec_arena(d->arena_cap);
-    }
-#else
-    d->arena_cap = ARENA_CAP_DEFAULT;
-    d->arena = alloc_exec_arena(d->arena_cap);
+    ESP_LOGI("gbjit_jit", "exec arena: static IRAM, %u KB at %p",
+             (unsigned)GBJIT_ARENA_KB, s_jit_arena);
 #endif
-
-    /* Fallback ladder if the runtime-sized request failed (or the static
-     * default did on host). Each step halves; we never go below 8 KB. */
-    if (!d->arena) {
-        static const u32 fallback_caps[] = {
-            ARENA_CAP_DEFAULT,
-            32u * 1024u,
-            16u * 1024u,
-            8u  * 1024u,
-        };
-        for (u32 i = 0; i < sizeof(fallback_caps)/sizeof(fallback_caps[0]); i++) {
-            if (fallback_caps[i] >= d->arena_cap) continue;  /* already tried bigger */
-            d->arena_cap = fallback_caps[i];
-            d->arena = alloc_exec_arena(d->arena_cap);
-            if (d->arena) break;
-        }
-    }
-    if (!d->arena) return false;
     codecache_init(&d->cc, (u8 *)d->arena, d->arena_cap);
     d->interp_fallback = false;
     d->prefetch_enabled = true;
@@ -194,7 +195,9 @@ void gbjit_dispatcher_shutdown(gbjit_dispatcher *d) {
         while (n) { smc_page_node *next = n->next; free(n); n = next; }
         d->smc_pages[p] = NULL;
     }
-    if (d->arena) free_exec_arena(d->arena, d->arena_cap);
+    /* Arena is statically allocated — nothing to free. Just reset the
+     * codecache so a subsequent dispatcher_init starts with cc->used=0. */
+    if (d->arena) codecache_reset(&d->cc);
     d->arena = NULL;
 }
 

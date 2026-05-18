@@ -13,46 +13,46 @@
 
 | Mode | GB cycles | wall (µs) | T-cycle MHz | × DMG |
 |------|----------:|----------:|------------:|------:|
-| interp | 200000 | 10101 | 19.800 | 4.721 |
-| jit_nocache | 200012 | 556963 | 0.359 | 0.086 |
-| jit_noprefetch | 200012 | 6019 | 33.230 | 7.923 |
-| jit | 200012 | 5878 | 34.027 | 8.113 |
-| jit_warm | 200012 | 2913 | 68.662 | 16.370 |
+| interp | 200000 | 11551 | 17.315 | 4.128 |
+| jit_nocache | 200012 | 2329370 | 0.086 | 0.020 |
+| jit_noprefetch | 200012 | 7189 | 27.822 | 6.633 |
+| jit | 200012 | 6984 | 28.639 | 6.828 |
+| jit_warm | 200012 | 2985 | 67.006 | 15.975 |
 
 ## Per-mode Xtensa execution (whole trace: boot ROM + IDF + bench + idle)
 
 | Region | TBs interp | TBs jit_nocache | TBs jit_noprefetch | TBs jit | TBs jit_warm | Instrs interp | Instrs jit_nocache | Instrs jit_noprefetch | Instrs jit | Instrs jit_warm |
 |--------|----------:|---------------:|------------------:|--------:|------------:|-------------:|------------------:|---------------------:|-----------:|---------------:|
-| flash XIP | 1,621,731 | 5,097,518 | 541,812 | 529,361 | 967,625 | 4,365,594 | 29,559,561 | 1,652,243 | 1,592,194 | 2,941,584 |
-| IRAM | 3,172,038 | 2,480,815 | 443,292 | 445,241 | 491,011 | 12,369,080 | 8,642,588 | 1,626,041 | 1,632,883 | 2,071,767 |
-| boot ROM | 1,616,706 | 2,562,286 | 1,818,192 | 1,856,578 | 1,899,840 | 4,095,565 | 6,210,388 | 3,739,264 | 3,795,697 | 4,063,112 |
-| **total** | **6,410,475** | **10,140,619** | **2,803,296** | **2,831,180** | **3,358,476** | **20,830,239** | **44,412,537** | **7,017,548** | **7,020,774** | **9,076,463** |
+| flash XIP | 1,621,503 | 5,106,249 | 519,679 | 518,334 | 968,801 | 4,363,692 | 29,573,326 | 1,583,419 | 1,580,722 | 2,947,541 |
+| IRAM | 3,193,601 | 2,581,170 | 443,930 | 443,705 | 492,096 | 12,399,889 | 9,046,724 | 1,629,113 | 1,628,758 | 2,077,324 |
+| boot ROM | 1,700,394 | 2,442,426 | 1,787,812 | 1,728,498 | 1,835,795 | 4,223,449 | 6,045,973 | 3,694,397 | 3,595,825 | 3,963,977 |
+| **total** | **6,515,498** | **10,129,845** | **2,751,421** | **2,690,537** | **3,296,692** | **20,987,030** | **44,666,023** | **6,906,929** | **6,805,305** | **8,988,842** |
 
 ## Memory-fetch / memory-store instructions
 
 | Mode | Loads | Stores |
 |------|------:|-------:|
-| interp | 4,657,411 | 1,665,203 |
-| jit_nocache | 8,371,542 | 4,831,200 |
-| jit_noprefetch | 1,620,260 | 627,151 |
-| jit | 1,596,704 | 629,123 |
-| jit_warm | 2,064,134 | 833,939 |
+| interp | 4,665,028 | 1,661,781 |
+| jit_nocache | 8,445,738 | 4,865,764 |
+| jit_noprefetch | 1,593,710 | 626,764 |
+| jit | 1,579,154 | 627,637 |
+| jit_warm | 2,060,800 | 833,646 |
 
 ## Headline ratios (each mode vs baseline `interp`)
 
 | Metric | interp | jit_nocache | jit_noprefetch | jit | jit_warm |
 |--------|------:|-----------:|--------------:|---:|--------:|
-| Xtensa instructions (full trace) | 20,830,239 (1.00×) | 44,412,537 (2.13×) | 7,017,548 (0.34×) | 7,020,774 (0.34×) | 9,076,463 (0.44×) |
-| Xtensa memory loads | 4,657,411 (1.00×) | 8,371,542 (1.80×) | 1,620,260 (0.35×) | 1,596,704 (0.34×) | 2,064,134 (0.44×) |
-| Xtensa memory stores | 1,665,203 (1.00×) | 4,831,200 (2.90×) | 627,151 (0.38×) | 629,123 (0.38×) | 833,939 (0.50×) |
+| Xtensa instructions (full trace) | 20,987,030 (1.00×) | 44,666,023 (2.13×) | 6,906,929 (0.33×) | 6,805,305 (0.32×) | 8,988,842 (0.43×) |
+| Xtensa memory loads | 4,665,028 (1.00×) | 8,445,738 (1.81×) | 1,593,710 (0.34×) | 1,579,154 (0.34×) | 2,060,800 (0.44×) |
+| Xtensa memory stores | 1,661,781 (1.00×) | 4,865,764 (2.93×) | 626,764 (0.38×) | 627,637 (0.38×) | 833,646 (0.50×) |
 
 ## Per GB T-cycle (whole-trace average — boot + IDF + bench + idle)
 
 | Metric | interp | jit_nocache | jit_noprefetch | jit | jit_warm |
 |--------|------:|-----------:|--------------:|---:|--------:|
-| Xtensa instructions / GB cycle | 104.15 | 222.05 | 35.09 | 35.10 | 45.38 |
-| Xtensa loads / GB cycle | 23.29 | 41.86 | 8.10 | 7.98 | 10.32 |
-| Xtensa stores / GB cycle | 8.33 | 24.15 | 3.14 | 3.15 | 4.17 |
+| Xtensa instructions / GB cycle | 104.94 | 223.32 | 34.53 | 34.02 | 44.94 |
+| Xtensa loads / GB cycle | 23.33 | 42.23 | 7.97 | 7.90 | 10.30 |
+| Xtensa stores / GB cycle | 8.31 | 24.33 | 3.13 | 3.14 | 4.17 |
 
 ## JIT cache speedup (with vs without)
 
@@ -64,9 +64,9 @@ compilations in the measured window).
 
 | Mode | Wall µs | × DMG | blocks_compiled | Speedup vs `jit_nocache` |
 |------|--------:|------:|----------------:|-------------------------:|
-| jit_nocache (no cache) | 556,963 | 0.086 | 7631 | 1.00× (baseline) |
-| jit (cached, cold)     | 5,878 | 8.113    | 10 | **94.75×** |
-| jit_warm (cached, pre-compiled) | 2,913 | 16.370 | 0 | **191.20×** |
+| jit_nocache (no cache) | 2,329,370 | 0.020 | 7631 | 1.00× (baseline) |
+| jit (cached, cold)     | 6,984 | 6.828    | 10 | **333.53×** |
+| jit_warm (cached, pre-compiled) | 2,985 | 15.975 | 0 | **780.36×** |
 
 For the 200 000-GB-cycle window:
 - `jit_nocache` invoked `gbjit_compile_block` ~7631 times (one per dispatch step).
@@ -80,10 +80,10 @@ For the 200 000-GB-cycle window:
 
 | Mode | Wall µs | × DMG | blocks_compiled | chain_misses | prefetched |
 |------|--------:|------:|----------------:|-------------:|-----------:|
-| jit_noprefetch | 6,019 | 7.923 | 7 | 50 | 0 |
-| jit | 5,878 | 8.113 | 10 | 50 | 8 |
+| jit_noprefetch | 7,189 | 6.633 | 7 | 50 | 0 |
+| jit | 6,984 | 6.828 | 10 | 50 | 8 |
 
-Speedup from prefetch (`jit` vs `jit_noprefetch`): **1.02×** wall-time.
+Speedup from prefetch (`jit` vs `jit_noprefetch`): **1.03×** wall-time.
 `jit` pays 8 extra compile calls inside `gbjit_compile_block`
 (walking successor PCs to depth 4) so block discovery isn't spread one-per-
 chain-miss across the run. The visible win on a tight loop is modest; the
@@ -101,9 +101,9 @@ run that is the one whose `elapsed_us` we report. In the warm pass
 
 | Metric | jit (cold) | jit_warm (executed pass only) | overhead (cold − warm) |
 |--------|----------:|------------------------------:|-----------------------:|
-| Wall µs (firmware-reported, simulated) | 5,878 | 2,913 | **2,965 (50.4% of cold)** |
+| Wall µs (firmware-reported, simulated) | 6,984 | 2,985 | **3,999 (57.3% of cold)** |
 
-So at this workload's mix the JIT spends about 14.82 µs of qemu
+So at this workload's mix the JIT spends about 19.99 µs of qemu
 simulated time per 1 000 GB cycles on translation. The overhead is *per unique
 block*, not per GB cycle — real ROMs that loop through the same code millions of
 times amortise it to near-zero. Our 200 000-cycle micro-benchmark only invokes

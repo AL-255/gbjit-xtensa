@@ -4,16 +4,16 @@
 
 | Mode | GB cycles | wall (µs) | throughput (MHz of T-cycles) | × DMG real-time |
 |------|-----------|-----------|------------------------------|-----------------|
-| interp | 200000 | 10101 | 19.800 | 4.721 |
+| interp | 200000 | 11551 | 17.315 | 4.128 |
 
 ## Xtensa instructions executed (combined: interp run + JIT run)
 
 | Region | TBs executed | Instructions | Load instrs | Store instrs |
 |--------|-------------:|-------------:|------------:|-------------:|
-| flash XIP (interp + JIT helpers) | 1,621,731 | 4,365,594 | 993,909 | 299,074 |
-| IRAM (JIT-emitted code) | 3,172,038 | 12,369,080 | 2,851,177 | 1,049,207 |
-| boot ROM | 1,616,706 | 4,095,565 | 812,325 | 316,922 |
-| **total** | **6,410,475** | **20,830,239** | **4,657,411** | **1,665,203** |
+| flash XIP (interp + JIT helpers) | 1,621,503 | 4,363,692 | 994,159 | 299,075 |
+| IRAM (JIT-emitted code) | 3,193,601 | 12,399,889 | 2,841,558 | 1,045,777 |
+| boot ROM | 1,700,394 | 4,223,449 | 829,311 | 316,929 |
+| **total** | **6,515,498** | **20,987,030** | **4,665,028** | **1,661,781** |
 
 ## Notes
 
