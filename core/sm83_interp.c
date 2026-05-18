@@ -201,8 +201,12 @@ static const u16 int_vector[5] = { 0x40, 0x48, 0x50, 0x58, 0x60 };
 
 u32 sm83_service_interrupts(cpu_state *cpu) {
     /* Drive the PPU timing model forward — it reads cpu->cycles and may
-     * raise IF bits ahead of the dispatch check below. */
+     * raise IF bits ahead of the dispatch check below. When
+     * GBJIT_PPU_ASYNC is defined the PPU runs on Core 1 instead (see
+     * core/ppu_thread.c) and Core 0 must not call it from here. */
+#ifndef GBJIT_PPU_ASYNC
     ppu_tick(cpu);
+#endif
     /* Refresh cached IF/IE from MMU IO + IE byte. */
     cpu->if_reg = cpu->mmu->io[0x0F];
     cpu->ie_reg = cpu->mmu->ie;
@@ -215,7 +219,15 @@ u32 sm83_service_interrupts(cpu_state *cpu) {
     for (int i = 0; i < 5; i++) {
         u8 mask = (u8)(1u << i);
         if (pending & mask) {
+            /* Clear just this bit via atomic AND — async PPU on Core 1
+             * can be OR'ing other bits into io[0x0F] concurrently, so a
+             * plain read-modify-write would race and drop concurrently-
+             * set IF bits. The unicore path collapses to a plain s8i. */
+#ifdef GBJIT_PPU_ASYNC
+            __atomic_fetch_and(&cpu->mmu->io[0x0F], (u8)~mask, __ATOMIC_RELAXED);
+#else
             cpu->mmu->io[0x0F] = (u8)(cpu->if_reg & ~mask);
+#endif
             push16(cpu, cpu->pc);
             cpu->pc = int_vector[i];
             cpu->cycles += 20;

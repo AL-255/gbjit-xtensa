@@ -89,7 +89,11 @@ static inline void ppu_update_stat_irq(mmu *m) {
         ((stat & STAT_MODE_2_INTR) && m->ppu_lcd_mode == LCD_SEARCH_OAM) ||
         ((stat & STAT_LYC_INTR)    && (stat & STAT_LYC_COINC));
     if (!m->ppu_stat_line && line_is_high) {
+#ifdef GBJIT_PPU_ASYNC
+        __atomic_fetch_or(&m->io[IF_REG], INT_LCDC_BIT, __ATOMIC_RELAXED);
+#else
         m->io[IF_REG] |= INT_LCDC_BIT;
+#endif
     }
     m->ppu_stat_line = line_is_high ? 1 : 0;
 }
@@ -250,7 +254,11 @@ void ppu_tick(struct cpu_state *cpu) {
                 if (m->io[LY_REG] == LCD_HEIGHT) {
                     m->ppu_lcd_mode = LCD_VBLANK;
                     m->io[STAT_REG] = (u8)((m->io[STAT_REG] & ~STAT_MODE) | LCD_VBLANK);
+#ifdef GBJIT_PPU_ASYNC
+                    __atomic_fetch_or(&m->io[IF_REG], INT_VBLANK_BIT, __ATOMIC_RELAXED);
+#else
                     m->io[IF_REG] |= INT_VBLANK_BIT;
+#endif
                     ppu_update_stat_irq(m);
                     ppu_check_lyc(m);
                     ppu_update_stat_irq(m);

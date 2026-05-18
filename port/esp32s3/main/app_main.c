@@ -14,6 +14,7 @@
 #include "memory.h"
 #include "sm83_interp.h"
 #include "dispatcher.h"
+#include "ppu_thread.h"
 #include "esp_timer.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -192,6 +193,12 @@ void app_main(void) {
     ESP_LOGI(TAG, "boot — gbjit-xtensa benchmark");
     ESP_LOGI(TAG, "rom = %s, size = %u bytes", ROM_LABEL,
              (unsigned)(rom_end - rom_start));
+
+    /* Move ppu_tick onto Core 1 (no-op when GBJIT_PPU_ASYNC is undefined).
+     * Started once for the whole benchmark; the task reads s_cpu through
+     * the pointer we pass in and survives across load_rom_and_reset()
+     * calls because s_cpu lives in BSS. */
+    ppu_thread_start(&s_cpu);
 
 #if defined(BENCH_MODE_INTERP_ONLY)
     run_interp();

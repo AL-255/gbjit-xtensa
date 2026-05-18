@@ -178,7 +178,11 @@ void mmu_write8(mmu *m, u16 addr, u8 v) {
             /* Self-clear the transfer-start bit. */
             m->io[0x02] = (u8)(v & 0x7Fu);
             /* Also request a serial interrupt for completeness. */
+#ifdef GBJIT_PPU_ASYNC
+            __atomic_fetch_or(&m->io[0x0F], INT_SERIAL, __ATOMIC_RELAXED);
+#else
             m->io[0x0F] |= INT_SERIAL;
+#endif
         }
         /* OAM DMA — Pan Docs §"OAM DMA Transfer". Writing $XX to $FF46
          * starts a 160-cycle copy of $XX00..$XX9F into OAM ($FE00..$FE9F).

@@ -8,9 +8,11 @@ Workload: SML's boot through to the start of the main game loop
 
 | Mode | Throughput | × DMG | PC at budget exhaustion | Notes |
 |------|-----------:|------:|------------------------:|------|
-| interp | 8.864 MHz | 2.113× | $01D4 | reference run |
+| interp (PPU on Core 0) | 8.864 MHz | 2.113× | $01D4 | reference run, single-core |
+| interp + async PPU | 9.803 MHz | 2.337× | $01D5 | PPU pinned to Core 1 (+10.6 %) |
 | jit_nocache | 0.391 MHz | 0.093× | $01D4 | every block recompiled (cache-effect lower bound) |
-| **jit (cached, cold)** | **14.480 MHz** | **3.452×** | $01D4 | one-shot compile per block, then chain hits |
+| jit (cached, PPU on Core 0) | 14.480 MHz | 3.452× | $01D4 | one-shot compile per block, then chain hits |
+| **jit (cached) + async PPU** | **15.985 MHz** | **3.811×** | $01D4 | PPU pinned to Core 1 (+10.4 %) |
 | jit_warm (cached, pre-compiled) | 14.702 MHz | 3.505× | $01D4 | warm-up pass discarded, measured pass has 0 compiles |
 
 Dispatcher stats (cold `jit`): 55 unique blocks, 205 640 executions,
@@ -53,6 +55,28 @@ interpreter as expected.
 Also: the DEC-A;JR NZ,-3 closed-form fast path collapses the
 40-iteration OAM-DMA wait body into one block call; generic back-edge
 inlining is hard-disabled (it caused a real-S3 regression of its own).
+
+## Async PPU (Core 1)
+
+The S3's second core sits idle by default — moving `ppu_tick` onto a
+FreeRTOS task pinned to Core 1 reclaims it. The PPU task spins on
+`ppu_tick` + `taskYIELD()`; most ticks early-return inside the state
+machine until `ppu_next_event_cycles` is crossed or LCDC changes, so
+the steady-state cost is a few loads + a compare. Core 0 no longer pays
+the per-block ppu_tick call overhead.
+
+Synchronisation: PPU OR's bits into `io[$FF0F]` (IF) on VBlank / STAT
+edges; the CPU clears bits on IRQ servicing. The naïve read-modify-
+write loses concurrently-set bits, so under `GBJIT_PPU_ASYNC` both
+sides use `__atomic_fetch_or` / `__atomic_fetch_and`. All other shared
+state is single-byte IO writes (atomic by Xtensa ISA) or fields touched
+by only one side.
+
+Build flag (default ON for the S3 firmware):
+
+```sh
+idf.py -DGBJIT_PPU_ASYNC=0 ...   # opt out and tick PPU from Core 0
+```
 
 ## Comparison with plain ESP32 (LX6)
 

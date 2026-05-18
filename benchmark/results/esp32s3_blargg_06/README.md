@@ -8,7 +8,8 @@ Workload: tight `LD r,r` correctness loop, 5 M GB-cycle budget.
 | Mode | Throughput | × DMG | PC at budget exhaustion |
 |------|-----------:|------:|------------------------:|
 | interp | 9.125 MHz | 2.176× | $CC5F |
-| jit (cached) | 3.587 MHz | 0.855× | $CC5F |
+| jit (cached, PPU on Core 0) | 3.587 MHz | 0.855× | $CC5F |
+| jit (cached) + async PPU on Core 1 | 3.696 MHz | 0.881× | $CC5F |
 
 Dispatcher stats (jit): 98 blocks, 83 544 executions, 80 335 chain
 hits / 3 209 misses (96.2 % prediction), 66 prefetched.

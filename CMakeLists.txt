@@ -15,6 +15,7 @@ add_compile_options(-Wall -Wextra -Wshadow -Wno-unused-parameter -fno-strict-ali
 add_library(gbjit_core STATIC
     core/memory.c
     core/ppu.c
+    core/ppu_thread.c
     core/sm83_decoder.c
     core/sm83_interp.c
 )
