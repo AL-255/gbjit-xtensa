@@ -48,6 +48,46 @@ static mmu s_mmu;
 
 static char  s_serial_buf[128];
 static int   s_serial_len;
+/* --- 60 fps wall-clock pacer ----------------------------------------
+ *
+ * Without throttling the emulator runs as fast as Core 0 can dispatch
+ * (~65-75 fps in sync-PPU mode for SML). That's faster than the real
+ * DMG (59.7 fps) and makes scrolling games look slightly sped-up. The
+ * pacer fires from inside ppu_tick at every frame boundary (right
+ * after frame_seq increments) and busy-waits until the next 16.667 ms
+ * tick of an anchor monotonic clock, so frame N completes at
+ * anchor + N * FRAME_PERIOD_US. If the emulator falls genuinely
+ * behind (> 2 frames of slip), re-anchor so we don't burn time
+ * sprinting to catch up — locks the long-term rate to 60 fps
+ * without amplifying transient stalls.
+ *
+ * The wait is a busy spin on esp_timer_get_time() rather than
+ * vTaskDelay. The dispatcher's only Core 0 task at this point is
+ * itself, so a vTaskDelay would just hand control back to the idle
+ * task; busy-waiting is no more wasteful and is precise to the
+ * microsecond. (FreeRTOS tick at 100 Hz can't represent the sub-tick
+ * waits this loop produces anyway.) */
+#define PACER_FRAME_PERIOD_US 16667   /* 1e6 / 59.97; one DMG frame */
+static int64_t s_pacer_anchor_us;
+static uint32_t s_pacer_frame_count;
+static void frame_pacer_60fps(struct mmu *m) {
+    (void)m;
+    s_pacer_frame_count++;
+    int64_t target = s_pacer_anchor_us +
+                     (int64_t)s_pacer_frame_count * PACER_FRAME_PERIOD_US;
+    int64_t now = esp_timer_get_time();
+    /* Behind-by-more-than-two-frames: don't sprint to catch up, just
+     * re-anchor here and keep producing at real rate from now on. */
+    if (now > target + 2 * PACER_FRAME_PERIOD_US) {
+        s_pacer_anchor_us = now;
+        s_pacer_frame_count = 0;
+        return;
+    }
+    while (now < target) {
+        now = esp_timer_get_time();
+    }
+}
+
 static void serial_sink(void *ctx, uint8_t b) {
     (void)ctx;
     if (b == '\n' || s_serial_len >= (int)sizeof(s_serial_buf) - 1) {
@@ -72,6 +112,10 @@ void app_main(void) {
         return;
     }
     s_mmu.serial_sink = serial_sink;
+    /* Lock emulation to 60 fps. See frame_pacer_60fps above. */
+    s_pacer_anchor_us = esp_timer_get_time();
+    s_pacer_frame_count = 0;
+    s_mmu.frame_complete_cb = frame_pacer_60fps;
     cpu_reset(&s_cpu, &s_mmu);
 
     /* Bring up the OLED task first (Core 1, low prio) — it'll sleep

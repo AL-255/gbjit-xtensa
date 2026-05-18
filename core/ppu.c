@@ -522,6 +522,14 @@ void ppu_tick(struct cpu_state *cpu) {
                     /* Frame complete — bump the seq so display tasks
                      * waiting on it can pull the freshly-drawn frame. */
                     m->frame_seq++;
+                    /* Wall-clock frame pacer (60 fps lock). Board
+                     * firmwares set this to busy-wait to the next
+                     * 16.667 ms tick; the host leaves it NULL so the
+                     * benches and tests still run free. The hook
+                     * fires before STAT IRQs are evaluated so the
+                     * post-VBlank IRQ for the new frame doesn't
+                     * include the pacer wait in its dispatch budget. */
+                    if (m->frame_complete_cb) m->frame_complete_cb(m);
                     ppu_update_stat_irq(m);
                     ppu_check_lyc(m);
                     ppu_update_stat_irq(m);

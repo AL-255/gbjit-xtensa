@@ -136,6 +136,15 @@ typedef struct mmu {
     /* Serial output capture — Blargg test ROMs write ASCII to FF01 then $81 to FF02. */
     void (*serial_sink)(void *ctx, u8 byte);
     void *serial_sink_ctx;
+
+    /* Optional frame-complete hook. ppu.c calls this every time the
+     * PPU finishes a frame (right after frame_seq is bumped at the
+     * mode-0 → mode-1 transition for line 144). NULL by default; the
+     * board firmware sets it to a wall-clock pacer to lock the
+     * emulation rate to ~60 fps (boards/HTIT-WB32LAF_V3.2/main has
+     * the implementation). Host harnesses leave it NULL so unit tests
+     * and the differential benches run as fast as the host allows. */
+    void (*frame_complete_cb)(struct mmu *m);
 } mmu;
 
 void gb_mmu_init(mmu *m);
