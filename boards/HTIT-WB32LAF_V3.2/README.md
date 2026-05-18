@@ -43,6 +43,16 @@ The default ROM is Super Mario Land. To run Blargg 06-ld_r_r instead:
 idf.py -DBOARD_ROM=blargg_06 build
 ```
 
+## ROM compatibility status
+
+The emulator is in CPU-phase development; not every ROM gets all the
+way to gameplay. What you'll actually see on the OLED right now:
+
+| ROM | Serial output | OLED output |
+|-----|---------------|-------------|
+| `blargg_06` (LD r,r) | `06-ld r,r` + `Passed` | Test name + "Passed" rendered to VRAM, visible |
+| `sml` (Super Mario Land) | none | Blank — SML init loops at PC=$01C5/$01D4 with LCD disabled. Reproduces on host interp too, so it's an emulator-side feature gap (timer/sound/joypad behaviour likely), not a board issue. Tracked separately. |
+
 The Blargg test prints PASS/FAIL strings over the GB's serial port —
 captured to UART via the `serial_sink` hook in `app_main.c` and shown in
 `idf.py monitor`.
