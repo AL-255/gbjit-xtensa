@@ -720,6 +720,75 @@ static bool inline_op(xt_emit *e, u8 opcode, u16 pc, inline_ctx *ictx) {
         return true;
     }
 
+    /* --- INC (HL) — 0x34, DEC (HL) — 0x35 with WRAM fast-path.
+     *
+     * Same WRAM range-check pattern as LD r,(HL) above; on hit, read the
+     * byte, INC/DEC, compute Z/N/H, write back. Flags exactly match the
+     * INC/DEC r 8-bit handler. Helper fallback otherwise. INC/DEC (HL)
+     * are 12-cycle (3-machine-cycle) ops. */
+    if (opcode == 0x34 || opcode == 0x35) {
+        bool is_dec = (opcode == 0x35);
+
+        u32 wram_base_minus_C000 =
+            ictx->mmu_base_value + (u32)offsetof(mmu, wram) - 0xC000u;
+        i32 wram_lit = lit_alloc_u32(ictx->L, wram_base_minus_C000);
+        if (wram_lit < 0) return false;
+
+        xt_l16ui(e, 3, 13, OFF_HL);
+        xt_extui(e, 4, 3, 13, 2);     /* top 3 bits of HL */
+        xt_addi(e, 4, 4, -6);
+        u32 br_to_slow = e->len;
+        xt_bnez(e, 4, 4);
+
+        /* --- Fast path: HL is in WRAM. --- */
+        u32 pc_off = ictx->entry_off + e->len;
+        emit_l32r_at(e, 5, (u32)wram_lit, pc_off);
+        xt_add(e, 6, 5, 3);             /* a6 = &mmu->wram[HL - 0xC000] */
+        xt_l8ui(e, 2, 6, 0);            /* a2 = old byte */
+        if (is_dec) xt_addi(e, 7, 2, -1);
+        else        xt_addi(e, 7, 2,  1);
+        xt_extui(e, 7, 7, 0, 7);        /* a7 = new byte (mask to 8 bit) */
+        xt_s8i(e, 7, 6, 0);             /* store back */
+
+        /* F: preserve C, replace Z|N|H. (a4 is F builder.) */
+        xt_l8ui(e, 4, 13, OFF_F);
+        xt_movi(e, 8, FLAG_C);
+        xt_and(e, 4, 4, 8);
+        emit_zflag(e, 7, 4, 8);
+        if (is_dec) {
+            emit_setflag_const(e, 4, FLAG_N, 8);
+            xt_extui(e, 8, 2, 0, 3);    /* old & 0xF */
+            xt_addi(e, 8, 8, -1);
+            xt_extui(e, 8, 8, 4, 0);
+            xt_slli(e, 8, 8, 5);
+            xt_or(e, 4, 4, 8);
+        } else {
+            xt_extui(e, 8, 2, 0, 3);
+            xt_addi(e, 8, 8, 1);
+            xt_extui(e, 8, 8, 4, 0);
+            xt_slli(e, 8, 8, 5);
+            xt_or(e, 4, 4, 8);
+        }
+        xt_s8i(e, 4, 13, OFF_F);
+        xt_addi(e, 11, 11, 1);
+        xt_addi(e, 12, 12, 12);
+
+        u32 j_to_end = e->len;
+        xt_j(e, 4);
+
+        /* --- Slow path: standard helper invocation. --- */
+        u32 slow_pos = e->len;
+        emit_sync_state(e);
+        xt_mov(e, 2, 13);
+        emit_callx0_helper(e, ictx->lit_off[HELPER_SM83_STEP], ictx->entry_off);
+        emit_reload_state(e, ictx->lit_off[ADDR_CPU_BASE], ictx->entry_off);
+
+        u32 end_pos = e->len;
+        patch_branch_to(e, br_to_slow, slow_pos);
+        patch_j_to(e, j_to_end, end_pos);
+        return true;
+    }
+
     /* --- INC rr / DEC rr (16-bit) — no flag effects.
      *   0x03 INC BC   0x0B DEC BC
      *   0x13 INC DE   0x1B DEC DE
