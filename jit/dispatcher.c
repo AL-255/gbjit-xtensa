@@ -627,31 +627,12 @@ void gbjit_dispatcher_run_until(gbjit_dispatcher *d, u64 until) {
             prev = NULL;
         }
         /* Service pending interrupts and wake from HALT before each block.
-         * The JIT inlines HALT as a simple `cpu->halted = 1; exit block`,
-         * so we depend on the dispatcher to re-enter the interrupt path
-         * that the reference interpreter normally runs at the top of
-         * sm83_step.
-         *
-         * Fast path under GBJIT_PPU_ASYNC: the PPU runs on Core 1 and
-         * Core 0's sm83_service_interrupts is a pure IF/IE check + IRQ
-         * dispatch — no PPU work to do. Skip the function call entirely
-         * when (io[$0F] & ie & 0x1F) is 0 AND we're not halted. This
-         * removes a ~10-instruction call sequence from every dispatcher
-         * iteration in the steady-state-no-IRQ case (which is most of
-         * them — IF bits land roughly once per scanline at most).
-         *
-         * Sync mode keeps calling unconditionally because ppu_tick is
-         * inside sm83_service_interrupts and must always run there. */
-#ifdef GBJIT_PPU_ASYNC
-        u8 if_pending = (u8)(cpu->mmu->io[0x0F] & cpu->mmu->ie & 0x1Fu);
-        if (unlikely(if_pending || cpu->halted)) {
-            if (sm83_service_interrupts(cpu)) prev = NULL;
-        }
-#else
+         * The JIT inlines HALT as a simple `cpu->halted = 1; exit block`, so
+         * we depend on the dispatcher to re-enter the interrupt path that
+         * the reference interpreter normally runs at the top of sm83_step. */
         if (unlikely(sm83_service_interrupts(cpu))) {
             prev = NULL;
         }
-#endif
         if (unlikely(cpu->halted)) {
             cpu->cycles += 4;
             continue;
