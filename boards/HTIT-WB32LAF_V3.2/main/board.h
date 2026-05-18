@@ -17,10 +17,23 @@
 
 #define BOARD_OLED_I2C_PORT   0
 #define BOARD_OLED_I2C_ADDR   0x3C    /* SSD1306 default */
-#define BOARD_OLED_I2C_HZ     400000  /* 400 kHz fast-mode — full-frame
-                                       * blit (~1 KB) at this rate is
-                                       * ~20 ms, fast enough for the GB's
-                                       * 60 Hz frame rate. */
+#define BOARD_OLED_I2C_HZ     1000000 /* 1 MHz Fast-mode+. SSD1306 datasheet
+                                       * §"AC characteristics" rates the
+                                       * I²C interface to 400 kHz @ 5 V but
+                                       * the chip-internal timing has plenty
+                                       * of headroom — Heltec's V3 OLED
+                                       * driven by the S3's native I²C
+                                       * controller is reliable up to ~1 MHz.
+                                       * Full-frame blit (1024 bytes payload
+                                       * + control + ACK overhead) drops
+                                       * from ~23 ms at 400 kHz to ~10 ms
+                                       * here, raising the OLED refresh
+                                       * ceiling from ~50 fps to ~100 fps
+                                       * so the I²C path stops being the
+                                       * scroll-smoothness bottleneck.
+                                       * If your panel garbles at this
+                                       * rate, drop back to 400000 (or
+                                       * try 800000 as a middle ground). */
 
 #define BOARD_OLED_WIDTH      128
 #define BOARD_OLED_HEIGHT     64
