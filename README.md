@@ -34,42 +34,50 @@ core design that gives a further +10 % on top.
 
 ## JIT cache size vs throughput
 
-Sweep of the JIT codecache arena size against SML's qemu-S3 throughput.
-The interpreter baseline (red dashed line) is unaffected by the JIT
-cache so it's a fixed reference; the JIT only beats it once the arena
-holds enough of the working set to stop thrashing. Annotations are the
-number of unique blocks compiled before the arena filled.
+Sweep of the JIT codecache arena size against SML's qemu-S3 throughput,
+plotting three dispatcher modes side by side against the interpreter
+baseline. Annotations on the cold-JIT line are unique blocks compiled
+before the arena filled.
 
 ![JIT cache size vs throughput](benchmark/results/cache_sweep.png)
 
-| Arena | MHz | × DMG | Blocks compiled | vs interp |
-|------:|----:|------:|----------------:|----------:|
-| **interp** | **17.85** | **4.26×** | — | — |
-| 4 KB | 9.61 | 2.29× | 7 | 0.54× |
-| 8 KB | 14.63 | 3.49× | 11 | 0.82× |
-| 16 KB | 17.05 | 4.07× | 21 | 0.96× |
-| 32 KB | 16.50 | 3.93× | 31 | 0.92× |
-| 48 KB | 22.93 | 5.47× | 57 | 1.28× |
-| **64 KB (default)** | 25.70 | 6.13× | 77 | 1.44× |
-| **96 KB (peak)** | **27.71** | **6.61×** | 110 | **1.55×** |
-| 128 KB | 26.38 | 6.29× | 113 | 1.48× |
-| 192 KB | 23.90 | 5.70× | 113 | 1.34× |
+| Arena | jit (cold) | jit (pre-compiled) | jit (no prefetch) | Blocks |
+|------:|-----------:|-------------------:|------------------:|-------:|
+|  4 KB |  5.01 MHz | 5.96 MHz | 5.25 MHz | 7 |
+|  8 KB |  6.60     | 7.73     | 6.67     | 11 |
+| 16 KB |  6.98     | 13.37    | 7.27     | 21 |
+| 32 KB |  6.79     | 13.15    | 7.30     | 31 |
+| 48 KB |  9.69     | 20.21    | 10.94    | 57 |
+| **64 KB (default)** | 11.42 | **27.00** | 12.15 | 77 |
+| 96 KB | **14.49** | 25.68    | 13.88    | 122 |
+| 128 KB| 13.98     | 26.20    | 14.04    | 133 |
+| 192 KB| 14.38     | 27.11    | 13.96    | 133 |
 
-Key takeaways:
+Interpreter baseline: **10.00 MHz** / 2.38× DMG.
 
-- **Under ~16 KB the JIT loses to the interp.** The arena fills before
-  SML's hot blocks are all compiled, so the dispatcher recompiles the
-  same blocks repeatedly. Per-call dispatch overhead + recompile cost
-  exceed the interp's per-op switch-table cost.
-- **96 KB is the sweet spot.** That fits all 113 unique blocks SML
-  exercises in this window with comfortable headroom; throughput hits
-  1.55× the interp.
-- **Larger arenas regress mildly.** Past 110 blocks the working set is
-  saturated (`blocks_compiled` plateaus); the extra IRAM just sits
-  idle and adds I-cache pressure, dragging 192 KB back down to 1.34×.
+What the curves say:
 
-Reproduce with `benchmark/run_cache_sweep.sh` (parallel per-size IDF
-builds + qemu-xtensa runs) and `benchmark/plot_cache_sweep.py`.
+- **jit (cold)** pays the on-the-fly compile cost during the measured
+  window — flat-ish past 96 KB at ~14 MHz because the working set
+  (133 blocks) fits comfortably and there's nothing more to compile.
+- **jit (pre-compiled)** runs a warm-up pass first, then resets `cpu_
+  state` and benches; the measured window contains zero compiles. Once
+  the arena is ≥ 64 KB it converges to ~27 MHz (~2.7× interp), almost
+  double the cold-start number — the compile cost is the gap.
+- **jit (no prefetch)** is the cached path with the static-successor
+  prefetch disabled, so each new block reaches the cache via a chain
+  miss instead of a depth-4 walk at first compile. Tracks the cold
+  curve closely; prefetch saves first-encounter latency more than
+  steady-state throughput.
+- **Under 48 KB every JIT mode falls below the interp.** The arena
+  fills before SML's hot blocks are compiled, the dispatcher
+  recompiles the same blocks, and per-call dispatcher overhead +
+  recompile cost exceed the interp's per-op switch-table dispatch.
+
+Reproduce: `benchmark/run_cache_sweep.sh` (parallel IDF builds,
+then a worker-pool of qemu-xtensa runs pinned one-per-CPU via
+`taskset -c` so each run's wall-clock-tied virtual timer is
+uncontended) and `benchmark/plot_cache_sweep.py`.
 
 ## Quick start — host
 
