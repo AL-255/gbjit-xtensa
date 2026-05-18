@@ -20,6 +20,12 @@ gbjit: [06-ld r,r] halted=1 pc=$CC5F cycles=50000000 elapsed=2049 ms
 gbjit: RESULT: PASS
 ```
 
+**Super Mario Land runs on a real ESP32-S3 at 14.48 MHz / 3.45× DMG**
+(JIT, cached) — see [`benchmark/results/esp32s3_sml`](benchmark/results/esp32s3_sml/)
+for the head-to-head against the reference interpreter and the
+correctness fixes (MBC1 bank-switch invalidation, OAM DMA, PPU-IO
+write block break) that unblocked this path.
+
 > See [PLAN.md](PLAN.md) for the original design and
 > [STATUS.md](STATUS.md) for the latest progress, benchmarks per ROM,
 > and notes on outstanding work.
