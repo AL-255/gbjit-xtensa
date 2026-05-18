@@ -9,6 +9,7 @@
 #include "dispatcher.h"
 #include "sm83_interp.h"
 #include "memory.h"
+#include "ppu.h"
 #include "xtensa_sim.h"
 #include "emit_xtensa.h"
 #include "gbjit_debug.h"
@@ -636,7 +637,34 @@ void gbjit_dispatcher_run_until(gbjit_dispatcher *d, u64 until) {
             prev = NULL;
         }
         if (unlikely(cpu->halted)) {
-            cpu->cycles += 4;
+            /* Tight halt loop. SML and similar HALT-and-wait-for-VBlank
+             * games spend most of their wall time here, and the
+             * sm83_service_interrupts call above is most of the per-iter
+             * cost. Stay inside this loop until either an IRQ is pending,
+             * the PPU's next-event deadline is reached (state machine
+             * might raise IF), or the dispatcher's cycle budget runs out.
+             * On each pass we advance cpu->cycles by 4 (the JIT's HALT
+             * cycle cost) and run the cheap-fast-path checks inline; the
+             * heavy ppu_tick + IRQ dispatch only run when one of those
+             * conditions actually fires.
+             *
+             * Sync-PPU mode benefit: ppu_tick (which includes timer_tick
+             * + state machine advance) is what was being called on every
+             * outer iter via sm83_service_interrupts. Most halt iters
+             * have no state transition due — the inline deadline check
+             * skips the call until it's actually meaningful. */
+            mmu *m_halt = cpu->mmu;
+            do {
+                cpu->cycles += 4;
+                if (cpu->cycles >= m_halt->ppu_next_event_cycles
+                        || m_halt->io[0x40] != m_halt->ppu_last_lcdc) {
+                    ppu_tick(cpu);
+                }
+                if ((m_halt->io[0x0F] & m_halt->ie & 0x1Fu) != 0) {
+                    if (sm83_service_interrupts(cpu)) prev = NULL;
+                    break;
+                }
+            } while (cpu->halted && cpu->cycles < until);
             continue;
         }
         /* EI delayed-enable: when ime_pending is set, run the next op via
