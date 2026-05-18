@@ -118,18 +118,27 @@ typedef struct mmu {
      * without crossing any boundary and skip the heavy work. */
     u64 ppu_next_event_cycles;
 
-    /* Software framebuffer — one byte per pixel, value 0..3 is the GB
-     * shade *after* palette translation (0 = white, 3 = black). Filled
-     * one scanline at a time at the mode-3 → mode-0 transition in
-     * ppu_draw_line(). The display layer (boards/<board>/oled_task.c
-     * for the Heltec board) reads this at VBlank.
+    /* Double-buffered software framebuffer — one byte per pixel,
+     * value 0..3 is the GB shade after palette translation (0 = white,
+     * 3 = black). The PPU on Core 1 draws scanlines progressively
+     * over the course of a frame; the OLED display task on the same
+     * core can wake to push a frame any time. If they shared one
+     * buffer the display would see a torn image (top of frame N,
+     * bottom of frame N-1) any time the OLED ran mid-render, and
+     * scrolling backgrounds would look visibly broken.
+     *
+     * `framebuffer_back` is where ppu_draw_line writes scanlines.
+     * `framebuffer` is the stable, complete frame the display reads.
+     * At LCD_HBLANK → LCD_VBLANK (last scanline done) the PPU
+     * memcpy's back → front and bumps frame_seq. Display tasks gate
+     * their reads on frame_seq changing, so they only ever see a
+     * fully-composed frame.
      *
      * `window_line` is the GB PPU's internal window line counter: it
      * only advances on scanlines where the window is actually drawn,
-     * and is reset at the start of every frame. The frame_seq counter
-     * is incremented at the LCD_HBLANK → LCD_VBLANK transition so the
-     * display task can detect "new frame ready". */
-    u8  framebuffer[160 * 144];
+     * and is reset at the start of every frame. */
+    u8  framebuffer[160 * 144];       /* front — stable, OLED reads this */
+    u8  framebuffer_back[160 * 144];  /* back  — PPU draws into this */
     u8  window_line;
     u32 frame_seq;
 

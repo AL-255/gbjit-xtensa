@@ -1,6 +1,7 @@
 #include "ppu.h"
 #include "cpu_state.h"
 #include "memory.h"
+#include <string.h>  /* memcpy in the back-to-front double-buffer swap */
 
 /* PPU state machine — adapted from CrankBoy's peanut_gb (libs/peanut_gb_core.h,
  * MIT licensed; original work copyright Mahyar Koshkouei 2018-2022 and the
@@ -202,11 +203,14 @@ static inline u8 fetch_tile_pixel(const u8 *vram, u16 tile_addr_vram_rel,
     return (u8)(((b1 >> bit) & 1) << 1 | ((b0 >> bit) & 1));
 }
 
-/* Render scanline `ly` into m->framebuffer. Called at LCD_TRANSFER →
- * LCD_HBLANK; reads OAM, VRAM, BGP/OBP0/OBP1, LCDC, SCY/SCX, WY/WX
- * which must reflect the final state for this line. */
+/* Render scanline `ly` into the BACK framebuffer. Called at
+ * LCD_TRANSFER → LCD_HBLANK; reads OAM, VRAM, BGP/OBP0/OBP1, LCDC,
+ * SCY/SCX, WY/WX which must reflect the final state for this line.
+ * The back buffer is published to the front buffer at the
+ * LCD_HBLANK → LCD_VBLANK transition (where frame_seq is bumped) so
+ * any display task sees only fully-composed frames. */
 static void ppu_draw_line(mmu *m, u8 ly) {
-    u8 *line = &m->framebuffer[(u32)ly * 160];
+    u8 *line = &m->framebuffer_back[(u32)ly * 160];
     u8 lcdc = m->io[LCDC_REG];
 
     /* DMG: if BG_ENABLE is clear, BG (and window) render as color 0. We
@@ -489,8 +493,15 @@ void ppu_tick(struct cpu_state *cpu) {
 #else
                     m->io[IF_REG] |= INT_VBLANK_BIT;
 #endif
-                    /* Frame complete — bump the seq so display tasks
-                     * waiting on it can pull the freshly-drawn frame. */
+                    /* Frame complete — publish the back buffer to the
+                     * front so display tasks see a fully-composed
+                     * frame, then bump the seq. The memcpy + bump
+                     * here is the swap point of the double buffer.
+                     * Order matters: front MUST be written before
+                     * frame_seq increments, otherwise a reader that
+                     * gates on frame_seq could snapshot an old front. */
+                    memcpy(m->framebuffer, m->framebuffer_back,
+                           sizeof(m->framebuffer));
                     m->frame_seq++;
                     ppu_update_stat_irq(m);
                     ppu_check_lyc(m);
