@@ -347,9 +347,11 @@ static void clear_dangling_predictions(gbjit_dispatcher *d, gbjit_block *block) 
     for (u32 i = 0; i < GBJIT_BLOCK_BUCKETS; i++) {
         dispatcher_bucket *bk = (dispatcher_bucket *)d->buckets[i];
         while (bk) {
-            if (bk->b->predicted_next == block) {
-                bk->b->predicted_next = NULL;
-                bk->b->predicted_next_pc = 0;
+            for (int s = 0; s < 2; s++) {
+                if (bk->b->predicted_next[s] == block) {
+                    bk->b->predicted_next[s] = NULL;
+                    bk->b->predicted_next_pc[s] = 0;
+                }
             }
             bk = bk->next;
         }
@@ -658,12 +660,26 @@ void gbjit_dispatcher_run_until(gbjit_dispatcher *d, u64 until) {
          * value vs always-recompile-on-encounter behaviour. */
         gbjit_block *b = NULL;
         if (likely(!d->no_cache)) {
-            if (likely(prev && prev->predicted_next && prev->predicted_next_pc == cpu->pc)) {
-                b = prev->predicted_next;
-                GBJIT_STAT_INC(d, chain_hits);
+            if (likely(prev)) {
+                /* 2-slot direct-mapped predictor — JR cc / JP cc that
+                 * alternates target hits one of the two cached entries
+                 * every time, where a 1-slot cache loses every other
+                 * lookup. Slot 0 is checked first (it's the more recent
+                 * insertion on streams where the two targets alternate). */
+                if (likely(prev->predicted_next_pc[0] == cpu->pc
+                           && prev->predicted_next[0])) {
+                    b = prev->predicted_next[0];
+                    GBJIT_STAT_INC(d, chain_hits);
+                } else if (prev->predicted_next_pc[1] == cpu->pc
+                           && prev->predicted_next[1]) {
+                    b = prev->predicted_next[1];
+                    GBJIT_STAT_INC(d, chain_hits);
+                } else {
+                    b = find_block(d, cpu->pc);
+                    GBJIT_STAT_INC(d, chain_misses);
+                }
             } else {
                 b = find_block(d, cpu->pc);
-                if (prev) GBJIT_STAT_INC(d, chain_misses);
             }
         }
 
@@ -708,11 +724,20 @@ void gbjit_dispatcher_run_until(gbjit_dispatcher *d, u64 until) {
 
         /* Record the successor link on the previous block (regardless of
          * cache-hit status, so a stale link doesn't stick). Skip in
-         * no_cache mode — the previous block has already been overwritten. */
-        if (!d->no_cache && prev &&
-            (!prev->predicted_next || prev->predicted_next_pc != cpu->pc)) {
-            prev->predicted_next = b;
-            prev->predicted_next_pc = cpu->pc;
+         * no_cache mode — the previous block has already been overwritten.
+         * If the target already lives in one of the two slots, leave
+         * everything alone; otherwise overwrite the round-robin victim. */
+        if (!d->no_cache && prev) {
+            bool present = (prev->predicted_next_pc[0] == cpu->pc
+                            && prev->predicted_next[0] == b)
+                        || (prev->predicted_next_pc[1] == cpu->pc
+                            && prev->predicted_next[1] == b);
+            if (!present) {
+                u8 v = (u8)(prev->predicted_next_victim & 1u);
+                prev->predicted_next[v] = b;
+                prev->predicted_next_pc[v] = cpu->pc;
+                prev->predicted_next_victim = (u8)(v ^ 1u);
+            }
         }
 
 #if defined(ESP_PLATFORM)

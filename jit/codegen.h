@@ -46,9 +46,14 @@ typedef struct gbjit_block {
     /* Soft "predicted-next" cache (host fast-path). When a block falls
      * through, the dispatcher updates this to the next block's pointer; on
      * subsequent executions of *this* block, the dispatcher skips the hash
-     * lookup if cpu->pc matches `predicted_next_pc`. */
-    struct gbjit_block *predicted_next;
-    u16                 predicted_next_pc;
+     * lookup if cpu->pc matches `predicted_next_pc[i]`. Two slots so
+     * conditional-branch blocks don't ping-pong: a JR cc that alternates
+     * between taken / fall-through hits one slot every time instead of
+     * losing every other lookup. `predicted_next_victim` is a 1-bit
+     * round-robin index — the next slot to overwrite on a miss. */
+    struct gbjit_block *predicted_next[2];
+    u16                 predicted_next_pc[2];
+    u8                  predicted_next_victim;
     /* Statically-known successor PCs (used by the prefetcher to compile
      * downstream blocks eagerly at this block's compile time). 0xFFFF
      * means "no static target — dynamic (RET / JP(HL)) or end of block".
