@@ -19,5 +19,14 @@ CONFIG_ESP_TASK_WDT_EN=n
 
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
 
-# Run the core at its rated max (240 MHz).
+# Run the core at its rated max (240 MHz). The ESP32-S3 datasheet
+# specifies 240 MHz as the maximum supported clock; ESP-IDF only
+# exposes 80/160/240 (the three PLL output paths). Pushing past 240 on
+# this part requires register-poking the PLL chain which is unsupported
+# and unstable across units / temperatures — we keep to the datasheet.
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+
+# Note: QIO/120 MHz flash both tripped an IDF v6.0.1 compile bug in
+# components/spi_flash/spi_flash_hpm_enable.c on this toolchain.
+# Keeping the default DIO @ 80 MHz; the JIT win from faster flash is
+# small relative to chasing that breakage.
