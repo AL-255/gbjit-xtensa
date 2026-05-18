@@ -6,6 +6,28 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <sys/resource.h>
+
+/* Cap the address space the emulator can claim. Bugs in JIT codegen
+ * (runaway loops, leaks, fault-recovery code paths) have crashed the
+ * host before; this turns "consumed all the RAM and OOM-killed
+ * something important" into a clean ENOMEM/abort. 500 MB is plenty
+ * for any sane workload — the JIT arena is ~64 KB, the cart ROM up to
+ * 256 KB, and unit-test cycle budgets max out at ~2 GB GB-cycles
+ * which produce no asymptotic memory growth. Override with
+ * GBJIT_RLIMIT_MB=0 (disable) or any positive value (cap in MB). */
+static void install_memory_guard(void) {
+    long mb = 500;
+    const char *env = getenv("GBJIT_RLIMIT_MB");
+    if (env) mb = strtol(env, NULL, 10);
+    if (mb <= 0) return;
+    struct rlimit rl;
+    rl.rlim_cur = (rlim_t)mb * 1024u * 1024u;
+    rl.rlim_max = rl.rlim_cur;
+    if (setrlimit(RLIMIT_AS, &rl) != 0) {
+        fprintf(stderr, "warning: setrlimit(RLIMIT_AS, %ld MB) failed (running unbounded)\n", mb);
+    }
+}
 
 static void serial_cb(void *ctx, u8 b) {
     (void)ctx;
@@ -38,6 +60,7 @@ static void usage(const char *argv0) {
 }
 
 int main(int argc, char **argv) {
+    install_memory_guard();
     bool use_jit = false;
     bool no_cache = false;
     bool no_prefetch = false;

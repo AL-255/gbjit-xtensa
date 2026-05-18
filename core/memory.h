@@ -61,19 +61,42 @@ typedef struct mmu {
      * inert and reads return the raw IO bytes. */
     struct cpu_state *cpu;
 
-    /* PPU edge-detection state — last-observed scanline (LY) and STAT mode
-     * bits, used so ppu_tick() can fire VBlank / STAT IRQs exactly once
-     * per transition. */
-    u8 ppu_last_ly;
-    u8 ppu_last_mode;
+    /* PPU state machine — adapted from CrankBoy's peanut_gb (MIT
+     * licensed). Stateful mode 2 → 3 → 0 → 2 walk per scanline, with
+     * dedicated VBlank handling for lines 144-153, level-triggered STAT
+     * IRQ, LY=LYC coincidence, and the short-line-153 LY=0-wrap quirk.
+     * See core/ppu.c for the full state machine.
+     *
+     * `ppu_lcd_count` is the dot count within the current mode (0..456
+     * range); `ppu_lcd_mode` is the current STAT mode (0=HBlank,
+     * 1=VBlank, 2=OAM-scan, 3=Transfer). `ppu_lcd_off_count` ticks
+     * frame cycles while the LCD is disabled. `ppu_mode3_cycles` and
+     * `ppu_mode0_cycles` are the per-scanline lengths set at the
+     * mode-2 → 3 transition (depend on SCX + OAM sprite layout).
+     * `ppu_stat_line` mirrors the level-triggered STAT interrupt
+     * line so we only fire IF.LCDC on a rising edge.
+     * `ppu_last_lcdc` is used to detect LCDC enable/disable
+     * transitions without hooking mmu_write8. */
+    u8  ppu_lcd_mode;
+    u8  ppu_stat_line;
+    u8  ppu_last_lcdc;
+    u8  ppu_latched_wy;
+    u16 ppu_lcd_count;
+    u16 ppu_mode3_cycles;
+    u16 ppu_mode0_cycles;
+    u32 ppu_lcd_off_count;
 
-    /* Cycle deadline past which ppu_tick MUST do its full LY/mode/IRQ
-     * recomputation; until then it can early-return. ppu_tick() runs on
-     * every dispatcher iteration, and the u64 modulo/division it does
-     * to derive LY is expensive on LX6. Cycles per state transition
-     * range from 80 (entering mode 3) to 456 (entering next scanline),
-     * so most dispatcher iterations cross zero transitions and can skip
-     * the work entirely. */
+    /* Last value of cpu->cycles seen by ppu_tick; the difference between
+     * the current cpu->cycles and this is the GB cycles to advance the
+     * PPU state machine by. */
+    u64 ppu_last_cpu_cycles;
+
+    /* Cycle deadline past which ppu_tick MUST run its state machine;
+     * until then it can early-return. ppu_tick() runs on every dispatch
+     * iteration via sm83_service_interrupts, but most iterations span
+     * far fewer cycles than the shortest PPU state transition (80 dots
+     * entering mode 3) — those iterations only advance lcd_count
+     * without crossing any boundary and skip the heavy work. */
     u64 ppu_next_event_cycles;
 
     /* Serial output capture — Blargg test ROMs write ASCII to FF01 then $81 to FF02. */

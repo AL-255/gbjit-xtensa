@@ -118,6 +118,67 @@ static void emit_l32r_at(xt_emit *e, u8 at, u32 lit_off, u32 pc_off) {
 
 static u32 align_up_4(u32 v) { return (v + 3u) & ~3u; }
 
+/* Returns true if `op` reads or writes anything in the MMU that could
+ * change between two consecutive executions of the same block (and
+ * therefore must NOT be kept inside a loop that bypasses the dispatcher's
+ * per-iteration sm83_service_interrupts → ppu_tick).
+ *
+ * Used to gate loop-internalisation: only "pure" loops (DEC/INC/ALU on
+ * registers, JR cond) qualify. A loop that polls LY/STAT/IO or touches
+ * (HL)/RAM gets the normal terminator-and-redispatch treatment so the
+ * PPU and IRQ state stay current. */
+static bool op_touches_mmu(u8 op) {
+    /* LD r,(HL) / LD (HL),r in the 0x40..0x7F block (reg-idx 6). */
+    if (op >= 0x40 && op <= 0x7F) {
+        u8 src = op & 7u;
+        u8 dst = (op >> 3) & 7u;
+        return (src == 6 || dst == 6);
+    }
+    /* LD (HL),n8 */
+    if (op == 0x36) return true;
+    /* ALU A,(HL) (group with src==6 in 0x80..0xBF). */
+    if (op >= 0x80 && op <= 0xBF && (op & 7u) == 6u) return true;
+    /* LD A,(BC/DE), LD (BC/DE),A */
+    if (op == 0x02 || op == 0x0A || op == 0x12 || op == 0x1A) return true;
+    /* LD A,(HL+/-), LD (HL+/-),A */
+    if (op == 0x22 || op == 0x2A || op == 0x32 || op == 0x3A) return true;
+    /* LD A,(a16), LD (a16),A */
+    if (op == 0xEA || op == 0xFA) return true;
+    /* LDH variants — IO/HRAM reads or writes; IO reads can pick up
+     * stale LY etc. if the loop doesn't yield to the dispatcher. */
+    if (op == 0xE0 || op == 0xE2 || op == 0xF0 || op == 0xF2) return true;
+    /* Stack PUSH/POP (touch RAM at SP). */
+    if (op == 0xC1 || op == 0xC5 || op == 0xD1 || op == 0xD5 ||
+        op == 0xE1 || op == 0xE5 || op == 0xF1 || op == 0xF5) return true;
+    /* CB-prefix (HL) variants — conservatively veto all CB-prefix. */
+    if (op == 0xCB) return true;
+    return false;
+}
+
+/* If `ops[idx]` is a JR cc whose target is a previously-collected op in
+ * the same block AND every op between that target and the JR cc itself
+ * is MMU-pure, returns the target's index in `ops`. Otherwise returns
+ * SIZE_MAX. The walker uses this to decide whether to keep walking past
+ * a JR cc, and inline_op uses it to decide whether to emit a back-branch
+ * vs. a block-terminator. */
+static u32 detect_back_edge_target(const u8 *ops_opcode, const u16 *ops_pc,
+                                    u32 idx, const mmu *m_for_reads) {
+    u8 op = ops_opcode[idx];
+    if (op != 0x20 && op != 0x28 && op != 0x30 && op != 0x38) return (u32)-1;
+    u16 jr_pc = ops_pc[idx];
+    i8 off = (i8)mmu_read8((mmu *)m_for_reads, (u16)(jr_pc + 1));
+    u16 target = (u16)(jr_pc + 2 + off);
+    u32 target_idx = (u32)-1;
+    for (u32 j = 0; j < idx; j++) {
+        if (ops_pc[j] == target) { target_idx = j; break; }
+    }
+    if (target_idx == (u32)-1) return (u32)-1;
+    for (u32 j = target_idx; j < idx; j++) {
+        if (op_touches_mmu(ops_opcode[j])) return (u32)-1;
+    }
+    return target_idx;
+}
+
 /* --- Code-emission helpers ---------------------------------------------- */
 
 /* Sync PC and cycles accumulator into cpu_state. */
@@ -200,18 +261,21 @@ static void emit_load_u16(xt_emit *e, u8 dst, u16 value, u8 scratch) {
  * The instruction may straddle a 4-byte boundary; in that case we load
  * both adjacent words and stitch.
  *
- * Caller MUST have flushed any partial-word state to buf first
- * (xt_flush_pending). All current patch sites in this file go through
- * word_write_24 which does this. */
-static u32 word_read_24(const xt_emit *e, u32 pos) {
+ * Flushes any partial-word accumulator first so the read picks up the
+ * latest bytes — necessary because patch sites may target an instruction
+ * that was emitted just a few bytes back and whose word hasn't completed
+ * yet (e.g. the internalised JR-cc back-edge in inline_op patches its
+ * own xt_j right after emitting it). */
+static u32 word_read_24(xt_emit *e, u32 pos) {
+    xt_flush_pending(e);
     u32 word_off = pos & ~3u;
     u32 byte_off = pos & 3u;
-    u32 w0 = *(const u32 *)(e->buf + word_off);
+    u32 w0 = *(u32 *)(e->buf + word_off);
     if (byte_off <= 1) {
         return (w0 >> (byte_off * 8)) & 0xFFFFFFu;
     }
     /* Straddles two words. */
-    u32 w1 = *(const u32 *)(e->buf + word_off + 4);
+    u32 w1 = *(u32 *)(e->buf + word_off + 4);
     u32 from_w0 = w0 >> (byte_off * 8);
     u32 from_w1 = w1 << ((4 - byte_off) * 8);
     return (from_w0 | from_w1) & 0xFFFFFFu;
@@ -348,6 +412,24 @@ typedef struct {
     u32 entry_off;
     u32 mmu_base_value;
     const u32 *lit_off;        /* fixed-literal offsets (LITERAL_COUNT entries) */
+    /* Per-op tracking for the block currently being compiled, so a
+     * backward GB JR cc to a previous op in the SAME block can be turned
+     * into an internal Xtensa branch instead of a block terminator. The
+     * arrays are filled by gbjit_compile_block as it walks forward; only
+     * indices [0..n_filled) are populated for the op currently in
+     * inline_op. `current_is_internalised_loop` is set by the walker
+     * when the op currently being inlined is a JR cc whose target is a
+     * previously-collected op in this block AND the loop body is "safe"
+     * (no MMU memory reads, no IRQ-emitting writes). Both the walker
+     * and inline_op consult this flag rather than re-deriving it. */
+    const u16 *ops_pc_arr;
+    const u32 *ops_code_off;    /* Xtensa-buf byte offset where ops_pc_arr[i] starts emitting */
+    u32        n_filled;
+    bool       current_is_internalised_loop;
+    /* Out-flag: when inline_op turns a JR cc with a backward target into
+     * an internal Xtensa branch, the op is no longer a block terminator
+     * — gbjit_compile_block keeps walking forward instead of stopping. */
+    bool       internalised_back_edge;
 } inline_ctx;
 
 /* Try to inline a GB op. Returns true on success, false to request the
@@ -679,9 +761,55 @@ static bool inline_op(xt_emit *e, u8 opcode, u16 pc, inline_ctx *ictx) {
         u8 flag_mask = (cc < 2) ? FLAG_Z : FLAG_C;
         bool taken_when_zero = ((cc & 1) == 0);   /* NZ/NC vs Z/C */
 
+        /* Loop internalisation: only take the back-edge emit path when
+         * the walker also chose to extend the block past this JR cc
+         * (current_is_internalised_loop is set in that case). Without
+         * that gate, we'd emit a back-branch but the block would still
+         * terminate at the epilogue — broken. */
+        i32 target_code_off = -1;
+        if (ictx->current_is_internalised_loop) {
+            for (u32 j = 0; j < ictx->n_filled; j++) {
+                if (ictx->ops_pc_arr[j] == target) {
+                    target_code_off = (i32)ictx->ops_code_off[j];
+                    break;
+                }
+            }
+        }
+
         xt_l8ui(e, 4, 13, OFF_F);
         xt_movi(e, 5, (i32)flag_mask);
         xt_and(e, 4, 4, 5);
+
+        if (target_code_off >= 0) {
+            /* Internalised loop. Branch over the back-edge path when the
+             * GB condition is NOT met; the back-edge path adds taken
+             * cycles, updates PC, and jumps back to the loop body. The
+             * fallthrough path then adds not-taken cycles, updates PC
+             * to `fallthrough`, and the block keeps walking forward. */
+            u32 br_skip = e->len;
+            if (taken_when_zero) xt_bnez(e, 4, 4);   /* skip back-edge if !taken */
+            else                 xt_beqz(e, 4, 4);
+
+            /* Back-edge path: cycles += 12, PC = target, j to loop body. */
+            xt_addi(e, 12, 12, 12);
+            emit_load_u16(e, 11, target, 2);
+            i32 j_pos = (i32)e->len;
+            xt_j(e, 4);   /* placeholder offset, will patch */
+            /* Patch the j to point at target_code_off. patch_j_to expects
+             * absolute byte offsets in e->buf. */
+            patch_j_to(e, (u32)j_pos, (u32)target_code_off);
+
+            /* Fallthrough path target. */
+            u32 fallthru_pos = e->len;
+            patch_branch_to(e, br_skip, fallthru_pos);
+
+            /* Not-taken cycles + PC. The block keeps emitting from here. */
+            xt_addi(e, 12, 12, 8);
+            emit_load_u16(e, 11, fallthrough, 2);
+
+            ictx->internalised_back_edge = true;
+            return true;
+        }
 
         /* Branch over taken-block when condition NOT met. */
         u32 br_pos = e->len;
@@ -1452,7 +1580,21 @@ gbjit_block *gbjit_compile_block(codecache *cc, cpu_state *cpu, u16 pc_start,
         ops_opcode[n_ops] = opcode;
         ops_len[n_ops] = info->length;
         n_ops++;
-        cur = (u16)(cur + info->length);
+        u16 next_pc = (u16)(cur + info->length);
+
+        /* Loop-internalisation (DISABLED): when this op is a JR cc with a
+         * backward target inside the block and an MMU-pure body, we'd
+         * keep walking forward and inline_op would emit a Xtensa back-
+         * branch. That's a real performance win for tight HRAM loops on
+         * the S3, but merging the loop into one block breaks the
+         * mid-loop-invalidation test in tests/test_smc.c — that test's
+         * design assumes the loop is split across multiple JIT blocks.
+         * Re-enable along with an updated test once we're willing to
+         * accept larger blocks. The helper detect_back_edge_target
+         * remains for symmetric re-enable from inline_op. */
+        (void)detect_back_edge_target;
+
+        cur = next_pc;
         if (sm83_terminates_block(opcode)) break;
     }
 
@@ -1504,17 +1646,30 @@ gbjit_block *gbjit_compile_block(codecache *cc, cpu_state *cpu, u16 pc_start,
     xt_movi (&e, 12, 0);
 
     /* --- Body --- */
+    u32 ops_code_off[MAX_OPS_PER_BLOCK];
     bool exited_early = false;
     for (u32 i = 0; i < n_ops; i++) {
         u8 opcode = ops_opcode[i];
         u16 op_pc = ops_pc[i];
+        ops_code_off[i] = e.len;
 
-        inline_ctx ictx = { cpu->mmu, &L, entry_off, mmu_base_value, lit_off };
+        bool is_back_edge =
+            detect_back_edge_target(ops_opcode, ops_pc, i, cpu->mmu) != (u32)-1;
+        inline_ctx ictx = {
+            cpu->mmu, &L, entry_off, mmu_base_value, lit_off,
+            ops_pc, ops_code_off, i, is_back_edge, false,
+        };
         if (inline_op(&e, opcode, op_pc, &ictx)) {
             /* Any terminator op (HALT/JR/JP/...) — once inlined the block
              * has already set PC + cycles itself, so we can break out and
-             * skip straight to the epilogue. */
-            if (sm83_terminates_block(opcode)) { exited_early = true; break; }
+             * skip straight to the epilogue. EXCEPT: if a JR cc was
+             * internalised as an Xtensa back-branch, it's no longer a
+             * terminator — we continue with the next op (the loop-exit
+             * fallthrough path). */
+            if (sm83_terminates_block(opcode) && !ictx.internalised_back_edge) {
+                exited_early = true;
+                break;
+            }
             continue;
         }
 
