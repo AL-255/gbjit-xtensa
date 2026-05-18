@@ -117,13 +117,16 @@ static inline void ppu_update_stat_irq(mmu *m) {
  * the SCX & 7 scroll alignment penalty; plus +6 if the window is visible
  * on this scanline. */
 static inline u16 compute_mode3_cycles(mmu *m) {
+    /* Use the latched per-frame snapshot for the cycle-count calculation
+     * — keep the timing consistent with what ppu_draw_line will actually
+     * render. LY is live (it's set by PPU itself). */
     u16 cycles = PPU_MODE_3_VRAM_MIN_CYCLES;
-    u8 scx_mod8 = m->io[SCX_REG] & 7u;
+    u8 scx_mod8 = m->ppu_latched_scx & 7u;
     cycles = (u16)(cycles + scx_mod8);
-    bool win_visible = (m->io[LCDC_REG] & LCDC_WINDOW_ENABLE)
-                    && (m->io[WX_REG] <= 166u)
+    bool win_visible = (m->ppu_latched_lcdc & LCDC_WINDOW_ENABLE)
+                    && (m->ppu_latched_wx <= 166u)
                     && (m->io[LY_REG] >= m->ppu_latched_wy);
-    if (m->io[LCDC_REG] & LCDC_BG_ENABLE) {
+    if (m->ppu_latched_lcdc & LCDC_BG_ENABLE) {
         /* DMG: window also gated on BG enable. */
         if (!win_visible) win_visible = false;
     }
@@ -183,6 +186,17 @@ static void ppu_lcdc_edge(mmu *m, u8 prev, u8 curr) {
         m->ppu_lcd_mode = LCD_SEARCH_OAM;
         m->io[STAT_REG] = (u8)((m->io[STAT_REG] & ~STAT_MODE) | LCD_SEARCH_OAM);
         m->ppu_stat_line = 0;
+        /* Re-latch the per-frame IO snapshot — LCD just came on, so the
+         * first frame draws against whatever the game just programmed,
+         * not whatever was latched the last time we were running. */
+        m->ppu_latched_lcdc = curr;
+        m->ppu_latched_scx  = m->io[SCX_REG];
+        m->ppu_latched_scy  = m->io[SCY_REG];
+        m->ppu_latched_bgp  = m->io[BGP_REG];
+        m->ppu_latched_obp0 = m->io[OBP0_REG];
+        m->ppu_latched_obp1 = m->io[OBP1_REG];
+        m->ppu_latched_wx   = m->io[WX_REG];
+        m->ppu_latched_wy   = m->io[WY_REG];
         ppu_check_lyc(m);
         ppu_update_stat_irq(m);
     }
@@ -203,16 +217,20 @@ static inline u8 fetch_tile_pixel(const u8 *vram, u16 tile_addr_vram_rel,
 }
 
 /* Render scanline `ly` into m->framebuffer. Called at LCD_TRANSFER →
- * LCD_HBLANK; reads OAM, VRAM, BGP/OBP0/OBP1, LCDC, SCY/SCX, WY/WX
- * which must reflect the final state for this line. */
+ * LCD_HBLANK. Reads the per-frame latched snapshot of LCDC, BGP,
+ * SCY/SCX, OBP0/OBP1, WY/WX (see ppu_tick's end-of-VBlank case), plus
+ * the live OAM/VRAM (which mmu_write8 keeps coherent on the CPU side).
+ * Using the latched snapshot fixes the cross-core race in async-PPU
+ * mode where Core 1's per-scanline reads of mmu->io would otherwise
+ * see Core 0's mid-frame writes intended for a later frame. */
 static void ppu_draw_line(mmu *m, u8 ly) {
     u8 *line = &m->framebuffer[(u32)ly * 160];
-    u8 lcdc = m->io[LCDC_REG];
+    u8 lcdc = m->ppu_latched_lcdc;
 
     /* DMG: if BG_ENABLE is clear, BG (and window) render as color 0. We
      * fill the line with shade-0 (BGP[0]) up front so sprites can still
      * draw over it. */
-    u8 bgp = m->io[BGP_REG];
+    u8 bgp = m->ppu_latched_bgp;
     u8 bg_shade[4] = {
         (u8)(bgp & 3), (u8)((bgp >> 2) & 3),
         (u8)((bgp >> 4) & 3), (u8)((bgp >> 6) & 3),
@@ -220,7 +238,7 @@ static void ppu_draw_line(mmu *m, u8 ly) {
     u8 bg_color_id[160];                /* raw 0..3 before palette, for sprite/bg priority */
 
     if (lcdc & LCDC_BG_ENABLE) {
-        u8 scx = m->io[SCX_REG], scy = m->io[SCY_REG];
+        u8 scx = m->ppu_latched_scx, scy = m->ppu_latched_scy;
         u16 tilemap_base = (lcdc & LCDC_BG_TILEMAP_HI) ? 0x1C00 : 0x1800;
         bool unsigned_tiles = (lcdc & LCDC_BG_TILEDATA_LO) != 0;
         u8 bg_y = (u8)(ly + scy);
@@ -253,7 +271,7 @@ static void ppu_draw_line(mmu *m, u8 ly) {
      * too (yes, the BG_ENABLE bit gates the window in DMG mode). */
     if ((lcdc & LCDC_WINDOW_ENABLE) && (lcdc & LCDC_BG_ENABLE)
             && ly >= m->ppu_latched_wy) {
-        u8 wx = m->io[WX_REG];
+        u8 wx = m->ppu_latched_wx;
         if (wx < 167) {
             int start_x = (wx >= 7) ? (wx - 7) : 0;
             u16 tilemap_base = (lcdc & LCDC_WINDOW_TILEMAP_HI) ? 0x1C00 : 0x1800;
@@ -312,7 +330,7 @@ static void ppu_draw_line(mmu *m, u8 ly) {
             }
         }
         /* Render in reverse (lower X / earlier OAM wins). */
-        u8 obp0 = m->io[OBP0_REG], obp1 = m->io[OBP1_REG];
+        u8 obp0 = m->ppu_latched_obp0, obp1 = m->ppu_latched_obp1;
         for (int s = nvis - 1; s >= 0; s--) {
             int top = (int)vis[s].y - 16;
             int left = (int)vis[s].x - 8;
@@ -508,9 +526,22 @@ void ppu_tick(struct cpu_state *cpu) {
             if (m->ppu_lcd_count >= LCD_LINE_CYCLES) {
                 m->ppu_lcd_count = (u16)(m->ppu_lcd_count - LCD_LINE_CYCLES);
                 if (m->io[LY_REG] == 0) {
-                    /* End of VBlank — latch WY and reset the window-
-                     * line counter for the next frame. */
-                    m->ppu_latched_wy = m->io[WY_REG];
+                    /* End of VBlank — latch the per-frame IO snapshot
+                     * and reset the window-line counter. ppu_draw_line
+                     * reads from these latched fields rather than the
+                     * live mmu->io bytes, so the BG/window for all 144
+                     * scanlines of the next frame uses the value Core 0
+                     * had written by this point — even if Core 0 writes
+                     * a new SCX mid-frame from the PPU thread's
+                     * perspective on Core 1. */
+                    m->ppu_latched_wy   = m->io[WY_REG];
+                    m->ppu_latched_lcdc = m->io[LCDC_REG];
+                    m->ppu_latched_scx  = m->io[SCX_REG];
+                    m->ppu_latched_scy  = m->io[SCY_REG];
+                    m->ppu_latched_bgp  = m->io[BGP_REG];
+                    m->ppu_latched_obp0 = m->io[OBP0_REG];
+                    m->ppu_latched_obp1 = m->io[OBP1_REG];
+                    m->ppu_latched_wx   = m->io[WX_REG];
                     m->window_line = 0;
                     m->ppu_lcd_mode = LCD_SEARCH_OAM;
                     m->io[STAT_REG] = (u8)((m->io[STAT_REG] & ~STAT_MODE) | LCD_SEARCH_OAM);
