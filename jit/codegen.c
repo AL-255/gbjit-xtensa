@@ -1125,14 +1125,21 @@ static bool inline_op(xt_emit *e, u8 opcode, u16 pc, inline_ctx *ictx) {
         return true;
     }
 
-    /* --- JP HL (0xE9) — block terminator, target from a CPU register so
-     * we can't resolve it at codegen time. Just load cpu->hl into the
-     * block-exit PC slot (a11) and add the 4-cycle cost. */
+    /* --- JP HL (0xE9) — block terminator, target from a CPU register
+     * so we can't resolve it at codegen time. Just load cpu->hl into
+     * the block-exit PC slot (a11) and add the 4-cycle cost. Compile-
+     * time gated via -DGBJIT_INLINE_JP_HL=0 to force the helper path
+     * (useful for A/B'ing the inliner). Default 1. */
+#ifndef GBJIT_INLINE_JP_HL
+#define GBJIT_INLINE_JP_HL 1
+#endif
+#if GBJIT_INLINE_JP_HL
     if (opcode == 0xE9) {
         xt_l16ui(e, 11, 13, OFF_HL);
         xt_addi(e, 12, 12, 4);
         return true;
     }
+#endif
 
     /* --- JP cc, a16 (0xC2/0xCA/0xD2/0xDA). */
     if (opcode == 0xC2 || opcode == 0xCA || opcode == 0xD2 || opcode == 0xDA) {

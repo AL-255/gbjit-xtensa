@@ -44,15 +44,23 @@ typedef struct gbjit_block {
     u32 *chain_lit_off;
     u32  n_chain_lit;
     /* Soft "predicted-next" cache (host fast-path). When a block falls
-     * through, the dispatcher updates this to the next block's pointer; on
-     * subsequent executions of *this* block, the dispatcher skips the hash
-     * lookup if cpu->pc matches `predicted_next_pc[i]`. Two slots so
-     * conditional-branch blocks don't ping-pong: a JR cc that alternates
-     * between taken / fall-through hits one slot every time instead of
-     * losing every other lookup. `predicted_next_victim` is a 1-bit
-     * round-robin index — the next slot to overwrite on a miss. */
-    struct gbjit_block *predicted_next[2];
-    u16                 predicted_next_pc[2];
+     * through, the dispatcher updates this to the next block's pointer;
+     * on subsequent executions of *this* block, the dispatcher skips
+     * the hash lookup if cpu->pc matches one of `predicted_next_pc[i]`.
+     *
+     * Compile-time configurable via -DGBJIT_CHAIN_PREDICTOR_WAYS=<N>:
+     *   1 → classic single-slot cache. Cheap lookup, but conditional
+     *       branches alternating taken/fall-through evict each other on
+     *       every iteration → ~50% hit rate on the worst SML inner loops.
+     *   2 → two-way direct-mapped + 1-bit round-robin victim. The
+     *       extra compare in the hot path is offset by the find_block
+     *       calls it eliminates (90%+ hit rate on SML).
+     * Default is 2; bump higher if you want more associativity. */
+#ifndef GBJIT_CHAIN_PREDICTOR_WAYS
+#define GBJIT_CHAIN_PREDICTOR_WAYS 2
+#endif
+    struct gbjit_block *predicted_next[GBJIT_CHAIN_PREDICTOR_WAYS];
+    u16                 predicted_next_pc[GBJIT_CHAIN_PREDICTOR_WAYS];
     u8                  predicted_next_victim;
     /* Statically-known successor PCs (used by the prefetcher to compile
      * downstream blocks eagerly at this block's compile time). 0xFFFF

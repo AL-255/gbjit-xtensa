@@ -76,3 +76,44 @@ endif()
 if(GBJIT_PPU_ASYNC)
     target_compile_definitions(${COMPONENT_LIB} PRIVATE GBJIT_PPU_ASYNC=1)
 endif()
+
+# --- Optional perf / correctness toggles ------------------------------
+# Each defaults to the production-good value. Override at configure time
+# with `idf.py -D<NAME>=<VALUE> build` to A/B against the legacy path.
+#
+#   GBJIT_CHAIN_PREDICTOR_WAYS=N   N-way predicted-next cache. Default
+#                                  2 (best on SML); set to 1 for the
+#                                  classic single-slot cache.
+#
+#   GBJIT_INLINE_JP_HL=0|1         Inline the JP HL terminator instead
+#                                  of dispatching through sm83_step.
+#                                  Default 1.
+#
+#   GBJIT_DISPATCHER_HALT_INNER_LOOP=0|1
+#                                  Tight inner loop in the dispatcher
+#                                  when cpu->halted, avoiding the
+#                                  sm83_service_interrupts call cost
+#                                  on every halt iter. Default 1.
+#
+#   GBJIT_FRAMEBUFFER_DOUBLE_BUFFER=0|1
+#                                  Add a back-buffer to mmu and memcpy
+#                                  to the front at frame complete.
+#                                  +23 KB DRAM, ~50 µs/frame. Default 0
+#                                  (sync-PPU mode largely eliminates
+#                                  the tearing this was meant to fix).
+if(DEFINED GBJIT_CHAIN_PREDICTOR_WAYS)
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE
+        GBJIT_CHAIN_PREDICTOR_WAYS=${GBJIT_CHAIN_PREDICTOR_WAYS})
+endif()
+if(DEFINED GBJIT_INLINE_JP_HL)
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE
+        GBJIT_INLINE_JP_HL=${GBJIT_INLINE_JP_HL})
+endif()
+if(DEFINED GBJIT_DISPATCHER_HALT_INNER_LOOP)
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE
+        GBJIT_DISPATCHER_HALT_INNER_LOOP=${GBJIT_DISPATCHER_HALT_INNER_LOOP})
+endif()
+if(DEFINED GBJIT_FRAMEBUFFER_DOUBLE_BUFFER)
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE
+        GBJIT_FRAMEBUFFER_DOUBLE_BUFFER=${GBJIT_FRAMEBUFFER_DOUBLE_BUFFER})
+endif()

@@ -130,6 +130,22 @@ typedef struct mmu {
      * is incremented at the LCD_HBLANK → LCD_VBLANK transition so the
      * display task can detect "new frame ready". */
     u8  framebuffer[160 * 144];
+
+    /* Optional second buffer for tear-free OLED reads. Enabled at
+     * build time with -DGBJIT_FRAMEBUFFER_DOUBLE_BUFFER=1. When on,
+     * ppu_draw_line writes scanlines to framebuffer_back; at the
+     * LCD_HBLANK → LCD_VBLANK transition (end of line 143) we memcpy
+     * back → front and bump frame_seq, so any reader gating on
+     * frame_seq sees only fully-composed frames. Costs ~23 KB DRAM
+     * plus a ~50 µs memcpy per frame. Off by default — sync-PPU mode
+     * makes the framebuffer race much less visible. */
+#ifndef GBJIT_FRAMEBUFFER_DOUBLE_BUFFER
+#define GBJIT_FRAMEBUFFER_DOUBLE_BUFFER 0
+#endif
+#if GBJIT_FRAMEBUFFER_DOUBLE_BUFFER
+    u8  framebuffer_back[160 * 144];
+#endif
+
     u8  window_line;
     u32 frame_seq;
 

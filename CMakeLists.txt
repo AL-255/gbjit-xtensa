@@ -18,6 +18,21 @@ add_compile_options(-Wall -Wextra -Wshadow -Wno-unused-parameter -fno-strict-ali
 # DEBUG, so those increments are compiled out of the hot path.
 add_compile_definitions(DEBUG=1)
 
+# Propagate the JIT/PPU build-time toggles so the host build can A/B
+# them too. Each is optional — when undefined the C source picks up
+# its own #ifndef default. See boards/HTIT-WB32LAF_V3.2/components/
+# gbjit/CMakeLists.txt for the full list and what each one does.
+foreach(_opt
+        GBJIT_CHAIN_PREDICTOR_WAYS
+        GBJIT_INLINE_JP_HL
+        GBJIT_DISPATCHER_HALT_INNER_LOOP
+        GBJIT_FRAMEBUFFER_DOUBLE_BUFFER
+        GBJIT_PPU_ASYNC)
+    if(DEFINED ${_opt})
+        add_compile_definitions(${_opt}=${${_opt}})
+    endif()
+endforeach()
+
 # Portable core
 add_library(gbjit_core STATIC
     core/memory.c

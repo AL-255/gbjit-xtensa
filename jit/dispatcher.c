@@ -10,6 +10,14 @@
 #include "sm83_interp.h"
 #include "memory.h"
 #include "ppu.h"
+
+/* Inline the tight HALT-and-wait-for-IRQ loop. Default on; flip to 0
+ * to fall back to the naive "advance 4 cycles, full sm83_service_
+ * interrupts call, continue" path. The tight loop is the main reason
+ * sync-PPU mode is fast enough to be usable on SML. */
+#ifndef GBJIT_DISPATCHER_HALT_INNER_LOOP
+#define GBJIT_DISPATCHER_HALT_INNER_LOOP 1
+#endif
 #include "xtensa_sim.h"
 #include "emit_xtensa.h"
 #include "gbjit_debug.h"
@@ -348,7 +356,7 @@ static void clear_dangling_predictions(gbjit_dispatcher *d, gbjit_block *block) 
     for (u32 i = 0; i < GBJIT_BLOCK_BUCKETS; i++) {
         dispatcher_bucket *bk = (dispatcher_bucket *)d->buckets[i];
         while (bk) {
-            for (int s = 0; s < 2; s++) {
+            for (int s = 0; s < GBJIT_CHAIN_PREDICTOR_WAYS; s++) {
                 if (bk->b->predicted_next[s] == block) {
                     bk->b->predicted_next[s] = NULL;
                     bk->b->predicted_next_pc[s] = 0;
@@ -637,22 +645,20 @@ void gbjit_dispatcher_run_until(gbjit_dispatcher *d, u64 until) {
             prev = NULL;
         }
         if (unlikely(cpu->halted)) {
+#if GBJIT_DISPATCHER_HALT_INNER_LOOP
             /* Tight halt loop. SML and similar HALT-and-wait-for-VBlank
              * games spend most of their wall time here, and the
-             * sm83_service_interrupts call above is most of the per-iter
-             * cost. Stay inside this loop until either an IRQ is pending,
-             * the PPU's next-event deadline is reached (state machine
-             * might raise IF), or the dispatcher's cycle budget runs out.
-             * On each pass we advance cpu->cycles by 4 (the JIT's HALT
-             * cycle cost) and run the cheap-fast-path checks inline; the
-             * heavy ppu_tick + IRQ dispatch only run when one of those
-             * conditions actually fires.
+             * sm83_service_interrupts call above is most of the
+             * per-iter cost. Stay inside this loop until either an IRQ
+             * is pending, the PPU's next-event deadline is reached
+             * (state machine might raise IF), or the dispatcher's
+             * cycle budget runs out. On each pass we advance
+             * cpu->cycles by 4 (the JIT's HALT cycle cost) and run the
+             * cheap-fast-path checks inline; the heavy ppu_tick + IRQ
+             * dispatch only fire when one of those conditions hits.
              *
-             * Sync-PPU mode benefit: ppu_tick (which includes timer_tick
-             * + state machine advance) is what was being called on every
-             * outer iter via sm83_service_interrupts. Most halt iters
-             * have no state transition due — the inline deadline check
-             * skips the call until it's actually meaningful. */
+             * Compile-time gated: -DGBJIT_DISPATCHER_HALT_INNER_LOOP=0
+             * falls back to the naive "advance 4, continue" path. */
             mmu *m_halt = cpu->mmu;
             do {
                 cpu->cycles += 4;
@@ -666,6 +672,10 @@ void gbjit_dispatcher_run_until(gbjit_dispatcher *d, u64 until) {
                 }
             } while (cpu->halted && cpu->cycles < until);
             continue;
+#else
+            cpu->cycles += 4;
+            continue;
+#endif
         }
         /* EI delayed-enable: when ime_pending is set, run the next op via
          * the interpreter so that the reference path handles the ime promotion
@@ -689,18 +699,21 @@ void gbjit_dispatcher_run_until(gbjit_dispatcher *d, u64 until) {
         gbjit_block *b = NULL;
         if (likely(!d->no_cache)) {
             if (likely(prev)) {
-                /* 2-slot direct-mapped predictor — JR cc / JP cc that
-                 * alternates target hits one of the two cached entries
-                 * every time, where a 1-slot cache loses every other
-                 * lookup. Slot 0 is checked first (it's the more recent
-                 * insertion on streams where the two targets alternate). */
-                if (likely(prev->predicted_next_pc[0] == cpu->pc
-                           && prev->predicted_next[0])) {
-                    b = prev->predicted_next[0];
-                    GBJIT_STAT_INC(d, chain_hits);
-                } else if (prev->predicted_next_pc[1] == cpu->pc
-                           && prev->predicted_next[1]) {
-                    b = prev->predicted_next[1];
+                /* N-way predicted-next cache. The first slot is the
+                 * hot path; on a typical conditional branch alternating
+                 * between two successors, the post-update logic below
+                 * keeps the most-recently-taken target in slot 0, so
+                 * the common case is just one compare. */
+                bool hit = false;
+                for (int _i = 0; _i < GBJIT_CHAIN_PREDICTOR_WAYS; _i++) {
+                    if (prev->predicted_next_pc[_i] == cpu->pc
+                            && prev->predicted_next[_i]) {
+                        b = prev->predicted_next[_i];
+                        hit = true;
+                        break;
+                    }
+                }
+                if (likely(hit)) {
                     GBJIT_STAT_INC(d, chain_hits);
                 } else {
                     b = find_block(d, cpu->pc);
@@ -750,21 +763,27 @@ void gbjit_dispatcher_run_until(gbjit_dispatcher *d, u64 until) {
             }
         }
 
-        /* Record the successor link on the previous block (regardless of
-         * cache-hit status, so a stale link doesn't stick). Skip in
-         * no_cache mode — the previous block has already been overwritten.
-         * If the target already lives in one of the two slots, leave
-         * everything alone; otherwise overwrite the round-robin victim. */
+        /* Record the successor link on the previous block (regardless
+         * of cache-hit status, so a stale link doesn't stick). Skip in
+         * no_cache mode — the previous block has already been
+         * overwritten. If the target already lives in one of the slots,
+         * leave everything alone; otherwise overwrite the round-robin
+         * victim. */
         if (!d->no_cache && prev) {
-            bool present = (prev->predicted_next_pc[0] == cpu->pc
-                            && prev->predicted_next[0] == b)
-                        || (prev->predicted_next_pc[1] == cpu->pc
-                            && prev->predicted_next[1] == b);
+            bool present = false;
+            for (int _i = 0; _i < GBJIT_CHAIN_PREDICTOR_WAYS; _i++) {
+                if (prev->predicted_next_pc[_i] == cpu->pc
+                        && prev->predicted_next[_i] == b) {
+                    present = true;
+                    break;
+                }
+            }
             if (!present) {
-                u8 v = (u8)(prev->predicted_next_victim & 1u);
+                u8 v = (u8)(prev->predicted_next_victim
+                            % GBJIT_CHAIN_PREDICTOR_WAYS);
                 prev->predicted_next[v] = b;
                 prev->predicted_next_pc[v] = cpu->pc;
-                prev->predicted_next_victim = (u8)(v ^ 1u);
+                prev->predicted_next_victim = (u8)(v + 1u);
             }
         }
 

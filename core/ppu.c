@@ -1,6 +1,9 @@
 #include "ppu.h"
 #include "cpu_state.h"
 #include "memory.h"
+#if GBJIT_FRAMEBUFFER_DOUBLE_BUFFER
+#include <string.h>   /* memcpy for back→front swap on frame complete */
+#endif
 
 /* PPU state machine — adapted from CrankBoy's peanut_gb (libs/peanut_gb_core.h,
  * MIT licensed; original work copyright Mahyar Koshkouei 2018-2022 and the
@@ -206,7 +209,11 @@ static inline u8 fetch_tile_pixel(const u8 *vram, u16 tile_addr_vram_rel,
  * LCD_HBLANK; reads OAM, VRAM, BGP/OBP0/OBP1, LCDC, SCY/SCX, WY/WX
  * which must reflect the final state for this line. */
 static void ppu_draw_line(mmu *m, u8 ly) {
+#if GBJIT_FRAMEBUFFER_DOUBLE_BUFFER
+    u8 *line = &m->framebuffer_back[(u32)ly * 160];
+#else
     u8 *line = &m->framebuffer[(u32)ly * 160];
+#endif
     u8 lcdc = m->io[LCDC_REG];
 
     /* DMG: if BG_ENABLE is clear, BG (and window) render as color 0. We
@@ -519,8 +526,16 @@ void ppu_tick(struct cpu_state *cpu) {
 #else
                     m->io[IF_REG] |= INT_VBLANK_BIT;
 #endif
-                    /* Frame complete — bump the seq so display tasks
-                     * waiting on it can pull the freshly-drawn frame. */
+                    /* Frame complete. With double-buffering enabled
+                     * we publish the back buffer to the front first,
+                     * then bump frame_seq — readers that gate on
+                     * frame_seq only ever see fully-composed frames.
+                     * Without it (default), ppu_draw_line wrote
+                     * straight into framebuffer above. */
+#if GBJIT_FRAMEBUFFER_DOUBLE_BUFFER
+                    memcpy(m->framebuffer, m->framebuffer_back,
+                           sizeof(m->framebuffer));
+#endif
                     m->frame_seq++;
                     /* Wall-clock frame pacer (60 fps lock). Board
                      * firmwares set this to busy-wait to the next
