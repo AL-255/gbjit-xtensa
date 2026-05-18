@@ -87,11 +87,15 @@ void app_main(void) {
      * VBlank IRQ wakes the GB CPU. The 4 G-cycle budget here is just
      * "run effectively forever" — at 4 MHz DMG that's ~34 minutes
      * simulated, vastly longer than we'll typically watch the OLED. */
-    gbjit_dispatcher disp;
+    static gbjit_dispatcher disp;
     if (!gbjit_dispatcher_init(&disp, &s_cpu)) {
         ESP_LOGE(TAG, "dispatcher_init failed");
         return;
     }
+    /* Make the dispatcher reachable from oled_task so the per-second
+     * log can dump JIT counters (profiling build only). */
+    extern gbjit_dispatcher *g_dispatcher;
+    g_dispatcher = &disp;
     /* Disable the static-successor prefetcher. The cache-size sweep
      * (benchmark/results/cache_sweep.csv) found that at the 64 KB
      * default arena the no-prefetch path is 11 % faster than the

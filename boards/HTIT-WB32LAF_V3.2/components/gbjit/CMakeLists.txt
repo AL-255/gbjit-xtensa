@@ -37,6 +37,13 @@ target_compile_options(${COMPONENT_LIB} PRIVATE -Wall -Wextra -Wno-shadow)
 # include/gbjit_debug.h).
 target_compile_options(${COMPONENT_LIB} PRIVATE -O3)
 
+# Profiling mode: enable the dispatcher's stat counters so the board's
+# oled_task can log them once a second. The increments are cheap (a
+# few extra u64 stores per block call) and we need them to identify
+# bottlenecks; flip back off (drop the DEBUG=1 line) once the data is
+# in hand.
+target_compile_definitions(${COMPONENT_LIB} PRIVATE DEBUG=1)
+
 # Move ppu_tick onto Core 1 by default. See core/ppu_thread.h.
 if(NOT DEFINED GBJIT_PPU_ASYNC)
     set(GBJIT_PPU_ASYNC 1)

@@ -6,6 +6,11 @@
 
 #include "cpu_state.h"
 #include "memory.h"
+#include "dispatcher.h"
+
+/* Profiling mode: app_main.c stashes a pointer to the live dispatcher
+ * here so we can include its counters in the per-second log. */
+gbjit_dispatcher *g_dispatcher = NULL;
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -117,9 +122,6 @@ static void oled_task(void *arg) {
     ssd1306_clear();
 
     uint32_t last_seq = 0;
-#ifdef DEBUG
-    uint32_t frames_pushed = 0;
-#endif
 
     /* JIT-rendered fps = how fast the PPU completes frames, sampled
      * over a sliding 1-second window of mmu->frame_seq increments.
@@ -130,10 +132,8 @@ static void oled_task(void *arg) {
     uint32_t fps_window_seq_start = s_cpu->mmu->frame_seq;
     int current_fps = 0;
 
-#ifdef DEBUG
     uint32_t next_log_ms = 1000;
     uint32_t boot_ms = (uint32_t)(esp_log_timestamp());
-#endif
     while (1) {
         uint32_t cur = s_cpu->mmu->frame_seq;
 
@@ -158,23 +158,35 @@ static void oled_task(void *arg) {
              * readout. */
             draw_fps(s_page_buf, current_fps);
             ssd1306_blit(s_page_buf);
-#ifdef DEBUG
-            frames_pushed++;
-#endif
         } else {
             vTaskDelay(pdMS_TO_TICKS(4));
         }
-#ifdef DEBUG
         uint32_t now_ms = (uint32_t)(esp_log_timestamp());
         if (now_ms - boot_ms >= next_log_ms) {
-            ESP_LOGI(TAG, "jit_fps=%d  pushed=%lu  ppu_seq=%lu  pc=0x%04X",
-                     current_fps,
-                     (unsigned long)frames_pushed,
-                     (unsigned long)cur,
-                     (unsigned)s_cpu->pc);
+            if (g_dispatcher) {
+                /* Snapshot counters, then compute deltas over the past
+                 * second so we see RATES, not running totals. */
+                static uint64_t last_compiled, last_executed;
+                static uint64_t last_chain_hits, last_chain_misses;
+                uint64_t bc = g_dispatcher->blocks_compiled;
+                uint64_t be = g_dispatcher->blocks_executed;
+                uint64_t ch = g_dispatcher->chain_hits;
+                uint64_t cm = g_dispatcher->chain_misses;
+                ESP_LOGI(TAG, "fps=%d ppu=%lu pc=%04X | exec/s=%lu compile/s=%lu hit/s=%lu miss/s=%lu",
+                         current_fps,
+                         (unsigned long)cur, (unsigned)s_cpu->pc,
+                         (unsigned long)(be - last_executed),
+                         (unsigned long)(bc - last_compiled),
+                         (unsigned long)(ch - last_chain_hits),
+                         (unsigned long)(cm - last_chain_misses));
+                last_compiled = bc; last_executed = be;
+                last_chain_hits = ch; last_chain_misses = cm;
+            } else {
+                ESP_LOGI(TAG, "fps=%d ppu=%lu pc=%04X", current_fps,
+                         (unsigned long)cur, (unsigned)s_cpu->pc);
+            }
             next_log_ms += 1000;
         }
-#endif
     }
 }
 
