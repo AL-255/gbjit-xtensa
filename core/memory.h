@@ -18,7 +18,7 @@
 
 #define ROM_SIZE_MAX (256u * 1024u)
 #define ROM_BANK_SIZE (16u * 1024u)
-#define ROM_DEFAULT_BYTES (32u * 1024u)  /* allocated by mmu_init */
+#define ROM_DEFAULT_BYTES (32u * 1024u)  /* allocated by gb_mmu_init */
 #define VRAM_SIZE  (8u  * 1024u)
 #define WRAM_SIZE  (8u  * 1024u)
 #define OAM_SIZE   160u
@@ -31,7 +31,7 @@ typedef enum {
 } mbc_type;
 
 typedef struct mmu {
-    u8 *rom;            /* heap-backed cart ROM. mmu_init allocates */
+    u8 *rom;            /* heap-backed cart ROM. gb_mmu_init allocates */
                         /* ROM_DEFAULT_BYTES; mmu_load_rom resizes to */
                         /* the cart's actual rounded-up bank count. */
     u32 rom_capacity;   /* bytes actually allocated for *rom */
@@ -72,7 +72,7 @@ typedef struct mmu {
     void *serial_sink_ctx;
 } mmu;
 
-void mmu_init(mmu *m);
+void gb_mmu_init(mmu *m);
 void mmu_destroy(mmu *m);   /* free heap-allocated ROM buffer */
 bool mmu_load_rom(mmu *m, const u8 *data, size_t len);
 

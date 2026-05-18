@@ -33,7 +33,7 @@ static void rom_free(void *p) {
 #endif
 }
 
-void mmu_init(mmu *m) {
+void gb_mmu_init(mmu *m) {
     /* Free any previously-allocated heap rom first — otherwise re-init'ing
      * the same mmu (the JIT warm-pass harness does this between passes)
      * leaks the buffer and we eventually exhaust internal SRAM. Safe on

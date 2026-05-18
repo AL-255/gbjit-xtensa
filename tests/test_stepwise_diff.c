@@ -54,8 +54,8 @@ int main(int argc, char **argv) {
 
     static mmu m_i, m_j;
     static cpu_state cpu_i, cpu_j;
-    mmu_init(&m_i); mmu_load_rom(&m_i, rom, rom_len); cpu_reset(&cpu_i, &m_i);
-    mmu_init(&m_j); mmu_load_rom(&m_j, rom, rom_len); cpu_reset(&cpu_j, &m_j);
+    gb_mmu_init(&m_i); mmu_load_rom(&m_i, rom, rom_len); cpu_reset(&cpu_i, &m_i);
+    gb_mmu_init(&m_j); mmu_load_rom(&m_j, rom, rom_len); cpu_reset(&cpu_j, &m_j);
 
     gbjit_dispatcher d;
     if (!gbjit_dispatcher_init(&d, &cpu_j)) { fprintf(stderr, "jit init fail\n"); return 3; }

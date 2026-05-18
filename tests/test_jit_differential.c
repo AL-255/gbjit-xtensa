@@ -25,7 +25,7 @@ static int failed = 0;
 } while (0)
 
 static void run_interp(const u8 *prog, size_t prog_len, cpu_state *out_cpu, mmu *out_mmu) {
-    mmu_init(out_mmu);
+    gb_mmu_init(out_mmu);
     memcpy(out_mmu->rom + 0x0100, prog, prog_len);
     cpu_reset(out_cpu, out_mmu);
     int steps = 0;
@@ -33,7 +33,7 @@ static void run_interp(const u8 *prog, size_t prog_len, cpu_state *out_cpu, mmu 
 }
 
 static void run_jit(const u8 *prog, size_t prog_len, cpu_state *out_cpu, mmu *out_mmu) {
-    mmu_init(out_mmu);
+    gb_mmu_init(out_mmu);
     memcpy(out_mmu->rom + 0x0100, prog, prog_len);
     cpu_reset(out_cpu, out_mmu);
 

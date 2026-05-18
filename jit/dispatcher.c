@@ -24,6 +24,8 @@
 
 #if defined(ESP_PLATFORM)
 #include "esp_log.h"
+#include "sdkconfig.h"
+#if defined(CONFIG_IDF_TARGET_ESP32S3)
 /* IDF's IRAM_BSS_ATTR macro is a no-op on ESP32-S3 (it's gated on the
  * original ESP32's 8-bit-IRAM-access kconfig). To force genuine IRAM
  * placement we name the section the way IDF's linker fragments expect:
@@ -35,6 +37,17 @@
  * execution in qemu and per the TRM uses a less-optimised pipe on
  * real silicon. */
 #define GBJIT_IRAM_BSS __attribute__((section(".iram.bss")))
+#define GBJIT_STATIC_ARENA 1
+#else
+/* Plain ESP32 (LX6) doesn't support byte writes to IRAM from the data
+ * path without the CONFIG_ESP32_IRAM_AS_8BIT_ACCESSIBLE_MEMORY trap
+ * handler, which is dramatically slow. heap_caps_malloc(MALLOC_CAP_EXEC)
+ * returns memory from a special D-bus-aliased IRAM pool that DOES
+ * support byte writes — use that instead. The runtime cost is one
+ * malloc at boot. */
+#include "esp_heap_caps.h"
+#define GBJIT_HEAP_EXEC_ARENA 1
+#endif
 #endif
 
 /* JIT exec arena. Statically allocated — no heap, no fragmentation, no
@@ -66,12 +79,15 @@
 #endif
 #define GBJIT_ARENA_BYTES (GBJIT_ARENA_KB * 1024u)
 
-#if defined(ESP_PLATFORM)
+#if defined(GBJIT_STATIC_ARENA)
 GBJIT_IRAM_BSS __attribute__((aligned(4)))
 static u8 s_jit_arena[GBJIT_ARENA_BYTES];
 #elif defined(HAVE_MMAP_EXEC)
 __attribute__((aligned(4096)))
 static u8 s_jit_arena[GBJIT_ARENA_BYTES];
+#elif defined(GBJIT_HEAP_EXEC_ARENA)
+/* Allocated at first dispatcher_init via heap_caps_malloc(MALLOC_CAP_EXEC). */
+static u8 *s_jit_arena = NULL;
 #else
 __attribute__((aligned(64)))
 static u8 s_jit_arena[GBJIT_ARENA_BYTES];
@@ -87,11 +103,38 @@ static u8 s_jit_arena[GBJIT_ARENA_BYTES];
 #define HOST_STACK_BASE 0x80000000u
 #define HOST_STACK_TOP  0x80000100u  /* a1 init points here */
 
-/* Make the static arena executable. On ESP the section attribute already
- * placed it in RWX IRAM. On Linux we need to mprotect — but only once per
- * process lifetime, so cache the success state. */
+/* Make the static arena executable. On ESP32-S3 the section attribute
+ * already placed it in RWX IRAM. On plain ESP32 (LX6) the buffer is
+ * heap_caps_malloc'd from MALLOC_CAP_EXEC pool. On Linux we mprotect a
+ * BSS array. Cache the result — only happens once. */
 static bool ensure_arena_exec(void) {
-#if defined(HAVE_MMAP_EXEC)
+#if defined(GBJIT_HEAP_EXEC_ARENA)
+    if (s_jit_arena) return true;
+    /* Plain ESP32 has two kinds of executable internal SRAM: pure IRAM
+     * (0x4008xxxx region) which only accepts 32-bit-aligned word writes
+     * from the data path, and D/IRAM (0x3FFExxxx region) which is mapped
+     * to both buses and accepts byte writes. Our codecache writes
+     * Xtensa instructions byte-by-byte (3-byte narrow / 24-bit ops), so
+     * we MUST land in D/IRAM. MALLOC_CAP_8BIT forces the allocator to
+     * pick a region that supports unaligned byte stores. Print the
+     * available cap sizes so a NULL return is diagnosable. */
+    ESP_LOGI("gbjit_jit", "heap probe: EXEC|8BIT largest=%u KB, EXEC|32BIT largest=%u KB",
+             (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_EXEC|MALLOC_CAP_8BIT) / 1024u),
+             (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_EXEC|MALLOC_CAP_32BIT) / 1024u));
+    s_jit_arena = (u8 *)heap_caps_malloc(GBJIT_ARENA_BYTES,
+                                          MALLOC_CAP_EXEC | MALLOC_CAP_8BIT);
+    if (!s_jit_arena) {
+        /* Fall back to plain EXEC; codecache_finalize is a no-op so this
+         * will run from pure IRAM only if codegen avoids byte writes,
+         * which today it doesn't — but the diagnostic is worth keeping. */
+        s_jit_arena = (u8 *)heap_caps_malloc(GBJIT_ARENA_BYTES, MALLOC_CAP_EXEC);
+        if (s_jit_arena) {
+            ESP_LOGW("gbjit_jit", "exec arena landed in pure IRAM at %p — byte writes WILL fault",
+                     s_jit_arena);
+        }
+    }
+    return s_jit_arena != NULL;
+#elif defined(HAVE_MMAP_EXEC)
     static bool done = false;
     if (done) return true;
     long pagesz = sysconf(_SC_PAGESIZE);
@@ -169,7 +212,12 @@ bool gbjit_dispatcher_init(gbjit_dispatcher *d, cpu_state *cpu) {
     d->arena     = s_jit_arena;
     d->arena_cap = GBJIT_ARENA_BYTES;
 #if defined(ESP_PLATFORM)
-    ESP_LOGI("gbjit_jit", "exec arena: static IRAM, %u KB at %p",
+    ESP_LOGI("gbjit_jit", "exec arena: %s, %u KB at %p",
+#if defined(GBJIT_STATIC_ARENA)
+             "static IRAM",
+#else
+             "heap MALLOC_CAP_EXEC|8BIT",
+#endif
              (unsigned)GBJIT_ARENA_KB, s_jit_arena);
 #endif
     codecache_init(&d->cc, (u8 *)d->arena, d->arena_cap);

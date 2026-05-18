@@ -1,0 +1,33 @@
+# GBJIT-Xtensa target defaults — plain ESP32 (D0WD-V3 et al.).
+CONFIG_IDF_TARGET="esp32"
+
+# Plain ESP32 (LX6) IRAM normally rejects byte writes from the data path
+# — only 32-bit aligned word stores succeed. ESP32_IRAM_AS_8BIT_ACCESSIBLE_MEMORY
+# wires an exception handler that traps and emulates byte/halfword IRAM
+# stores so our JIT codecache can write Xtensa instructions byte-by-byte
+# into the exec arena. Slow per-byte during compile (~167 CPU cycles per
+# unaligned access), but the executed JIT code never modifies itself so
+# runtime stays fast.
+#
+# Requires single-core mode (the exception handler isn't multi-core safe).
+# FreeRTOS unicore = run FreeRTOS only on CPU0, which auto-selects
+# ESP_SYSTEM_SINGLE_CORE_MODE. The second core sits idle — fine for our
+# single-threaded benchmark.
+CONFIG_FREERTOS_UNICORE=y
+CONFIG_ESP32_IRAM_AS_8BIT_ACCESSIBLE_MEMORY=y
+
+# Console on UART0 — what qemu-system-xtensa wires to stdio via -serial.
+CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+
+# Release: -O2.
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+
+# IRAM heap is what the JIT codecache uses; keep memprot off so the EXEC
+# allocation works under qemu.
+CONFIG_ESP_SYSTEM_MEMPROT_FEATURE=n
+
+# Disable both watchdogs — the JIT busy-loop has no yield points.
+CONFIG_ESP_INT_WDT=n
+CONFIG_ESP_TASK_WDT_EN=n
+
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192

@@ -21,7 +21,7 @@ static int failed = 0;
 } while (0)
 
 static void setup(cpu_state *cpu, mmu *m, const u8 *prog, size_t prog_len) {
-    mmu_init(m);
+    gb_mmu_init(m);
     memcpy(m->rom + 0x0100, prog, prog_len);
     cpu_reset(cpu, m);
 }

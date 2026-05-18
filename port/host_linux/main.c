@@ -68,7 +68,7 @@ int main(int argc, char **argv) {
     }
 
     static mmu m;
-    mmu_init(&m);
+    gb_mmu_init(&m);
     if (!mmu_load_rom(&m, rom, rom_len)) {
         fprintf(stderr, "rom too large or invalid\n");
         return 3;

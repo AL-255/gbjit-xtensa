@@ -48,7 +48,7 @@ int main(void) {
     };
 
     static mmu m;
-    mmu_init(&m);
+    gb_mmu_init(&m);
     /* Place program at 0x0100. */
     memcpy(m.rom + 0x0100, prog, sizeof(prog));
     m.serial_sink = on_serial;
