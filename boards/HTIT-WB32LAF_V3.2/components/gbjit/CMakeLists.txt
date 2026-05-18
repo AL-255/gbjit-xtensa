@@ -44,9 +44,33 @@ target_compile_options(${COMPONENT_LIB} PRIVATE -O3)
 # in hand.
 target_compile_definitions(${COMPONENT_LIB} PRIVATE DEBUG=1)
 
-# Move ppu_tick onto Core 1 by default. See core/ppu_thread.h.
+# PPU placement.
+#
+# `async` ran ppu_tick on Core 1 (pinned FreeRTOS task) so Core 0's
+# dispatcher kept an uncontested busy loop, but the BG-rendering path
+# reads SCX/SCY/LCDC/BGP from mmu->io at draw time, while Core 0 writes
+# those bytes from CPU code. The two cores see each other's stores
+# without a timing relationship to cpu->cycles — for any IO reg that
+# the PPU consumes per-scanline, that's a real race: Core 1 can draw
+# frame F's BG using SCX written by Core 0 for frame F+1 (or vice
+# versa), producing visibly broken BG scrolling. Sprites are immune
+# because OAM is written atomically by the DMA copy in mmu_write8
+# during the game's VBlank handler — every byte lands on Core 0 before
+# Core 1's next OAM-scan.
+#
+# Sync mode runs ppu_tick on Core 0 inside sm83_service_interrupts —
+# the same call site the reference interpreter uses — so IO reads and
+# the cpu->cycles that triggered them happen on the same core in
+# program order. Throughput is lower (PPU work now competes with the
+# dispatcher loop on Core 0), but SML in HALT spends most cycles in
+# the halt loop anyway, so the hit is modest.
+#
+# To go back to async: set GBJIT_PPU_ASYNC=1 in the cmake cache (or in
+# the calling project file). The cross-core race is unsolved upstream
+# — see core/ppu.c for the IO regs that would need cycle-stamped
+# write queues before async is safe.
 if(NOT DEFINED GBJIT_PPU_ASYNC)
-    set(GBJIT_PPU_ASYNC 1)
+    set(GBJIT_PPU_ASYNC 0)
 endif()
 if(GBJIT_PPU_ASYNC)
     target_compile_definitions(${COMPONENT_LIB} PRIVATE GBJIT_PPU_ASYNC=1)
