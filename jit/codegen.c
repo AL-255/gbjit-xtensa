@@ -1375,16 +1375,20 @@ gbjit_block *gbjit_compile_block(codecache *cc, cpu_state *cpu, u16 pc_start,
     memset(base, 0, total);
 
     /* Literal pool layout: one u32 per literal_id at fixed offsets, followed
-     * by MAX_EXTRA_LITERALS slots reserved for dynamic per-access literals. */
+     * by MAX_EXTRA_LITERALS slots reserved for dynamic per-access literals.
+     *
+     * Use a single 32-bit store rather than four byte stores: some
+     * ESP32-S3 IDF builds (notably v5.4.x) place .iram.bss in a segment
+     * that only accepts 32-bit-aligned word accesses — byte stores there
+     * fault with LoadStoreError. `wp` is always a multiple of 4 in this
+     * loop (it starts at 0 and increments by 4) and `base` itself is 4-
+     * byte aligned by codecache_alloc, so the cast is well-defined. */
     u32 lit_off[LITERAL_COUNT];
     u32 wp = 0;
     for (literal_id l = 0; l < LITERAL_COUNT; l++) {
         lit_off[l] = wp;
         u32 v = helper_addr(l, user);
-        base[wp + 0] = (u8)(v & 0xFF);
-        base[wp + 1] = (u8)((v >> 8) & 0xFF);
-        base[wp + 2] = (u8)((v >> 16) & 0xFF);
-        base[wp + 3] = (u8)((v >> 24) & 0xFF);
+        *(u32 *)(base + wp) = v;
         wp += 4;
     }
     lit_ctx L = { base, wp, wp + (u32)(MAX_EXTRA_LITERALS * 4) };
