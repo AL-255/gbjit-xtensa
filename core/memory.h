@@ -56,6 +56,16 @@ typedef struct mmu {
     u8       rom_bank;
     u16      rom_banks;
 
+    /* Set by mmu_write8 whenever MBC bank-control writes change the bank
+     * currently mapped at $4000..$7FFF. The JIT dispatcher polls this
+     * flag before entering each block and invalidates any cached blocks
+     * compiled from the banked region — without that, a cached block can
+     * execute stale immediates / branch targets from the previous bank
+     * (SML's main loop diverges at PC=$7FF3 ~668k cycles in). The
+     * interpreter ignores this flag (it always re-reads through
+     * mmu_read8). */
+    u8       rom_bank_dirty;
+
     /* Back-pointer to the CPU. ppu_tick uses cpu->cycles as its time base
      * and writes back into io[$44]/io[$41]; left NULL the PPU model is
      * inert and reads return the raw IO bytes. */

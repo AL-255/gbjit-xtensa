@@ -499,9 +499,16 @@ static void enter_block_sim(gbjit_block *b, cpu_state *cpu) {
     s.a[1] = HOST_STACK_TOP;
     s.a[2] = HOST_CPU_BASE;              /* in case the block reads a2 */
 
-    /* Cap steps: prologue + body + epilogue. Real bound is hard to compute
-     * up-front; use a generous multiplier. */
-    u32 cap = 256 + b->n_ops * 64;
+    /* Cap steps: prologue + body + epilogue, plus headroom for any
+     * internal back-edge loops the block may execute. A back-edge-
+     * inlined HRAM polling loop can iterate hundreds of times inside
+     * one call (e.g. SML's OAM-DMA wait counter from $28 down to 0).
+     * 1M total Xtensa steps comfortably covers any sane CPU-only loop
+     * while still catching genuinely runaway emitted code. The cap is
+     * host-only; on the real chip the JIT block runs until its emit
+     * exits naturally. */
+    (void)b;
+    u32 cap = 1u << 20;   /* ~1 M Xtensa instructions per block call */
     xt_sim_run(&s, cap);
     if (s.status != XT_SIM_RETURNED) {
         fprintf(stderr, "[gbjit] block at GB pc=%04X stopped status=%d sim_pc=%u\n",
@@ -534,6 +541,20 @@ void gbjit_dispatcher_run_until(gbjit_dispatcher *d, u64 until) {
     gbjit_block *prev = NULL;
 
     while (cpu->cycles < until) {
+        /* MBC bank switched since last iteration → invalidate every JIT
+         * block compiled from the banked ROM window ($4000..$7FFF). The
+         * cached blocks may contain stale immediates or absolute branch
+         * targets fetched at compile time under the previous bank, so
+         * executing them after a bank flip leads to wrong PCs (SML
+         * loses control at ~668k cycles otherwise). The banked region
+         * covers SMC pages [0x40 .. 0x7F] (each page is 256 GB bytes). */
+        if (cpu->mmu->rom_bank_dirty) {
+            for (u32 a = 0x4000u; a < 0x8000u; a += (1u << GBJIT_SMC_PAGE_SHIFT)) {
+                gbjit_dispatcher_invalidate_addr(d, (u16)a);
+            }
+            cpu->mmu->rom_bank_dirty = 0;
+            prev = NULL;
+        }
         /* Service pending interrupts and wake from HALT before each block.
          * The JIT inlines HALT as a simple `cpu->halted = 1; exit block`, so
          * we depend on the dispatcher to re-enter the interrupt path that

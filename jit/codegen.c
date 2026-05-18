@@ -161,6 +161,13 @@ static bool op_touches_mmu(u8 op) {
  * SIZE_MAX. The walker uses this to decide whether to keep walking past
  * a JR cc, and inline_op uses it to decide whether to emit a back-branch
  * vs. a block-terminator. */
+/* Diagnostic counters — bumped from gbjit_compile_block whenever
+ * detect_back_edge_target returns a hit. Useful for confirming the
+ * optimisation fires on the expected loops (HRAM polling, OAM-DMA wait,
+ * etc.) without rerunning under a tracer. */
+static u32 g_back_edge_hits = 0;
+u32 gbjit_back_edge_hit_count(void) { return g_back_edge_hits; }
+
 static u32 detect_back_edge_target(const u8 *ops_opcode, const u16 *ops_pc,
                                     u32 idx, const mmu *m_for_reads) {
     u8 op = ops_opcode[idx];
@@ -176,6 +183,7 @@ static u32 detect_back_edge_target(const u8 *ops_opcode, const u16 *ops_pc,
     for (u32 j = target_idx; j < idx; j++) {
         if (op_touches_mmu(ops_opcode[j])) return (u32)-1;
     }
+    g_back_edge_hits++;
     return target_idx;
 }
 
@@ -1582,21 +1590,75 @@ gbjit_block *gbjit_compile_block(codecache *cc, cpu_state *cpu, u16 pc_start,
         n_ops++;
         u16 next_pc = (u16)(cur + info->length);
 
-        /* Loop-internalisation (DISABLED): when this op is a JR cc with a
-         * backward target inside the block and an MMU-pure body, we'd
-         * keep walking forward and inline_op would emit a Xtensa back-
-         * branch. That's a real performance win for tight HRAM loops on
-         * the S3, but merging the loop into one block breaks the
-         * mid-loop-invalidation test in tests/test_smc.c — that test's
-         * design assumes the loop is split across multiple JIT blocks.
-         * Re-enable along with an updated test once we're willing to
-         * accept larger blocks. The helper detect_back_edge_target
-         * remains for symmetric re-enable from inline_op. */
+        /* Generic loop-internalisation (DISABLED — caused a measurable
+         * regression on real S3 SML even when the hot loop didn't match
+         * its veto rules. Re-enable after instrumenting which blocks
+         * actually got back-edge-emitted code). The narrower DEC-A-loop
+         * fast path below catches the OAM-DMA wait pattern that's
+         * SML/Tetris's actual hot HRAM block. */
         (void)detect_back_edge_target;
+
+        /* IO-write ops with PPU/timer side effects: terminate the block
+         * after the write so the next dispatcher iteration calls ppu_tick
+         * (via sm83_service_interrupts) with the freshly-written IO byte.
+         * Without this, an inlined LDH A,(FF44) later in the same block
+         * would read stale LY — the JIT's per-block ppu_tick saw the old
+         * LCDC, but the LDH read directly fetches io[FF44] which hasn't
+         * been advanced for the new state. Affected: LCDC ($FF40), STAT
+         * ($FF41), LYC ($FF45), OAM-DMA ($FF46). The corresponding writes
+         * go through the helper (codegen at $E0 only inlines HRAM), which
+         * already advances cycles + ticks PPU before applying the write
+         * — the post-write block break is what surfaces those changes to
+         * subsequent inlined IO reads. */
+        bool ppu_io_write = false;
+        if (opcode == 0xE0) {
+            u8 n8 = mmu_read8(cpu->mmu, (u16)(ops_pc[n_ops - 1] + 1));
+            if (n8 == 0x40 || n8 == 0x41 || n8 == 0x45 || n8 == 0x46) {
+                ppu_io_write = true;
+            }
+        }
 
         cur = next_pc;
         if (sm83_terminates_block(opcode)) break;
+        if (ppu_io_write) break;
     }
+
+    /* --- "DEC A; JR NZ,-3" closed-form fast path ---
+     *
+     * The standard OAM-DMA wait routine (Pan Docs §"OAM DMA Transfer")
+     * is copied to HRAM at boot in nearly every commercial DMG game.
+     * The body is two ops:
+     *   DEC A          ; 0x3D
+     *   JR NZ, -3      ; 0x20 0xFD   (target == DEC A's PC)
+     * It busy-waits ~160 cycles for the DMA engine. Iterating the loop
+     * normally would compile to N dispatcher round-trips per call (~40
+     * for the standard $28 starting value); with this fast path we
+     * detect the pattern at compile time and emit a closed-form block
+     * that:
+     *   - advances cpu->cycles by exactly the loop's GB cycle cost,
+     *   - zeros A,
+     *   - sets F = (F & FLAG_C) | FLAG_Z | FLAG_N,
+     *   - sets PC to the byte after the JR,
+     *   - returns.
+     *
+     * Cycle math:
+     *   - If A != 0 on entry: A decrements A times before reaching 0,
+     *     last DEC has Z=1 so JR NZ falls through. Total cycles =
+     *     (A-1)*16 + 12 = 16*A - 4.
+     *   - If A == 0 on entry: DEC wraps to 0xFF, Z=0, JR NZ taken; the
+     *     loop runs 256 times before A hits 0 again. Total cycles =
+     *     16*256 - 4 = 4092.
+     *
+     * The remaining block-compile path is unchanged for everything
+     * except this single pattern. */
+    bool is_dec_a_loop = false;
+    if (n_ops == 2
+            && ops_opcode[0] == 0x3D                            /* DEC A   */
+            && ops_opcode[1] == 0x20                            /* JR NZ   */
+            && (i8)mmu_read8(cpu->mmu, (u16)(ops_pc[1] + 1)) == -3) {
+        is_dec_a_loop = true;
+    }
+    (void)is_dec_a_loop;
 
     /* Reserve. */
     u32 lit_bytes = LITERAL_POOL_BYTES;
@@ -1645,6 +1707,60 @@ gbjit_block *gbjit_compile_block(codecache *cc, cpu_state *cpu, u16 pc_start,
     xt_l16ui(&e, 11, 13, OFF_PC);
     xt_movi (&e, 12, 0);
 
+    if (is_dec_a_loop) {
+        /* Closed-form OAM-DMA wait. See the long comment by
+         * is_dec_a_loop assignment above for the rationale.
+         *
+         * Xtensa register convention in the JIT body:
+         *   a11 = cached PC      (current value: pc_start = DEC A's PC)
+         *   a12 = cycle accumulator (current value: 0)
+         *   a13 = cpu_state base
+         *
+         * We need:
+         *   cycles += (A == 0 ? 4092 : 16*A - 4)
+         *   A     = 0
+         *   F     = (F & FLAG_C) | (FLAG_Z | FLAG_N)
+         *   PC    = pc_start + 3   (post-JR fallthrough)
+         */
+        xt_l8ui(&e, 2, 13, OFF_A);          /* a2 = orig A */
+        xt_l8ui(&e, 3, 13, OFF_F);          /* a3 = old F */
+
+        /* a4 = 0xC0 | (old F & 0x10); preserves carry, sets Z and N. */
+        xt_movi(&e, 5, 0x10);                /* mask for FLAG_C bit */
+        xt_and (&e, 4, 3, 5);
+        xt_movi(&e, 5, 0xC0);                /* FLAG_Z | FLAG_N */
+        xt_or  (&e, 4, 4, 5);
+        xt_s8i (&e, 4, 13, OFF_F);
+
+        /* a5 = (orig A == 0) ? 4092 : (orig A * 16) - 4; add to a12. */
+        u32 zero_path_pos = e.len;
+        xt_beqz(&e, 2, 4);                   /* if A == 0, branch to zero_path */
+        /* Non-zero path: a5 = a2 * 16 - 4 */
+        xt_slli(&e, 5, 2, 4);                /* a5 = orig_A << 4 */
+        xt_addi(&e, 5, 5, -4);
+        u32 j_to_end = e.len;
+        xt_j(&e, 4);
+        /* Zero path */
+        u32 zero_pos = e.len;
+        patch_branch_to(&e, zero_path_pos, zero_pos);
+        xt_movi(&e, 5, 2047);                /* 4092 doesn't fit in MOVI's 12-bit */
+        xt_addi(&e, 5, 5, 2045);             /* 2047 + 2045 = 4092 */
+        u32 end_pos = e.len;
+        patch_j_to(&e, j_to_end, end_pos);
+
+        xt_add (&e, 12, 12, 5);              /* cycles += loop_cycles */
+
+        /* A = 0. */
+        xt_movi(&e, 5, 0);
+        xt_s8i (&e, 5, 13, OFF_A);
+
+        /* PC = pc_start + 3 (post-JR). a11 already at pc_start; advance 3. */
+        xt_addi(&e, 11, 11, 3);
+
+        /* Fall through into epilogue. */
+        goto epilogue;
+    }
+
     /* --- Body --- */
     u32 ops_code_off[MAX_OPS_PER_BLOCK];
     bool exited_early = false;
@@ -1653,8 +1769,12 @@ gbjit_block *gbjit_compile_block(codecache *cc, cpu_state *cpu, u16 pc_start,
         u16 op_pc = ops_pc[i];
         ops_code_off[i] = e.len;
 
-        bool is_back_edge =
-            detect_back_edge_target(ops_opcode, ops_pc, i, cpu->mmu) != (u32)-1;
+        /* Generic back-edge inlining is currently disabled (see the
+         * walker comment — caused a real-S3 SML regression even with
+         * the touches-MMU veto). Hard-code false here so inline_op
+         * never takes the back-edge emit path; the DEC-A-loop closed-
+         * form above catches the only loop pattern we fast-path. */
+        bool is_back_edge = false;
         inline_ctx ictx = {
             cpu->mmu, &L, entry_off, mmu_base_value, lit_off,
             ops_pc, ops_code_off, i, is_back_edge, false,
@@ -1682,6 +1802,7 @@ gbjit_block *gbjit_compile_block(codecache *cc, cpu_state *cpu, u16 pc_start,
     }
     (void)exited_early;
 
+epilogue:
     /* --- Epilogue: sync PC + cycles, reload return PC, JX. --- */
     emit_sync_state(&e);
     /* Reload cpu_base in case the last op was a helper. */

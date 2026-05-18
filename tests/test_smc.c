@@ -78,7 +78,9 @@ static int test_loop_block_invalidation(void) {
     static cpu_state cpu_a, cpu_b;
     static mmu m_a, m_b;
 
-    /* Reference run via interpreter. */
+    /* Reference run via interpreter — step until HALT, matching the
+     * JIT dispatcher's behaviour (it stops at HALT and doesn't tick
+     * halted iterations). */
     setup(&cpu_a, &m_a, prog, sizeof(prog));
     while (!cpu_a.halted) sm83_step(&cpu_a);
 

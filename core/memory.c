@@ -147,6 +147,7 @@ void mmu_write8(mmu *m, u16 addr, u8 v) {
             if (low5 == 0) low5 = 1;             /* MBC1 quirk */
             u8 next = (u8)((m->rom_bank & 0x60u) | low5);
             if (m->rom_banks) next %= (u8)m->rom_banks;
+            if (next != m->rom_bank) m->rom_bank_dirty = 1;
             m->rom_bank = next;
             return;
         }
@@ -154,6 +155,7 @@ void mmu_write8(mmu *m, u16 addr, u8 v) {
             u8 hi2 = (u8)((v & 3u) << 5);
             u8 next = (u8)((m->rom_bank & 0x1Fu) | hi2);
             if (m->rom_banks) next %= (u8)m->rom_banks;
+            if (next != m->rom_bank) m->rom_bank_dirty = 1;
             m->rom_bank = next;
             return;
         }
@@ -177,6 +179,21 @@ void mmu_write8(mmu *m, u16 addr, u8 v) {
             m->io[0x02] = (u8)(v & 0x7Fu);
             /* Also request a serial interrupt for completeness. */
             m->io[0x0F] |= INT_SERIAL;
+        }
+        /* OAM DMA — Pan Docs §"OAM DMA Transfer". Writing $XX to $FF46
+         * starts a 160-cycle copy of $XX00..$XX9F into OAM ($FE00..$FE9F).
+         * Real hardware bytes the transfer one machine cycle at a time
+         * while the CPU continues to run in HRAM; the standard caller
+         * uses a `DEC A; JR NZ,-3` wait loop to spin out the 160 cycles.
+         * We do the copy synchronously here — the caller's wait loop
+         * still consumes the same GB cycles, so observable behaviour is
+         * identical for the typical use pattern (and faster than emul-
+         * ating the DMA byte-by-byte). */
+        if (addr == 0xFF46u) {
+            u16 src = (u16)((u16)v << 8);
+            for (u16 i = 0; i < 0xA0u; i++) {
+                m->oam[i] = mmu_read8(m, (u16)(src + i));
+            }
         }
         return;
     }
