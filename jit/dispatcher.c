@@ -624,17 +624,7 @@ void gbjit_dispatcher_run_until(gbjit_dispatcher *d, u64 until) {
             prev = NULL;
         }
         if (cpu->halted) {
-            /* Fast-forward halted cycles in chunks. Real DMG HALT
-             * waits for any pending IRQ — each NOP-equivalent
-             * machine cycle is 4 T-cycles. The dispatcher's top of
-             * loop already calls sm83_service_interrupts which calls
-             * ppu_tick (sync mode) / reads io[$0F] (async mode), so
-             * an IRQ raised between checks is caught on the next
-             * iteration anyway. Advancing 64 cycles at a time cuts
-             * 16x off the spin overhead of waiting for VBlank
-             * (~70 k cycles) without losing IRQ-edge accuracy at
-             * the per-block grain we already operate on. */
-            cpu->cycles += 64;
+            cpu->cycles += 4;
             continue;
         }
         /* EI delayed-enable: when ime_pending is set, run the next op via

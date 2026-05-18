@@ -37,16 +37,6 @@ target_compile_options(${COMPONENT_LIB} PRIVATE -Wall -Wextra -Wno-shadow)
 # include/gbjit_debug.h).
 target_compile_options(${COMPONENT_LIB} PRIVATE -O3)
 
-# Bump arena to 96 KB (default is 64). The cache-size sweep showed
-# +25 % cold-JIT throughput at 96 vs 64 because SML's ~133-block
-# working set fits at 96 with comfortable headroom; at 64 a handful
-# of cold blocks have to chain-miss-compile during the bench window.
-# The dispatcher.c "latent codegen bug past ~100 unique blocks"
-# warning applies to Blargg 06-ld r,r specifically — SML at 96 KB
-# is fine in the qemu sweep, and the real-S3 firmware exercises only
-# this ROM.
-target_compile_definitions(${COMPONENT_LIB} PRIVATE GBJIT_ARENA_KB=96u)
-
 # Move ppu_tick onto Core 1 by default. See core/ppu_thread.h.
 if(NOT DEFINED GBJIT_PPU_ASYNC)
     set(GBJIT_PPU_ASYNC 1)

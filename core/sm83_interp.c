@@ -320,15 +320,9 @@ u32 sm83_step(cpu_state *cpu) {
     }
 
     if (cpu->halted) {
-        /* Fast-forward halted cycles in 64-cycle chunks. Real DMG HALT
-         * advances the system clock until any pending IRQ wakes the
-         * CPU; the dispatch loop calls sm83_service_interrupts on the
-         * next iteration to catch a newly-raised IRQ. Bigger steps
-         * cut the spin overhead waiting for VBlank by 16x. Mirror
-         * value in jit/dispatcher.c so cycles agree between modes. */
-        cpu->cycles += 64;
+        cpu->cycles += 4;
         if (ei_pending_clear) { cpu->ime = 1; cpu->ime_pending = 0; }
-        return 64;
+        return 4;
     }
 
     u8 op = fetch8(cpu);
