@@ -32,6 +32,45 @@ core design that gives a further +10 % on top.
 > [STATUS.md](STATUS.md) for the latest progress, benchmarks per ROM,
 > and notes on outstanding work.
 
+## JIT cache size vs throughput
+
+Sweep of the JIT codecache arena size against SML's qemu-S3 throughput.
+The interpreter baseline (red dashed line) is unaffected by the JIT
+cache so it's a fixed reference; the JIT only beats it once the arena
+holds enough of the working set to stop thrashing. Annotations are the
+number of unique blocks compiled before the arena filled.
+
+![JIT cache size vs throughput](benchmark/results/cache_sweep.png)
+
+| Arena | MHz | × DMG | Blocks compiled | vs interp |
+|------:|----:|------:|----------------:|----------:|
+| **interp** | **17.85** | **4.26×** | — | — |
+| 4 KB | 9.61 | 2.29× | 7 | 0.54× |
+| 8 KB | 14.63 | 3.49× | 11 | 0.82× |
+| 16 KB | 17.05 | 4.07× | 21 | 0.96× |
+| 32 KB | 16.50 | 3.93× | 31 | 0.92× |
+| 48 KB | 22.93 | 5.47× | 57 | 1.28× |
+| **64 KB (default)** | 25.70 | 6.13× | 77 | 1.44× |
+| **96 KB (peak)** | **27.71** | **6.61×** | 110 | **1.55×** |
+| 128 KB | 26.38 | 6.29× | 113 | 1.48× |
+| 192 KB | 23.90 | 5.70× | 113 | 1.34× |
+
+Key takeaways:
+
+- **Under ~16 KB the JIT loses to the interp.** The arena fills before
+  SML's hot blocks are all compiled, so the dispatcher recompiles the
+  same blocks repeatedly. Per-call dispatch overhead + recompile cost
+  exceed the interp's per-op switch-table cost.
+- **96 KB is the sweet spot.** That fits all 113 unique blocks SML
+  exercises in this window with comfortable headroom; throughput hits
+  1.55× the interp.
+- **Larger arenas regress mildly.** Past 110 blocks the working set is
+  saturated (`blocks_compiled` plateaus); the extra IRAM just sits
+  idle and adds I-cache pressure, dragging 192 KB back down to 1.34×.
+
+Reproduce with `benchmark/run_cache_sweep.sh` (parallel per-size IDF
+builds + qemu-xtensa runs) and `benchmark/plot_cache_sweep.py`.
+
 ## Quick start — host
 
 ```sh

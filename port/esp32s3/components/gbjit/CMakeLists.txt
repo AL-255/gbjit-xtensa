@@ -32,6 +32,13 @@ target_compile_options(${COMPONENT_LIB} PRIVATE -Wall -Wextra -Wno-shadow)
 # of this define and get a faster hot loop.
 target_compile_definitions(${COMPONENT_LIB} PRIVATE DEBUG=1)
 
+# Codecache arena size override. The dispatcher.c default is 64 KB;
+# the bench sweep (benchmark/run_cache_sweep.sh) rebuilds with several
+# values to plot performance vs cache size.
+if(DEFINED GBJIT_ARENA_KB)
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE GBJIT_ARENA_KB=${GBJIT_ARENA_KB}u)
+endif()
+
 # Move ppu_tick onto Core 1. See core/ppu_thread.h for the design and
 # the synchronisation contract with sm83_service_interrupts. Opt-out by
 # passing -DGBJIT_PPU_ASYNC=0 to fall back to the in-line PPU tick.
