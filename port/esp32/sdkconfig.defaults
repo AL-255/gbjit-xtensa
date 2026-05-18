@@ -16,6 +16,13 @@ CONFIG_IDF_TARGET="esp32"
 CONFIG_FREERTOS_UNICORE=y
 CONFIG_ESP32_IRAM_AS_8BIT_ACCESSIBLE_MEMORY=y
 
+# Overclock: 240 MHz is the standard IDF maximum for the ESP32 (D0WD-V3
+# included). Default is 160 MHz; 240 MHz uses the 320 MHz PLL with a /2
+# CPU divider. The chip is rated for 240 MHz operation per the datasheet
+# so this isn't strictly overclocking — it's just unlocking the rated
+# top speed.
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+
 # Console on UART0 — what qemu-system-xtensa wires to stdio via -serial.
 CONFIG_ESP_CONSOLE_UART_DEFAULT=y
 

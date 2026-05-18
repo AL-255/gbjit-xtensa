@@ -390,6 +390,21 @@ void gbjit_dispatcher_invalidate_addr(gbjit_dispatcher *d, u16 gb_addr) {
  * block, the JIT returns via `JX a0` to the instruction right after our
  * CALLX0, we restore `a0`, and RETW back to the windowed caller. */
 __attribute__((noinline))
+/* `noinline` is load-bearing: when this function gets inlined into
+ * `gbjit_dispatcher_run_until`, the JIT block (which doesn't allocate
+ * its own stack frame) inherits the dispatcher's `a1`. If a deeper
+ * call from inside the JIT trampolines causes a window overflow, the
+ * Xtensa overflow handler spills the live a0..a3 to a1+0..15 — i.e.
+ * to the dispatcher's stack frame, on top of compiler-managed locals
+ * stored there. On LX6 (plain ESP32) this corrupts the dispatcher's
+ * `d` pointer and a subsequent `d->blocks_executed++` faults trying
+ * to write to the literal slot it accidentally pointed at.
+ *
+ * Forcing `enter_block_native` to be a real function call gives the
+ * JIT block its own `a1` (this function's frame); the overflow handler
+ * spills into a1+0..15 here, which we keep clear (return PC saved at
+ * offset 16, above the spill zone). */
+__attribute__((noinline))
 static void enter_block_native(gbjit_block *b, cpu_state *cpu) {
     uint32_t fn = (uint32_t)(uintptr_t)(b->code + b->entry_off);
     /* Pin `cpu` into a2 — CALL0 callees receive their first argument there.
@@ -496,6 +511,25 @@ static void enter_block_sim(gbjit_block *b, cpu_state *cpu) {
 #endif
 
 void gbjit_dispatcher_run_until(gbjit_dispatcher *d, u64 until) {
+#if defined(ESP_PLATFORM) && !defined(CONFIG_IDF_TARGET_ESP32S3)
+    /* Xtensa LX6 windowed-ABI workaround: when this function does its
+     * inner `call8` (to enter_block_native) and that call's downstream
+     * trampoline `call8` triggers a window-overflow exception, the
+     * overflow handler (_WindowOverflow8 in xtensa_vectors.S) spills
+     * the overflowed frame's a4..a7 to byte offsets +16, +20, +24, +28
+     * within OUR stack frame. The compiler's stack-slot allocator
+     * happily uses those same offsets for our locals (in particular
+     * the cached `d + offsetof(blocks_executed-region)` value at SP+20)
+     * — every overflow corrupts that slot, and the post-call reload
+     * faults dereferencing the spilled register value as if it were a
+     * pointer. Reserving 64 bytes of padding at the bottom of the frame
+     * forces the compiler to push its locals above the spill window,
+     * so the overflow handler writes into untouched padding instead of
+     * load-bearing state. `volatile` + the dummy write keep it from
+     * being optimised out. */
+    volatile uint8_t _gbjit_overflow_pad[64];
+    _gbjit_overflow_pad[0] = 0;
+#endif
     cpu_state *cpu = d->cpu;
     gbjit_block *prev = NULL;
 
@@ -577,6 +611,20 @@ void gbjit_dispatcher_run_until(gbjit_dispatcher *d, u64 until) {
 
 #if defined(ESP_PLATFORM)
         enter_block_native(b, cpu);
+        /* The JIT block runs in CALL0 ABI inside enter_block_native's
+         * windowed frame. On plain ESP32 (LX6) the windowed save/restore
+         * around this call doesn't reliably preserve every caller-side
+         * register the GCC scheduler relied on (we've seen `d` end up
+         * with a flash-rodata literal after the call returns, which
+         * faults on the next store). Force the compiler to spill all
+         * live values to memory before the call and reload them after:
+         * a no-op asm with a "memory" clobber, plus listing every
+         * candidate register so GCC can't keep any of them live across
+         * the boundary. */
+        __asm__ volatile("" :::
+            "a2","a3","a4","a5","a6","a7",
+            "a8","a9","a10","a11","a12","a13","a14","a15",
+            "memory");
 #else
         enter_block_sim(b, cpu);
 #endif
