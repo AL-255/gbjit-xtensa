@@ -67,6 +67,15 @@ typedef struct mmu {
     u8 ppu_last_ly;
     u8 ppu_last_mode;
 
+    /* Cycle deadline past which ppu_tick MUST do its full LY/mode/IRQ
+     * recomputation; until then it can early-return. ppu_tick() runs on
+     * every dispatcher iteration, and the u64 modulo/division it does
+     * to derive LY is expensive on LX6. Cycles per state transition
+     * range from 80 (entering mode 3) to 456 (entering next scanline),
+     * so most dispatcher iterations cross zero transitions and can skip
+     * the work entirely. */
+    u64 ppu_next_event_cycles;
+
     /* Serial output capture — Blargg test ROMs write ASCII to FF01 then $81 to FF02. */
     void (*serial_sink)(void *ctx, u8 byte);
     void *serial_sink_ctx;

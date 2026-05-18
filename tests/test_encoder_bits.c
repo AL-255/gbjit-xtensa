@@ -33,7 +33,14 @@ static u32 readw(const u8 *b) { return (u32)b[0] | ((u32)b[1] << 8) | ((u32)b[2]
 
 #define ONE_INSTR(call_, expected, label) do { \
     xt_emit e; xt_init(&e, buf, sizeof(buf)); \
+    memset(buf, 0, sizeof(buf)); \
     call_; \
+    /* The encoder now buffers bytes into a 32-bit accumulator that's */ \
+    /* only flushed to buf when a 4-byte word completes — needed so we */ \
+    /* never touch IRAM-resident exec memory with an 8-bit store on the */ \
+    /* S3. For a single 3-byte instruction the word isn't complete yet, */ \
+    /* so the test has to flush manually to observe the bytes. */ \
+    xt_flush_pending(&e); \
     if (e.len != 3) { fprintf(stderr, "FAIL %s: %u bytes\n", label, (unsigned)e.len); failed++; } \
     else CHECK(label, expected); \
 } while (0)

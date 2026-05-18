@@ -12,9 +12,19 @@ typedef struct {
     u8  *buf;
     u32  len;
     u32  cap;
+    /* Word-packing accumulator: holds the bytes for the in-progress
+     * 4-byte word. Flushed to buf via a 32-bit store every time len
+     * crosses a 4-byte boundary, and on xt_flush_pending() at the end
+     * of emission. This lets us avoid byte stores to executable
+     * memory, which fault with LoadStoreError on ESP32-S3 IRAM (and
+     * on plain ESP32 IRAM without the trap handler). */
+    u32  word_acc;
 } xt_emit;
 
 void xt_init(xt_emit *e, u8 *buf, u32 cap);
+/* Flush any partial-word accumulator at the tail. Must be called once
+ * before any final use of `buf` (execution, patching across words, etc.). */
+void xt_flush_pending(xt_emit *e);
 
 /* --- Core instruction encoders ---
    ar = destination register, as = source, at = source/target index.

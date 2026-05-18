@@ -30,14 +30,39 @@ void xt_init(xt_emit *e, u8 *buf, u32 cap) {
     e->buf = buf;
     e->len = 0;
     e->cap = cap;
+    e->word_acc = 0;
+}
+
+void xt_flush_pending(xt_emit *e) {
+    /* Flush the current partial word (if any) so its bytes become visible
+     * in buf. Unwritten byte positions remain 0 (word_acc was init'd to
+     * 0); that matches the memset() the codecache does after alloc. */
+    if (e->len & 3u) {
+        u32 word_off = e->len & ~3u;
+        *(u32 *)(e->buf + word_off) = e->word_acc;
+    }
+}
+
+static inline void emit_byte_packed(xt_emit *e, u8 b) {
+    /* Pack `b` into the current word at the right byte slot. When that
+     * makes the word complete, flush it to buf via a 32-bit store —
+     * never touch the buffer with an 8-bit access, which faults on
+     * IRAM-resident exec memory on ESP32-S3 (and on plain ESP32 IRAM
+     * without the LoadStoreError trap handler). */
+    u32 byte_in_word = e->len & 3u;
+    e->word_acc |= ((u32)b) << (byte_in_word * 8);
+    e->len++;
+    if ((e->len & 3u) == 0) {
+        *(u32 *)(e->buf + (e->len - 4)) = e->word_acc;
+        e->word_acc = 0;
+    }
 }
 
 static inline u32 emit24(xt_emit *e, u32 w) {
     assert(e->len + 3 <= e->cap);
-    e->buf[e->len + 0] = (u8)(w & 0xFF);
-    e->buf[e->len + 1] = (u8)((w >> 8) & 0xFF);
-    e->buf[e->len + 2] = (u8)((w >> 16) & 0xFF);
-    e->len += 3;
+    emit_byte_packed(e, (u8)(w & 0xFFu));
+    emit_byte_packed(e, (u8)((w >> 8) & 0xFFu));
+    emit_byte_packed(e, (u8)((w >> 16) & 0xFFu));
     return 3;
 }
 

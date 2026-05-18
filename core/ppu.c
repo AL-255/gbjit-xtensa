@@ -31,6 +31,13 @@ void ppu_tick(struct cpu_state *cpu) {
     if (!cpu || !cpu->mmu) return;
     mmu *m = cpu->mmu;
 
+    /* Hot-path short-circuit: ppu_tick runs on every dispatcher iteration
+     * via sm83_service_interrupts. Most iterations span far fewer cycles
+     * than the shortest PPU state transition (80 dots entering mode 3),
+     * so we cache the cycle at which the next transition becomes due and
+     * skip the heavy u64 modulo/division until then. */
+    if (cpu->cycles < m->ppu_next_event_cycles) return;
+
     /* Compute current LY and intra-scanline dot position. */
     u32 frame_dots = (u32)(cpu->cycles % DOTS_PER_FRAME);
     u8  ly         = (u8)(frame_dots / DOTS_PER_LINE);
@@ -90,4 +97,24 @@ void ppu_tick(struct cpu_state *cpu) {
 
     m->ppu_last_ly   = ly;
     m->ppu_last_mode = mode;
+
+    /* Compute when the next state transition is due. The deadline is
+     * cpu->cycles rounded up to the next state boundary in dot space.
+     * Boundaries within a visible scanline: 80 (→mode 3), 252 (→mode 0),
+     * 456 (→next line). On VBlank lines (mode 1) only the line boundary
+     * matters. LCDC-off uses a long deadline since no transitions occur
+     * (we'll be re-armed if/when the game re-enables the LCD via a write,
+     * but for now the line-boundary cadence is conservative). */
+    u32 next_dot_in_line;
+    if (!(lcdc & 0x80u) || ly >= VISIBLE_LINES) {
+        /* Next event is the start of the next line. */
+        next_dot_in_line = DOTS_PER_LINE;
+    } else if (line_dot < MODE2_DOTS) {
+        next_dot_in_line = MODE2_DOTS;
+    } else if (line_dot < MODE3_END) {
+        next_dot_in_line = MODE3_END;
+    } else {
+        next_dot_in_line = DOTS_PER_LINE;
+    }
+    m->ppu_next_event_cycles = cpu->cycles + (u64)(next_dot_in_line - line_dot);
 }

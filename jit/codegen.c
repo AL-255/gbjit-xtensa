@@ -82,10 +82,10 @@ typedef struct {
 static i32 lit_alloc_u32(lit_ctx *L, u32 value) {
     if (L->next_off + 4 > L->limit) return -1;
     u32 off = L->next_off;
-    L->base[off + 0] = (u8)(value & 0xFFu);
-    L->base[off + 1] = (u8)((value >> 8) & 0xFFu);
-    L->base[off + 2] = (u8)((value >> 16) & 0xFFu);
-    L->base[off + 3] = (u8)((value >> 24) & 0xFFu);
+    /* `L->base` is the codecache-allocated buffer (4-byte aligned), and
+     * `next_off` is always a multiple of 4 — one 32-bit store, never a
+     * byte store, so this works on IRAM-resident exec memory on the S3. */
+    *(u32 *)(L->base + off) = value;
     L->next_off += 4;
     return (i32)off;
 }
@@ -194,18 +194,90 @@ static void emit_load_u16(xt_emit *e, u8 dst, u16 value, u8 scratch) {
  *
  * The encoded imm12 field is at bits 12..23 of the 24-bit instruction word,
  * and the target = (br_pc + 4 + imm12).  We solve for imm12 = target - br_pc - 4. */
+/* Read a 24-bit instruction from `e->buf` at byte offset `pos` using only
+ * 32-bit aligned word loads — byte reads from IRAM-resident exec memory
+ * fault on the S3 (and on plain ESP32 IRAM without the trap handler).
+ * The instruction may straddle a 4-byte boundary; in that case we load
+ * both adjacent words and stitch.
+ *
+ * Caller MUST have flushed any partial-word state to buf first
+ * (xt_flush_pending). All current patch sites in this file go through
+ * word_write_24 which does this. */
+static u32 word_read_24(const xt_emit *e, u32 pos) {
+    u32 word_off = pos & ~3u;
+    u32 byte_off = pos & 3u;
+    u32 w0 = *(const u32 *)(e->buf + word_off);
+    if (byte_off <= 1) {
+        return (w0 >> (byte_off * 8)) & 0xFFFFFFu;
+    }
+    /* Straddles two words. */
+    u32 w1 = *(const u32 *)(e->buf + word_off + 4);
+    u32 from_w0 = w0 >> (byte_off * 8);
+    u32 from_w1 = w1 << ((4 - byte_off) * 8);
+    return (from_w0 | from_w1) & 0xFFFFFFu;
+}
+
+/* Write a 24-bit instruction back to `e->buf` at byte offset `pos` using
+ * only 32-bit word stores (read-modify-write, masking out the affected
+ * 24 bits and OR-ing the new value in). Bytes BEYOND the instruction in
+ * the same 4-byte word(s) are preserved.
+ *
+ * Calls xt_flush_pending first so any in-progress word_acc is visible
+ * in buf — patches usually target backward branches that are several
+ * words behind the current emit position, but flushing makes the
+ * boundary cases safe. If the patched word IS the in-progress one,
+ * resync word_acc afterwards so the next byte emit doesn't undo the
+ * patch when it eventually flushes. */
+static void word_write_24(xt_emit *e, u32 pos, u32 instr) {
+    xt_flush_pending(e);
+    instr &= 0xFFFFFFu;
+    u32 word_off = pos & ~3u;
+    u32 byte_off = pos & 3u;
+    u32 w0 = *(u32 *)(e->buf + word_off);
+    if (byte_off <= 1) {
+        u32 shift = byte_off * 8;
+        u32 mask = 0xFFFFFFu << shift;
+        w0 = (w0 & ~mask) | (instr << shift);
+        *(u32 *)(e->buf + word_off) = w0;
+    } else {
+        /* Lower portion of instr lives in the upper bytes of w0; the
+         * remaining (1 or 2) bytes spill into the low bytes of w1. */
+        u32 shift_lo = byte_off * 8;             /* 16 or 24 */
+        u32 bits_lo  = 32 - shift_lo;            /* 16 or 8 */
+        u32 mask_lo  = ((1u << bits_lo) - 1u) << shift_lo;
+        w0 = (w0 & ~mask_lo) | ((instr << shift_lo) & mask_lo);
+        *(u32 *)(e->buf + word_off) = w0;
+
+        u32 bits_hi = 24 - bits_lo;              /* 8 or 16 */
+        u32 mask_hi = (1u << bits_hi) - 1u;
+        u32 w1 = *(u32 *)(e->buf + word_off + 4);
+        w1 = (w1 & ~mask_hi) | ((instr >> bits_lo) & mask_hi);
+        *(u32 *)(e->buf + word_off + 4) = w1;
+    }
+    /* Resync word_acc if the patch overlapped the current incomplete
+     * word — otherwise the next emit's flush would clobber the patch. */
+    u32 current_word = e->len & ~3u;
+    if (current_word == word_off || current_word == word_off + 4) {
+        e->word_acc = *(u32 *)(e->buf + current_word);
+        /* High bytes past the current emit position must read back as 0
+         * (the codecache memset cleared them) so we don't accidentally
+         * pick up stale bytes when finishing the word. */
+        u32 valid_bytes = e->len & 3u;
+        if (valid_bytes < 4) {
+            u32 keep_mask = valid_bytes ? ((1u << (valid_bytes * 8)) - 1u) : 0u;
+            e->word_acc &= keep_mask;
+        }
+    }
+}
+
 static void patch_branch_to(xt_emit *e, u32 br_pos, u32 target_pos) {
     i32 imm12 = (i32)target_pos - (i32)br_pos - 4;
     assert(imm12 >= -2048 && imm12 <= 2047);
     u32 imm12_u = (u32)imm12 & 0xFFFu;
-    u32 w = (u32)e->buf[br_pos]
-          | ((u32)e->buf[br_pos + 1] << 8)
-          | ((u32)e->buf[br_pos + 2] << 16);
+    u32 w = word_read_24(e, br_pos);
     w &= ~(0xFFFu << 12);
     w |= (imm12_u << 12);
-    e->buf[br_pos + 0] = (u8)(w & 0xFFu);
-    e->buf[br_pos + 1] = (u8)((w >> 8) & 0xFFu);
-    e->buf[br_pos + 2] = (u8)((w >> 16) & 0xFFu);
+    word_write_24(e, br_pos, w);
 }
 
 /* Patch a previously-emitted J at `j_pos` so it lands at `target_pos`.
@@ -214,14 +286,10 @@ static void patch_j_to(xt_emit *e, u32 j_pos, u32 target_pos) {
     i32 imm18 = (i32)target_pos - (i32)j_pos - 4;
     assert(imm18 >= -(1 << 17) && imm18 < (1 << 17));
     u32 imm18_u = (u32)imm18 & 0x3FFFFu;
-    u32 w = (u32)e->buf[j_pos]
-          | ((u32)e->buf[j_pos + 1] << 8)
-          | ((u32)e->buf[j_pos + 2] << 16);
+    u32 w = word_read_24(e, j_pos);
     w &= ~(0x3FFFFu << 6);
     w |= (imm18_u << 6);
-    e->buf[j_pos + 0] = (u8)(w & 0xFFu);
-    e->buf[j_pos + 1] = (u8)((w >> 8) & 0xFFu);
-    e->buf[j_pos + 2] = (u8)((w >> 16) & 0xFFu);
+    word_write_24(e, j_pos, w);
 }
 
 /* --- Flag-bit helpers used by the ALU inliners.
@@ -981,13 +1049,35 @@ static bool inline_op(xt_emit *e, u8 opcode, u16 pc, inline_ctx *ictx) {
     }
 
     /* --- LDH (n8), A (0xE0)  /  LDH A, (n8) (0xF0).
-     * GB address = 0xFF00 | n8. Only inline when n8 ≥ 0x80 (HRAM range);
-     * leave IO accesses (0xFF00..0xFF7F) on the helper. */
+     * GB address = 0xFF00 | n8.
+     *
+     * For READS (LDH A,(n8) — opcode 0xF0): inline the full $FF00..$FFFE
+     * range. HRAM bytes (n8 >= 0x80) live in mmu->hram; IO bytes
+     * (n8 < 0x80) live in mmu->io and reflect the latest game-written
+     * state — including $FF44 (LY) and $FF41 (STAT) which the dispatcher
+     * keeps current via ppu_tick. Inlining the IO read avoids a helper
+     * call on the per-iteration LY-poll loop (SML, Blargg, ...) that
+     * dominates JIT hot paths.
+     *
+     * For WRITES (LDH (n8),A — opcode 0xE0): IO writes have side-effects
+     * (FF02 serial-transmit trap, FF40 LCDC enable, FF46 OAM DMA, ...)
+     * so we only inline the HRAM range; IO writes go via the helper. */
     if (opcode == 0xE0 || opcode == 0xF0) {
         u8 n8 = mmu_read8(m, (u16)(pc + 1));
-        if (n8 < 0x80) return false;
-        u16 a16 = (u16)(0xFF00u | n8);
-        u32 byte_addr = inlinable_byte_addr(ictx->mmu_base_value, a16);
+        u32 byte_addr = 0;
+        if (opcode == 0xF0) {
+            /* LDH A,(n8): inline IO and HRAM reads. */
+            if (n8 < 0x80) {
+                byte_addr = ictx->mmu_base_value + (u32)offsetof(mmu, io) + n8;
+            } else if (n8 < 0xFF) {
+                byte_addr = ictx->mmu_base_value + (u32)offsetof(mmu, hram) + (n8 - 0x80);
+            }
+        } else {
+            /* LDH (n8),A: inline HRAM writes only. */
+            if (n8 >= 0x80 && n8 < 0xFF) {
+                byte_addr = ictx->mmu_base_value + (u32)offsetof(mmu, hram) + (n8 - 0x80);
+            }
+        }
         if (!byte_addr) return false;
         i32 lit_off = lit_alloc_u32(ictx->L, byte_addr);
         if (lit_off < 0) return false;
@@ -1446,6 +1536,12 @@ gbjit_block *gbjit_compile_block(codecache *cc, cpu_state *cpu, u16 pc_start,
     }
     xt_l32i(&e, 0, 13, OFF_JITRETPC);
     xt_jx(&e, 0);
+
+    /* Final flush of the word-pack accumulator — any partial-word tail
+     * needs to be stored to buf before execution. The codecache_alloc
+     * memset'd the buffer to 0, so the unwritten upper byte(s) of the
+     * tail word remain 0 (and our flush also writes them as 0). */
+    xt_flush_pending(&e);
 
     codecache_finalize(cc, base + entry_off, e.len);
 

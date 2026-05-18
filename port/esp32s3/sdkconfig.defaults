@@ -16,3 +16,8 @@ CONFIG_ESP_INT_WDT=n
 CONFIG_ESP_TASK_WDT_EN=n
 
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+
+# Run the core at its rated max (default would be 160 MHz). The S3 datasheet
+# specs 240 MHz operation; this isn't overclocking, just unlocking the
+# already-rated top speed.
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
