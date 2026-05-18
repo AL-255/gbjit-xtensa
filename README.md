@@ -43,32 +43,34 @@ before the arena filled.
 
 | Arena | jit (cold) | jit (pre-compiled) | jit (no prefetch) | Blocks |
 |------:|-----------:|-------------------:|------------------:|-------:|
-|  4 KB |  5.01 MHz | 5.96 MHz | 5.25 MHz | 7 |
-|  8 KB |  6.60     | 7.73     | 6.67     | 11 |
-| 16 KB |  6.98     | 13.37    | 7.27     | 21 |
-| 32 KB |  6.79     | 13.15    | 7.30     | 31 |
-| 48 KB |  9.69     | 20.21    | 10.94    | 57 |
-| **64 KB (default)** | 11.42 | **27.00** | 12.15 | 77 |
-| 96 KB | **14.49** | 25.68    | 13.88    | 122 |
-| 128 KB| 13.98     | 26.20    | 14.04    | 133 |
-| 192 KB| 14.38     | 27.11    | 13.96    | 133 |
+|  4 KB |  4.51 MHz | 5.25 MHz | 4.51 MHz | 7 |
+|  8 KB |  5.85     | 7.21     | 5.92     | 11 |
+| 16 KB |  6.25     | 11.08    | 6.32     | 21 |
+| 32 KB |  6.13     | 11.03    | 6.28     | 31 |
+| 48 KB |  9.19     | 18.72    | 10.14    | 57 |
+| **64 KB (default)** | 9.90 | 22.11    | 11.03 | 77 |
+| **96 KB**           | **13.67** | 22.56 | 12.79 | 122 |
+| 128 KB| 12.22     | 22.46    | 12.45    | 133 |
+| 192 KB| 13.65     | **23.03** | 12.94 | 133 |
 
-Interpreter baseline: **10.00 MHz** / 2.38× DMG.
+Interpreter baseline: **9.48 MHz** / 2.26× DMG.
 
 What the curves say:
 
 - **jit (cold)** pays the on-the-fly compile cost during the measured
-  window — flat-ish past 96 KB at ~14 MHz because the working set
+  window — flat-ish past 96 KB at ~13–14 MHz because the working set
   (133 blocks) fits comfortably and there's nothing more to compile.
 - **jit (pre-compiled)** runs a warm-up pass first, then resets `cpu_
   state` and benches; the measured window contains zero compiles. Once
-  the arena is ≥ 64 KB it converges to ~27 MHz (~2.7× interp), almost
-  double the cold-start number — the compile cost is the gap.
+  the arena is ≥ 64 KB it sits in the 22–23 MHz band (~2.4× interp);
+  the gap vs cold-start (~9 MHz at 96 KB) is the JIT compile cost.
 - **jit (no prefetch)** is the cached path with the static-successor
   prefetch disabled, so each new block reaches the cache via a chain
   miss instead of a depth-4 walk at first compile. Tracks the cold
-  curve closely; prefetch saves first-encounter latency more than
-  steady-state throughput.
+  curve within noise — prefetch is a marginal first-encounter win,
+  not a steady-state speedup. See
+  [`benchmark/results/prefetch_investigation.md`](benchmark/results/prefetch_investigation.md)
+  for the full depth + evict-policy sweep.
 - **Under 48 KB every JIT mode falls below the interp.** The arena
   fills before SML's hot blocks are compiled, the dispatcher
   recompiles the same blocks, and per-call dispatcher overhead +

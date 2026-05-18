@@ -54,6 +54,21 @@ typedef struct gbjit_dispatcher {
     /* Stats. */
     u64  prefetched_blocks;        /* compiled by the prefetcher (not the hot path) */
     u64  prefetch_already_cached;  /* successor was already in the bucket table */
+
+    /* Evict-on-fill policy. When `evict_on_full` is true, a failed
+     * codecache allocation (arena full) triggers a full wipe of every
+     * cached block + a codecache_reset; the dispatcher then retries
+     * the compile into a fresh arena. Without this, a too-small arena
+     * stays stuck at "no more compiles" and the dispatcher falls back
+     * to the interp helper for every new PC.
+     *
+     * Hot blocks naturally re-warm after each wipe via the lazy chain-
+     * miss compile path. The thrashing cost is bounded: each wipe lets
+     * us compile ~arena_capacity_in_blocks fresh blocks before another
+     * wipe, so the worst-case overhead is proportional to (working set
+     * size / arena capacity in blocks). */
+    bool evict_on_full;
+    u64  arena_resets;
 } gbjit_dispatcher;
 
 bool gbjit_dispatcher_init(gbjit_dispatcher *d, cpu_state *cpu);

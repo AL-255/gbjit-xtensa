@@ -44,3 +44,8 @@ endif()
 if(BENCH_MODE_JIT_NOPREFETCH_ONLY)
     target_compile_definitions(${COMPONENT_LIB} PRIVATE BENCH_MODE_JIT_NOPREFETCH_ONLY=1)
 endif()
+# Optional prefetch-recursion-depth override (used by the prefetch
+# sweep). 0 disables the prefetcher; the dispatcher's default is 4.
+if(DEFINED BENCH_PREFETCH_DEPTH)
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE "BENCH_PREFETCH_DEPTH=${BENCH_PREFETCH_DEPTH}")
+endif()

@@ -99,6 +99,15 @@ static void run_jit_labelled(const char *label, bool warm_only) {
         ESP_LOGE(TAG, "jit: dispatcher_init FAILED");
         return;
     }
+    /* Optional compile-time override of the prefetcher's recursion
+     * depth — used by benchmark/run_prefetch_sweep.sh to characterise
+     * how much the eager-compile walk actually buys us at each depth.
+     * Default is 4 (set in gbjit_dispatcher_init); 0 disables the
+     * prefetcher entirely (equivalent to BENCH_MODE_JIT_NOPREFETCH). */
+#ifdef BENCH_PREFETCH_DEPTH
+    d.prefetch_depth = BENCH_PREFETCH_DEPTH;
+    d.prefetch_enabled = BENCH_PREFETCH_DEPTH > 0;
+#endif
     if (warm_only) {
         /* Dry-run: compile every block the workload touches. */
         gbjit_dispatcher_run_until(&d, BENCH_CYCLES_BUDGET);
@@ -121,10 +130,10 @@ static void run_jit_labelled(const char *label, bool warm_only) {
         " mhz=%.3f dmg_x=%.3f pc=0x%04X halted=%d"
         " blocks_compiled=%" PRIu64 " blocks_executed=%" PRIu64
         " chain_hits=%" PRIu64 " chain_misses=%" PRIu64
-        " prefetched=%" PRIu64,
+        " prefetched=%" PRIu64 " arena_resets=%" PRIu64,
         label, s_cpu.cycles, us, mhz, mhz / 4.194304, s_cpu.pc, s_cpu.halted,
         d.blocks_compiled, d.blocks_executed, d.chain_hits, d.chain_misses,
-        d.prefetched_blocks);
+        d.prefetched_blocks, d.arena_resets);
     /* Intentionally leak the dispatcher's arena: gbjit_dispatcher_shutdown
      * tries to free per-block book-keeping that has dangling predicted_next
      * pointers across multiple runs, and a clean teardown isn't worth a

@@ -223,8 +223,34 @@ bool gbjit_dispatcher_init(gbjit_dispatcher *d, cpu_state *cpu) {
 #endif
     codecache_init(&d->cc, (u8 *)d->arena, d->arena_cap);
     d->interp_fallback = false;
+    /* Prefetch defaults — depth 4, walking both succ_pc[0] (the
+     * taken / unconditional / CALL-target path) and succ_pc[1] (the
+     * fallthru of conditional JR/JP and the return point of CALL).
+     *
+     * The benchmark/run_prefetch_sweep.sh sweep confirmed this is at
+     * best a marginal steady-state win (often inside the noise vs.
+     * depth=0) — its main benefit is first-encounter latency on cold
+     * code. Specifically:
+     *   - Skipping succ_pc[1] kills warm-mode performance because
+     *     CALL return points are only reachable via dynamic RET,
+     *     never via static prefetch.
+     *   - depth=2 reduces eager compile work but loses ~3-7 % in
+     *     several measured points.
+     *   - depth=8 just wastes arena.
+     * Kept at the historical default (4, both) — the empirical sweet
+     * spot for SML's branching pattern. */
     d->prefetch_enabled = true;
     d->prefetch_depth = 4;
+    /* Evict-on-fill defaults OFF. The simple "wipe and retry" policy
+     * tested in the cache sweep was a net loss: tiny arenas (4-16 KB)
+     * thrashed catastrophically (every fresh compile fills the arena,
+     * triggers a wipe, repeat — 8x slower than falling back to interp);
+     * medium/large arenas saw no benefit because SML's working set
+     * (~130 blocks) fits comfortably in the 64 KB default. Kept as an
+     * opt-in runtime toggle for future workloads whose working set
+     * exceeds the arena, where the alternative (interp fallback for
+     * every uncompiled block) would be worse than thrashing. */
+    d->evict_on_full = false;
     return true;
 }
 
@@ -342,6 +368,15 @@ static void clear_dangling_predictions(gbjit_dispatcher *d, gbjit_block *block) 
  * triggering block. */
 static void prefetch_successors(gbjit_dispatcher *d, gbjit_block *b, int depth) {
     if (depth <= 0 || d->no_cache) return;
+    /* Walk BOTH succ_pc[0] (unconditional / taken / CALL-target) and
+     * succ_pc[1] (JR-cc fallthru / CALL return point). Dropping the
+     * second-successor walk was tempting — the depth=4 + both-succ
+     * default did churn through fallthru blocks that the bench never
+     * hit — but doing so collapsed CALL-return prefetching, which
+     * tanked warm-mode throughput by ~50% in the medium-arena range
+     * because the post-CALL block only ever reaches the cache via a
+     * dynamic RET. Keeping both, dropping depth to 2 to bound the
+     * tree size, is the empirical sweet spot. */
     for (int i = 0; i < 2; i++) {
         u16 pc = b->succ_pc[i];
         if (pc == 0xFFFFu) continue;
@@ -356,12 +391,37 @@ static void prefetch_successors(gbjit_dispatcher *d, gbjit_block *b, int depth) 
 #else
         nb = gbjit_compile_block(&d->cc, d->cpu, pc, host_helper_addr, &hr);
 #endif
-        if (!nb) return;     /* arena full — stop walking */
+        if (!nb) return;
         insert_block(d, nb);
         GBJIT_STAT_INC(d, blocks_compiled);
         GBJIT_STAT_INC(d, prefetched_blocks);
         prefetch_successors(d, nb, depth - 1);
     }
+}
+
+/* Drop every cached block + free the codecache arena. Called from the
+ * dispatch loop when codecache_alloc returns NULL (arena full) — the
+ * dispatcher then retries the failing compile into the now-empty
+ * arena. Hot blocks naturally re-compile on chain miss the next time
+ * they execute. */
+static void evict_all(gbjit_dispatcher *d) {
+    for (u32 i = 0; i < GBJIT_BLOCK_BUCKETS; i++) {
+        dispatcher_bucket *b = (dispatcher_bucket *)d->buckets[i];
+        while (b) {
+            dispatcher_bucket *next = b->next;
+            gbjit_block_free(b->b);
+            free(b);
+            b = next;
+        }
+        d->buckets[i] = NULL;
+    }
+    for (u32 p = 0; p < GBJIT_SMC_PAGE_COUNT; p++) {
+        smc_page_node *n = (smc_page_node *)d->smc_pages[p];
+        while (n) { smc_page_node *next = n->next; free(n); n = next; }
+        d->smc_pages[p] = NULL;
+    }
+    codecache_reset(&d->cc);
+    GBJIT_STAT_INC(d, arena_resets);
 }
 
 void gbjit_dispatcher_invalidate_addr(gbjit_dispatcher *d, u16 gb_addr) {
@@ -610,6 +670,20 @@ void gbjit_dispatcher_run_until(gbjit_dispatcher *d, u64 until) {
 #else
             b = gbjit_compile_block(&d->cc, cpu, cpu->pc, host_helper_addr, &hr);
 #endif
+            /* Arena full → evict-all + retry once. With evict_on_full
+             * the dispatcher prefers wiping the cache over falling
+             * back to the interp helper; hot blocks will lazy-recompile
+             * on chain miss. Disable evict_on_full to get the old
+             * fixed-size fixed-content behaviour. */
+            if (!b && d->evict_on_full) {
+                evict_all(d);
+                prev = NULL;
+#if defined(ESP_PLATFORM)
+                b = gbjit_compile_block(&d->cc, cpu, cpu->pc, target_helper_addr, &hr);
+#else
+                b = gbjit_compile_block(&d->cc, cpu, cpu->pc, host_helper_addr, &hr);
+#endif
+            }
             if (!b) {
                 sm83_step(cpu);
                 prev = NULL;
