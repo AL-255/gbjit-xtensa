@@ -91,7 +91,15 @@ void app_main(void) {
         ESP_LOGE(TAG, "dispatcher_init failed");
         return;
     }
-    ESP_LOGI(TAG, "starting CPU — PPU on Core 1, OLED on Core 0");
+    /* Disable the static-successor prefetcher. The cache-size sweep
+     * (benchmark/results/cache_sweep.csv) found that at the 64 KB
+     * default arena the no-prefetch path is 11 % faster than the
+     * historical depth=4 default — the prefetcher compiles fallthru
+     * blocks that this workload never executes and the eager-compile
+     * cost outweighs the first-encounter latency it saves. The lazy
+     * chain-miss compile path picks up new blocks on demand. */
+    disp.prefetch_enabled = false;
+    ESP_LOGI(TAG, "starting CPU — PPU on Core 1, OLED on Core 0, prefetch off");
     gbjit_dispatcher_run_until(&disp, ~(uint64_t)0);
     ESP_LOGI(TAG, "dispatcher returned (pc=%04X halted=%d cycles=%" PRIu64 ")",
              s_cpu.pc, s_cpu.halted, s_cpu.cycles);
