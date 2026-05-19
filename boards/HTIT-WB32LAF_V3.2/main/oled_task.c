@@ -4,6 +4,24 @@
 #include "board.h"
 #include "ssd1306.h"
 
+/* Disable the OLED entirely for perf probing. Default 1 = run the
+ * task normally. Set GBJIT_HTIT_OLED_ENABLE=0 at build time to leave
+ * the panel dark and skip all I²C / framebuffer work on Core 1, to
+ * see whether cross-core bus contention is on Core 0's critical path. */
+#ifndef GBJIT_HTIT_OLED_ENABLE
+#define GBJIT_HTIT_OLED_ENABLE 1
+#endif
+
+/* Minimum gap between OLED blits, in milliseconds. Core 1's
+ * compose_frame + I²C DMA share the internal SRAM bus with Core 0's
+ * dispatcher; running the OLED at maximum refresh costs Core 0 ~6
+ * fps min. Default 0 = blit as fast as the I²C peripheral allows
+ * (~80-100 Hz at 1 MHz I²C). Raise to 33 (≈30 fps) or 50 (≈20 fps)
+ * to trade visible refresh for emulation throughput. */
+#ifndef GBJIT_HTIT_OLED_MIN_INTERVAL_MS
+#define GBJIT_HTIT_OLED_MIN_INTERVAL_MS 0
+#endif
+
 #include "cpu_state.h"
 #include "memory.h"
 #include "dispatcher.h"
@@ -114,12 +132,14 @@ static void compose_frame(const uint8_t *fb_160x144) {
 
 static void oled_task(void *arg) {
     (void)arg;
+#if GBJIT_HTIT_OLED_ENABLE
     if (!ssd1306_init()) {
         ESP_LOGE(TAG, "ssd1306_init failed — task exiting");
         vTaskDelete(NULL);
         return;
     }
     ssd1306_clear();
+#endif
 
     uint32_t last_seq = 0;
 
@@ -152,12 +172,22 @@ static void oled_task(void *arg) {
 
         if (cur != last_seq) {
             last_seq = cur;
+#if GBJIT_HTIT_OLED_ENABLE
             compose_frame(s_cpu->mmu->framebuffer);
             /* Overlay the JIT-rendered fps in the top-left corner
              * before blitting. Clobbers the underlying PPU pixels in
              * that 18x7 region — small price for a live perf readout. */
             draw_fps(s_page_buf, current_fps);
             ssd1306_blit(s_page_buf);
+#if GBJIT_HTIT_OLED_MIN_INTERVAL_MS > 0
+            /* Throttle OLED refresh — gives Core 0 longer windows of
+             * uncontended SRAM bus access between blits. */
+            vTaskDelay(pdMS_TO_TICKS(GBJIT_HTIT_OLED_MIN_INTERVAL_MS));
+#endif
+#else
+            (void)current_fps;
+            vTaskDelay(pdMS_TO_TICKS(1));
+#endif
         } else {
             vTaskDelay(pdMS_TO_TICKS(4));
         }

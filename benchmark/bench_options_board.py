@@ -35,16 +35,21 @@ _CROP_FULL = {
     "GBJIT_PPU_DRAW_MIN_X":  16,
     "GBJIT_PPU_DRAW_MAX_X":  144,
 }
+_ALL_ON = {
+    "GBJIT_HALT_STEP_CYCLES": 1024,
+    "GBJIT_HTIT_OLED_MIN_INTERVAL_MS": 100,
+    **_CROP_FULL,
+}
 CONFIGS = [
-    ("baseline",                {}),
-    ("hs256",                   {"GBJIT_HALT_STEP_CYCLES": 256}),
-    ("hs256_rowcrop",           {"GBJIT_HALT_STEP_CYCLES": 256,
-                                 "GBJIT_PPU_DRAW_MIN_LY": 40,
-                                 "GBJIT_PPU_DRAW_MAX_LY": 104}),
-    ("hs256_fullcrop",          {"GBJIT_HALT_STEP_CYCLES": 256, **_CROP_FULL}),
-    ("hs1024_fullcrop",         {"GBJIT_HALT_STEP_CYCLES": 1024, **_CROP_FULL}),
-    ("hs1024_fullcrop_skip",    {"GBJIT_HALT_STEP_CYCLES": 1024,
-                                 "GBJIT_PPU_SKIP_DRAW": 1}),
+    ("baseline_default",        {}),
+    ("all_opts",                _ALL_ON),
+    ("all_opts_skip",           {**_ALL_ON, "GBJIT_PPU_SKIP_DRAW": 1}),
+    ("all_opts_no_oled",        {**_ALL_ON, "GBJIT_HTIT_OLED_ENABLE": 0}),
+    ("all_opts_skip_no_oled",   {**_ALL_ON, "GBJIT_PPU_SKIP_DRAW": 1,
+                                 "GBJIT_HTIT_OLED_ENABLE": 0}),
+    ("hs4096_skip_no_oled",     {**_ALL_ON, "GBJIT_HALT_STEP_CYCLES": 4096,
+                                 "GBJIT_PPU_SKIP_DRAW": 1,
+                                 "GBJIT_HTIT_OLED_ENABLE": 0}),
 ]
 
 def patch_for_bench():

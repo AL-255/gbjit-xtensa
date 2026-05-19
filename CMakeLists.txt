@@ -33,6 +33,9 @@ foreach(_opt
         GBJIT_PPU_SKIP_DRAW
         GBJIT_PPU_DRAW_MIN_LY
         GBJIT_PPU_DRAW_MAX_LY
+        GBJIT_PPU_DRAW_MIN_X
+        GBJIT_PPU_DRAW_MAX_X
+        GBJIT_ARENA_KB
         GBJIT_PPU_ASYNC)
     if(DEFINED ${_opt})
         add_compile_definitions(${_opt}=${${_opt}})

@@ -28,7 +28,12 @@ foreach(_opt
         GBJIT_PPU_SKIP_DRAW
         GBJIT_PPU_DRAW_MIN_LY
         GBJIT_PPU_DRAW_MAX_LY
-        GBJIT_PPU_ASYNC)
+        GBJIT_PPU_DRAW_MIN_X
+        GBJIT_PPU_DRAW_MAX_X
+        GBJIT_ARENA_KB
+        GBJIT_PPU_ASYNC
+        GBJIT_HTIT_OLED_ENABLE
+        GBJIT_HTIT_OLED_MIN_INTERVAL_MS)
     if(DEFINED ${_opt})
         idf_build_set_property(COMPILE_DEFINITIONS
             "${_opt}=${${_opt}}" APPEND)
