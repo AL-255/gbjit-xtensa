@@ -42,12 +42,11 @@ _ALL_ON = {
 }
 _ASYNC = {**_ALL_ON, "GBJIT_PPU_ASYNC": 1}
 CONFIGS = [
-    ("baseline_default",        {}),
-    ("async_batch2",            {**_ASYNC, "GBJIT_DISPATCHER_CHAIN_BATCH": 2}),
-    ("async_batch4",            _ASYNC),  # batch=4 is default
-    ("async_batch6",            {**_ASYNC, "GBJIT_DISPATCHER_CHAIN_BATCH": 6}),
-    ("async_batch4_no_oled",    {**_ASYNC, "GBJIT_HTIT_OLED_ENABLE": 0}),
-    ("async_batch4_oled200",    {**_ASYNC, "GBJIT_HTIT_OLED_MIN_INTERVAL_MS": 200}),
+    ("async_run1",              _ASYNC),
+    ("async_run2",              _ASYNC),
+    ("async_run3",              _ASYNC),
+    ("async_no_oled_run1",      {**_ASYNC, "GBJIT_HTIT_OLED_ENABLE": 0}),
+    ("async_no_oled_run2",      {**_ASYNC, "GBJIT_HTIT_OLED_ENABLE": 0}),
 ]
 
 def patch_for_bench():
