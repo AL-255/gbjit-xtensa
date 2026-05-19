@@ -33,3 +33,4 @@ benchmark/results/**/*_qemu_trace.log
 benchmark/results/**/*_qemu_stdout.txt
 benchmark/results/**/*_bench_lines.txt
 benchmark/__pycache__/
+.claude/
