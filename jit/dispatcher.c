@@ -661,12 +661,41 @@ void gbjit_dispatcher_run_until(gbjit_dispatcher *d, u64 until) {
             prev = NULL;
         }
         /* Service pending interrupts and wake from HALT before each block.
-         * The JIT inlines HALT as a simple `cpu->halted = 1; exit block`, so
-         * we depend on the dispatcher to re-enter the interrupt path that
-         * the reference interpreter normally runs at the top of sm83_step. */
+         * The JIT inlines HALT as a simple `cpu->halted = 1; exit block`,
+         * so we depend on the dispatcher to re-enter the interrupt path
+         * that the reference interpreter normally runs at the top of
+         * sm83_step.
+         *
+         * Fast-path skip (GBJIT_DISPATCHER_SERVICE_SHORTCUT, default 1):
+         * if the PPU deadline hasn't been crossed, LCDC is unchanged,
+         * no IRQ is pending, and we're not in any of the slow-path
+         * states (halted, ime_pending), there's no work for
+         * sm83_service_interrupts to do — skip the call. ppu_tick
+         * itself has an internal early return for the same conditions,
+         * but a function call to find that out still costs the entry
+         * and the IF/IE/halt branches inside the function. The inline
+         * version below is ~5 instructions and lets the compiler keep
+         * the cpu_state base in a register across iterations. */
+#ifndef GBJIT_DISPATCHER_SERVICE_SHORTCUT
+#define GBJIT_DISPATCHER_SERVICE_SHORTCUT 0
+#endif
+#if GBJIT_DISPATCHER_SERVICE_SHORTCUT
+        {
+            mmu *_m = cpu->mmu;
+            bool _need_service = cpu->halted
+                || cpu->ime_pending
+                || cpu->cycles >= _m->ppu_next_event_cycles
+                || _m->io[0x40] != _m->ppu_last_lcdc
+                || (_m->io[0x0F] & _m->ie & 0x1Fu) != 0;
+            if (unlikely(_need_service)) {
+                if (sm83_service_interrupts(cpu)) prev = NULL;
+            }
+        }
+#else
         if (unlikely(sm83_service_interrupts(cpu))) {
             prev = NULL;
         }
+#endif
         if (unlikely(cpu->halted)) {
 #if GBJIT_DISPATCHER_HALT_INNER_LOOP
             /* Tight halt loop. SML and similar HALT-and-wait-for-VBlank

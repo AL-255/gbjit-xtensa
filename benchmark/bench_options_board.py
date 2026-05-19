@@ -43,12 +43,9 @@ _ALL_ON = {
 CONFIGS = [
     ("baseline_default",        {}),
     ("all_opts",                _ALL_ON),
-    ("all_opts_skip",           {**_ALL_ON, "GBJIT_PPU_SKIP_DRAW": 1}),
+    ("all_opts_shortcut_off",   {**_ALL_ON, "GBJIT_DISPATCHER_SERVICE_SHORTCUT": 0}),
     ("all_opts_no_oled",        {**_ALL_ON, "GBJIT_HTIT_OLED_ENABLE": 0}),
     ("all_opts_skip_no_oled",   {**_ALL_ON, "GBJIT_PPU_SKIP_DRAW": 1,
-                                 "GBJIT_HTIT_OLED_ENABLE": 0}),
-    ("hs4096_skip_no_oled",     {**_ALL_ON, "GBJIT_HALT_STEP_CYCLES": 4096,
-                                 "GBJIT_PPU_SKIP_DRAW": 1,
                                  "GBJIT_HTIT_OLED_ENABLE": 0}),
 ]
 
