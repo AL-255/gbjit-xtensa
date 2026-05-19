@@ -279,18 +279,24 @@ static inline u8 fetch_tile_pixel(const u8 *vram, u16 tile_addr_vram_rel,
 #endif
 
 /* Crop the rendered scanline range. The Heltec OLED shows the centre
- * 128×64 region of the 160×144 GB screen, i.e. GB rows 40..103.
- * Rows outside the visible band can stay stale in the framebuffer
- * without affecting the displayed image. Set GBJIT_PPU_DRAW_MIN_LY /
- * GBJIT_PPU_DRAW_MAX_LY (inclusive lower, exclusive upper) at build
- * time to gate drawing — the state machine still walks all 144
- * scanlines, but ppu_draw_line returns early for the hidden rows.
- * Default 0..144 = render everything. */
+ * 128×64 region of the 160×144 GB screen, i.e. GB rows 40..103 and
+ * columns 16..143. Pixels outside the visible band can stay stale in
+ * the framebuffer without affecting the displayed image. Set the
+ * GBJIT_PPU_DRAW_MIN_LY / MAX_LY (rows) and MIN_X / MAX_X (columns)
+ * macros at build time to gate drawing. The PPU state machine still
+ * walks all scanlines; only the per-pixel work is gated. Defaults
+ * are the full GB frame, so by default behaviour is unchanged. */
 #ifndef GBJIT_PPU_DRAW_MIN_LY
 #define GBJIT_PPU_DRAW_MIN_LY 0
 #endif
 #ifndef GBJIT_PPU_DRAW_MAX_LY
 #define GBJIT_PPU_DRAW_MAX_LY 144
+#endif
+#ifndef GBJIT_PPU_DRAW_MIN_X
+#define GBJIT_PPU_DRAW_MIN_X 0
+#endif
+#ifndef GBJIT_PPU_DRAW_MAX_X
+#define GBJIT_PPU_DRAW_MAX_X 160
 #endif
 
 /* Render scanline `ly` into m->framebuffer. Called at LCD_TRANSFER →
@@ -336,10 +342,12 @@ static void ppu_draw_line(mmu *m, u8 ly) {
         u8 pixel_row = (u8)(bg_y & 7);
         const u8 *tilemap_row = &m->vram[tilemap_base + tile_row * 32];
         u16 row_off = (u16)(pixel_row * 2);
+        const int min_x = GBJIT_PPU_DRAW_MIN_X;
+        const int max_x = GBJIT_PPU_DRAW_MAX_X;
 #if GBJIT_PPU_FAST_BG_RENDERER
         ensure_bg_luts(bgp);
-        int x = 0;
-        u8 bg_x = scx;
+        int x = min_x;
+        u8 bg_x = (u8)(scx + min_x);
         u8 pc   = (u8)(bg_x & 7u);
         /* Leading partial tile (pc != 0): slow per-pixel until we
          * reach an 8-pixel boundary in the framebuffer. */
@@ -351,7 +359,7 @@ static void ppu_draw_line(mmu *m, u8 ly) {
                           : (u16)(0x1000 + (i8)tile_id * 16);
             u8 b0 = m->vram[tile_addr + row_off];
             u8 b1 = m->vram[tile_addr + row_off + 1u];
-            for (; pc < 8 && x < 160; pc++, x++, bg_x++) {
+            for (; pc < 8 && x < max_x; pc++, x++, bg_x++) {
                 u8 bit = (u8)(7u - pc);
                 u8 cid = (u8)((((b1 >> bit) & 1u) << 1) | ((b0 >> bit) & 1u));
                 bg_color_id[x] = cid;
@@ -359,7 +367,7 @@ static void ppu_draw_line(mmu *m, u8 ly) {
             }
         }
         /* Aligned fast path: 8 pixels per tile via two 4-bit LUT lookups. */
-        while (x + 8 <= 160) {
+        while (x + 8 <= max_x) {
             u8 tile_col = (u8)((bg_x >> 3) & 0x1Fu);
             u8 tile_id  = tilemap_row[tile_col];
             u16 tile_addr = unsigned_tiles
@@ -379,7 +387,7 @@ static void ppu_draw_line(mmu *m, u8 ly) {
             bg_x += 8;
         }
         /* Trailing partial tile. */
-        while (x < 160) {
+        while (x < max_x) {
             u8 tile_col = (u8)((bg_x >> 3) & 0x1Fu);
             u8 tile_id  = tilemap_row[tile_col];
             u16 tile_addr = unsigned_tiles
@@ -387,7 +395,7 @@ static void ppu_draw_line(mmu *m, u8 ly) {
                           : (u16)(0x1000 + (i8)tile_id * 16);
             u8 b0 = m->vram[tile_addr + row_off];
             u8 b1 = m->vram[tile_addr + row_off + 1u];
-            for (pc = 0; pc < 8 && x < 160; pc++, x++, bg_x++) {
+            for (pc = 0; pc < 8 && x < max_x; pc++, x++, bg_x++) {
                 u8 bit = (u8)(7u - pc);
                 u8 cid = (u8)((((b1 >> bit) & 1u) << 1) | ((b0 >> bit) & 1u));
                 bg_color_id[x] = cid;
@@ -396,10 +404,10 @@ static void ppu_draw_line(mmu *m, u8 ly) {
         }
 #else
         /* Per-pixel bit-extract path (legacy). */
-        int x = 0;
-        u8 bg_x = scx;
+        int x = min_x;
+        u8 bg_x = (u8)(scx + min_x);
         u8 pc   = (u8)(bg_x & 7u);
-        while (x < 160) {
+        while (x < max_x) {
             u8 tile_col = (u8)((bg_x >> 3) & 0x1Fu);
             u8 tile_id  = tilemap_row[tile_col];
             u16 tile_addr;
@@ -410,7 +418,7 @@ static void ppu_draw_line(mmu *m, u8 ly) {
             }
             u8 b0 = m->vram[tile_addr + row_off];
             u8 b1 = m->vram[tile_addr + row_off + 1u];
-            for (; pc < 8 && x < 160; pc++, x++, bg_x++) {
+            for (; pc < 8 && x < max_x; pc++, x++, bg_x++) {
                 u8 bit = (u8)(7u - pc);
                 u8 cid = (u8)((((b1 >> bit) & 1u) << 1) | ((b0 >> bit) & 1u));
                 bg_color_id[x] = cid;
@@ -420,7 +428,7 @@ static void ppu_draw_line(mmu *m, u8 ly) {
         }
 #endif
     } else {
-        for (int x = 0; x < 160; x++) {
+        for (int x = GBJIT_PPU_DRAW_MIN_X; x < GBJIT_PPU_DRAW_MAX_X; x++) {
             bg_color_id[x] = 0;
             line[x] = bg_shade[0];
         }
@@ -434,6 +442,8 @@ static void ppu_draw_line(mmu *m, u8 ly) {
         u8 wx = m->io[WX_REG];
         if (wx < 167) {
             int start_x = (wx >= 7) ? (wx - 7) : 0;
+            if (start_x < GBJIT_PPU_DRAW_MIN_X) start_x = GBJIT_PPU_DRAW_MIN_X;
+            int end_x = GBJIT_PPU_DRAW_MAX_X;
             u16 tilemap_base = (lcdc & LCDC_WINDOW_TILEMAP_HI) ? 0x1C00 : 0x1800;
             bool unsigned_tiles = (lcdc & LCDC_BG_TILEDATA_LO) != 0;
             u8 wy_internal = m->window_line;
@@ -444,7 +454,7 @@ static void ppu_draw_line(mmu *m, u8 ly) {
             int x = start_x;
             int win_x = x - (int)wx + 7;
             u8 pc = (u8)(win_x & 7);
-            while (x < 160) {
+            while (x < end_x) {
                 u8 tile_col = (u8)((win_x >> 3) & 0x1F);
                 u8 tile_id  = tilemap_row[tile_col];
                 u16 tile_addr;
@@ -455,7 +465,7 @@ static void ppu_draw_line(mmu *m, u8 ly) {
                 }
                 u8 b0 = m->vram[tile_addr + row_off];
                 u8 b1 = m->vram[tile_addr + row_off + 1u];
-                for (; pc < 8 && x < 160; pc++, x++, win_x++) {
+                for (; pc < 8 && x < end_x; pc++, x++, win_x++) {
                     u8 bit = (u8)(7u - pc);
                     u8 cid = (u8)((((b1 >> bit) & 1u) << 1) | ((b0 >> bit) & 1u));
                     bg_color_id[x] = cid;
@@ -519,9 +529,13 @@ static void ppu_draw_line(mmu *m, u8 ly) {
             u8 b1 = m->vram[row_addr + 1u];
             bool flip_x = (vis[s].attr & OAM_FLIP_X) != 0;
             bool bg_prio = (vis[s].attr & OAM_BG_PRIO) != 0;
+            /* Early skip if the whole sprite is outside the column crop. */
+            if (left >= GBJIT_PPU_DRAW_MAX_X || left + 8 <= GBJIT_PPU_DRAW_MIN_X) {
+                continue;
+            }
             for (int px = 0; px < 8; px++) {
                 int x = left + px;
-                if (x < 0 || x >= 160) continue;
+                if (x < GBJIT_PPU_DRAW_MIN_X || x >= GBJIT_PPU_DRAW_MAX_X) continue;
                 u8 col_in_sprite = flip_x ? (u8)(7 - px) : (u8)px;
                 u8 bit = (u8)(7u - col_in_sprite);
                 u8 cid = (u8)((((b1 >> bit) & 1u) << 1) | ((b0 >> bit) & 1u));

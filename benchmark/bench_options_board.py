@@ -29,15 +29,21 @@ IDF_EXPORT = Path.home() / ".espressif/v6.0.1/esp-idf/export.sh"
 # (label, dict-of-cmake-defines).
 # Order matters only for the report; the baseline goes first as the
 # reference point for the relative deltas in the summary table.
+_CROP_FULL = {
+    "GBJIT_PPU_DRAW_MIN_LY": 40,
+    "GBJIT_PPU_DRAW_MAX_LY": 104,
+    "GBJIT_PPU_DRAW_MIN_X":  16,
+    "GBJIT_PPU_DRAW_MAX_X":  144,
+}
 CONFIGS = [
     ("baseline",                {}),
     ("hs256",                   {"GBJIT_HALT_STEP_CYCLES": 256}),
-    ("crop_visible",            {"GBJIT_PPU_DRAW_MIN_LY": 40,
-                                 "GBJIT_PPU_DRAW_MAX_LY": 104}),
-    ("hs256_crop",              {"GBJIT_HALT_STEP_CYCLES": 256,
+    ("hs256_rowcrop",           {"GBJIT_HALT_STEP_CYCLES": 256,
                                  "GBJIT_PPU_DRAW_MIN_LY": 40,
                                  "GBJIT_PPU_DRAW_MAX_LY": 104}),
-    ("hs256_crop_skip",         {"GBJIT_HALT_STEP_CYCLES": 256,
+    ("hs256_fullcrop",          {"GBJIT_HALT_STEP_CYCLES": 256, **_CROP_FULL}),
+    ("hs1024_fullcrop",         {"GBJIT_HALT_STEP_CYCLES": 1024, **_CROP_FULL}),
+    ("hs1024_fullcrop_skip",    {"GBJIT_HALT_STEP_CYCLES": 1024,
                                  "GBJIT_PPU_SKIP_DRAW": 1}),
 ]
 
