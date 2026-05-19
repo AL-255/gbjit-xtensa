@@ -31,11 +31,10 @@ IDF_EXPORT = Path.home() / ".espressif/v6.0.1/esp-idf/export.sh"
 # reference point for the relative deltas in the summary table.
 CONFIGS = [
     ("baseline",                {}),
-    ("halt_step_16",            {"GBJIT_HALT_STEP_CYCLES": 16}),
-    ("halt_step_64",            {"GBJIT_HALT_STEP_CYCLES": 64}),
-    ("halt_step_256",           {"GBJIT_HALT_STEP_CYCLES": 256}),
-    ("double_buffer_on",        {"GBJIT_FRAMEBUFFER_DOUBLE_BUFFER": 1}),
-    ("hs64_doublebuf",          {"GBJIT_HALT_STEP_CYCLES": 64,
+    ("addhl_off",               {"GBJIT_INLINE_ADD_HL_RR": 0}),
+    ("hs256",                   {"GBJIT_HALT_STEP_CYCLES": 256}),
+    ("hs256_addhl",             {"GBJIT_HALT_STEP_CYCLES": 256}),  # addhl already default on
+    ("hs256_dbuf",              {"GBJIT_HALT_STEP_CYCLES": 256,
                                  "GBJIT_FRAMEBUFFER_DOUBLE_BUFFER": 1}),
 ]
 

@@ -743,6 +743,51 @@ static bool inline_op(xt_emit *e, u8 opcode, u16 pc, inline_ctx *ictx) {
         return true;
     }
 
+    /* --- ADD HL, rr (0x09 BC, 0x19 DE, 0x29 HL, 0x39 SP) — common
+     * in pointer arithmetic (e.g. table indexing).
+     *
+     * Z is preserved, N cleared, H = carry-from-bit-11, C = carry-
+     * from-bit-15. Compile-time gated via -DGBJIT_INLINE_ADD_HL_RR=0
+     * to force the helper path. Default 1. */
+#ifndef GBJIT_INLINE_ADD_HL_RR
+#define GBJIT_INLINE_ADD_HL_RR 1
+#endif
+#if GBJIT_INLINE_ADD_HL_RR
+    if (opcode == 0x09 || opcode == 0x19 || opcode == 0x29 || opcode == 0x39) {
+        u8 pair = (opcode >> 4) & 3;
+        u32 src_off = OFF_BC;
+        switch (pair) {
+            case 0: src_off = OFF_BC; break;
+            case 1: src_off = OFF_DE; break;
+            case 2: src_off = OFF_HL; break;
+            case 3: src_off = OFF_SP; break;
+        }
+        /* a2 = HL, a3 = rr */
+        xt_l16ui(e, 2, 13, OFF_HL);
+        xt_l16ui(e, 3, 13, src_off);
+        /* C flag: bit 16 of HL + rr. */
+        xt_add  (e, 4, 2, 3);            /* a4 = HL + rr (32-bit, may overflow bit 16) */
+        xt_s16i (e, 4, 13, OFF_HL);      /* HL = sum & 0xFFFF (low 16 stored) */
+        xt_extui(e, 5, 4, 16, 0);        /* a5 = (a4 >> 16) & 1   carry */
+        xt_slli (e, 5, 5, 4);            /* a5 = C bit at FLAG_C position (0x10) */
+        /* H flag: ((HL & 0xFFF) + (rr & 0xFFF)) bit 12. */
+        xt_extui(e, 6, 2, 0, 11);        /* a6 = HL & 0xFFF (12 bits) */
+        xt_extui(e, 7, 3, 0, 11);        /* a7 = rr & 0xFFF */
+        xt_add  (e, 6, 6, 7);            /* a6 = sum_lo12 */
+        xt_extui(e, 6, 6, 12, 0);        /* a6 = bit 12 only */
+        xt_slli (e, 6, 6, 5);            /* a6 = H bit at FLAG_H position (0x20) */
+        /* Combine: F = (F & FLAG_Z) | H | C. N is cleared by mask. */
+        xt_l8ui (e, 4, 13, OFF_F);
+        xt_movi (e, 7, FLAG_Z);
+        xt_and  (e, 4, 4, 7);            /* preserve only Z */
+        xt_or   (e, 4, 4, 5);
+        xt_or   (e, 4, 4, 6);
+        xt_s8i  (e, 4, 13, OFF_F);
+        emit_advance(e, 1, 8);
+        return true;
+    }
+#endif
+
     /* --- JR r8 (0x18, unconditional) — block terminator. */
     if (opcode == 0x18) {
         i8 off = (i8)mmu_read8(m, (u16)(pc + 1));
