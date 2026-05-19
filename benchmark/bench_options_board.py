@@ -31,11 +31,12 @@ IDF_EXPORT = Path.home() / ".espressif/v6.0.1/esp-idf/export.sh"
 # reference point for the relative deltas in the summary table.
 CONFIGS = [
     ("baseline",                {}),
-    ("1way_predictor",          {"GBJIT_CHAIN_PREDICTOR_WAYS": 1}),
-    ("no_jphl_inline",          {"GBJIT_INLINE_JP_HL": 0}),
-    ("no_halt_inner",           {"GBJIT_DISPATCHER_HALT_INNER_LOOP": 0}),
+    ("halt_step_16",            {"GBJIT_HALT_STEP_CYCLES": 16}),
+    ("halt_step_64",            {"GBJIT_HALT_STEP_CYCLES": 64}),
+    ("halt_step_256",           {"GBJIT_HALT_STEP_CYCLES": 256}),
     ("double_buffer_on",        {"GBJIT_FRAMEBUFFER_DOUBLE_BUFFER": 1}),
-    ("async_ppu_on",            {"GBJIT_PPU_ASYNC": 1}),
+    ("hs64_doublebuf",          {"GBJIT_HALT_STEP_CYCLES": 64,
+                                 "GBJIT_FRAMEBUFFER_DOUBLE_BUFFER": 1}),
 ]
 
 def patch_for_bench():

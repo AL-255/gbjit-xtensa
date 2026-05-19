@@ -18,6 +18,29 @@
 #ifndef GBJIT_DISPATCHER_HALT_INNER_LOOP
 #define GBJIT_DISPATCHER_HALT_INNER_LOOP 1
 #endif
+
+/* GB cycles to advance per halt-loop iteration. SM83 HALT is
+ * semantically "wait for IRQ", so each iter just bumps the cycle
+ * counter and re-checks PPU/IRQ state. The fixed 4 below is the
+ * real DMG cycle granularity, but for IRQ-bound waits the only
+ * observable side effect of a larger step is IRQ latency: an IRQ
+ * raised at GB cycle X is noticed up to STEP-1 cycles later. SML's
+ * VBlank handler is ~5000 cycles long, so even a 256-cycle step
+ * shifts wake-up by <5%. Larger step → fewer halt iters → less
+ * dispatcher overhead → higher steady-state fps.
+ *
+ *   4   : DMG-accurate. Default.
+ *   16  : 4x throughput in halt, IRQ accuracy still near-DMG.
+ *   64  : 16x throughput, noticeable IRQ slop on timing-sensitive ROMs.
+ *   256 : maximal, only safe on VBlank-only ROMs like SML.
+ *
+ * The step is also a lower bound on the ppu_next_event_cycles check
+ * granularity, so very large values may delay scanline transitions.
+ * Combined with ppu_tick's delta-driven catch-up this stays
+ * functionally correct. */
+#ifndef GBJIT_HALT_STEP_CYCLES
+#define GBJIT_HALT_STEP_CYCLES 4
+#endif
 #include "xtensa_sim.h"
 #include "emit_xtensa.h"
 #include "gbjit_debug.h"
@@ -661,7 +684,7 @@ void gbjit_dispatcher_run_until(gbjit_dispatcher *d, u64 until) {
              * falls back to the naive "advance 4, continue" path. */
             mmu *m_halt = cpu->mmu;
             do {
-                cpu->cycles += 4;
+                cpu->cycles += GBJIT_HALT_STEP_CYCLES;
                 if (cpu->cycles >= m_halt->ppu_next_event_cycles
                         || m_halt->io[0x40] != m_halt->ppu_last_lcdc) {
                     ppu_tick(cpu);
@@ -673,7 +696,7 @@ void gbjit_dispatcher_run_until(gbjit_dispatcher *d, u64 until) {
             } while (cpu->halted && cpu->cycles < until);
             continue;
 #else
-            cpu->cycles += 4;
+            cpu->cycles += GBJIT_HALT_STEP_CYCLES;
             continue;
 #endif
         }
