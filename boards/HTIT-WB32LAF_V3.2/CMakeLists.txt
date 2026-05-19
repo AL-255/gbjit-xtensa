@@ -10,6 +10,38 @@ set(EXTRA_COMPONENT_DIRS "${CMAKE_CURRENT_LIST_DIR}/components")
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 idf_build_set_property(MINIMAL_BUILD ON)
 
+# Release-build defaults for this board. Each is a CMake variable so a
+# user can still override at configure time:
+#   idf.py -DGBJIT_HALT_STEP_CYCLES=4 build
+# These are the values that benchmark/results/board_option_sweep.md
+# documents as the steady-state-best for SML on the Heltec V3 OLED:
+#   sync PPU (correct BG)
+#   1024-cycle halt step (large halt-loop strides on HALT-heavy ROMs)
+#   crop the per-line render to the OLED's centre 128×64 window
+#   OLED I²C blits at native bandwidth (no artificial cap)
+#   chain-batching 4 blocks per outer iter (default already)
+if(NOT DEFINED GBJIT_PPU_ASYNC)
+    set(GBJIT_PPU_ASYNC 0)
+endif()
+if(NOT DEFINED GBJIT_HALT_STEP_CYCLES)
+    set(GBJIT_HALT_STEP_CYCLES 1024)
+endif()
+if(NOT DEFINED GBJIT_PPU_DRAW_MIN_LY)
+    set(GBJIT_PPU_DRAW_MIN_LY 40)
+endif()
+if(NOT DEFINED GBJIT_PPU_DRAW_MAX_LY)
+    set(GBJIT_PPU_DRAW_MAX_LY 104)
+endif()
+if(NOT DEFINED GBJIT_PPU_DRAW_MIN_X)
+    set(GBJIT_PPU_DRAW_MIN_X 16)
+endif()
+if(NOT DEFINED GBJIT_PPU_DRAW_MAX_X)
+    set(GBJIT_PPU_DRAW_MAX_X 144)
+endif()
+if(NOT DEFINED GBJIT_HTIT_OLED_MIN_INTERVAL_MS)
+    set(GBJIT_HTIT_OLED_MIN_INTERVAL_MS 0)
+endif()
+
 # Propagate JIT/PPU compile-time toggles project-wide. Flags that
 # affect the mmu struct layout (e.g. GBJIT_FRAMEBUFFER_DOUBLE_BUFFER)
 # MUST be visible to every translation unit that includes
