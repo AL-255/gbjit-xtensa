@@ -1,8 +1,73 @@
 #include "ppu.h"
 #include "cpu_state.h"
 #include "memory.h"
-#if GBJIT_FRAMEBUFFER_DOUBLE_BUFFER
-#include <string.h>   /* memcpy for back→front swap on frame complete */
+#include <string.h>   /* memcpy — frame buffer swap, tile-row pack/unpack */
+
+/* Fast tile-row renderer.
+ *
+ * When GBJIT_PPU_FAST_BG_RENDERER is on (default 1), ppu_draw_line
+ * uses two lookup tables to expand a 2-byte tile-row (b0, b1) into
+ * 8 pre-palette colour IDs and 8 post-palette shades using two
+ * 4-bit-keyed lookups instead of an 8-iteration bit-extract loop.
+ *
+ * Tables, indexed by [b0_nibble][b1_nibble], pack 4 results per u32
+ * (one byte per pixel, MSB-first as on the LCD):
+ *   bg_cid_lut    : 4 colour IDs (0..3) per entry.  Static, built once.
+ *   bg_shade_lut  : 4 post-BGP shades per entry.    Rebuilt on BGP edges.
+ *
+ * Total memory: 2 KB. The shade LUT is BGP-keyed, so when the game
+ * writes a new BGP we lazily rebuild on the next scanline that needs
+ * it. */
+#ifndef GBJIT_PPU_FAST_BG_RENDERER
+#define GBJIT_PPU_FAST_BG_RENDERER 1
+#endif
+
+#if GBJIT_PPU_FAST_BG_RENDERER
+static u32 bg_cid_lut[16][16];
+static u32 bg_shade_lut[16][16];
+static u8  bg_shade_lut_bgp = 0xFF;          /* invalid sentinel so first call builds */
+static bool bg_lut_inited = false;
+
+static void build_bg_cid_lut(void) {
+    /* Each entry handles 4 pixels (one nibble of b0 + one of b1).
+     * The display puts MSB of the byte on the left, so within the
+     * 4-pixel group pixel 0 (leftmost) uses bit 3 of each nibble. */
+    for (int b0 = 0; b0 < 16; b0++) {
+        for (int b1 = 0; b1 < 16; b1++) {
+            u32 packed = 0;
+            for (int p = 0; p < 4; p++) {
+                int bit = 3 - p;
+                u8 cid = (u8)((((b1 >> bit) & 1u) << 1) | ((b0 >> bit) & 1u));
+                packed |= ((u32)cid << (p * 8));
+            }
+            bg_cid_lut[b0][b1] = packed;
+        }
+    }
+    bg_lut_inited = true;
+}
+
+static void rebuild_shade_lut(u8 bgp) {
+    u8 shade[4] = {
+        (u8)(bgp & 3), (u8)((bgp >> 2) & 3),
+        (u8)((bgp >> 4) & 3), (u8)((bgp >> 6) & 3),
+    };
+    for (int b0 = 0; b0 < 16; b0++) {
+        for (int b1 = 0; b1 < 16; b1++) {
+            u32 cids = bg_cid_lut[b0][b1];
+            u32 packed = ((u32)shade[(cids >>  0) & 3])
+                       | ((u32)shade[(cids >>  8) & 3] <<  8)
+                       | ((u32)shade[(cids >> 16) & 3] << 16)
+                       | ((u32)shade[(cids >> 24) & 3] << 24);
+            bg_shade_lut[b0][b1] = packed;
+        }
+    }
+    bg_shade_lut_bgp = bgp;
+}
+
+static inline void ensure_bg_luts(u8 bgp) {
+    if (!bg_lut_inited) build_bg_cid_lut();
+    if (bgp != bg_shade_lut_bgp) rebuild_shade_lut(bgp);
+}
 #endif
 
 /* PPU state machine — adapted from CrankBoy's peanut_gb (libs/peanut_gb_core.h,
@@ -205,10 +270,46 @@ static inline u8 fetch_tile_pixel(const u8 *vram, u16 tile_addr_vram_rel,
     return (u8)(((b1 >> bit) & 1) << 1 | ((b0 >> bit) & 1));
 }
 
+/* Diagnostic: skip the entire per-line render to measure how much of
+ * the per-frame wall time is actually consumed by PPU drawing vs CPU
+ * dispatch + state-machine work. NOT a release flag — leaves the
+ * framebuffer stale, so the OLED shows whatever was there. */
+#ifndef GBJIT_PPU_SKIP_DRAW
+#define GBJIT_PPU_SKIP_DRAW 0
+#endif
+
+/* Crop the rendered scanline range. The Heltec OLED shows the centre
+ * 128×64 region of the 160×144 GB screen, i.e. GB rows 40..103.
+ * Rows outside the visible band can stay stale in the framebuffer
+ * without affecting the displayed image. Set GBJIT_PPU_DRAW_MIN_LY /
+ * GBJIT_PPU_DRAW_MAX_LY (inclusive lower, exclusive upper) at build
+ * time to gate drawing — the state machine still walks all 144
+ * scanlines, but ppu_draw_line returns early for the hidden rows.
+ * Default 0..144 = render everything. */
+#ifndef GBJIT_PPU_DRAW_MIN_LY
+#define GBJIT_PPU_DRAW_MIN_LY 0
+#endif
+#ifndef GBJIT_PPU_DRAW_MAX_LY
+#define GBJIT_PPU_DRAW_MAX_LY 144
+#endif
+
 /* Render scanline `ly` into m->framebuffer. Called at LCD_TRANSFER →
  * LCD_HBLANK; reads OAM, VRAM, BGP/OBP0/OBP1, LCDC, SCY/SCX, WY/WX
  * which must reflect the final state for this line. */
 static void ppu_draw_line(mmu *m, u8 ly) {
+#if GBJIT_PPU_SKIP_DRAW
+    (void)m; (void)ly;
+    return;
+#endif
+#if GBJIT_PPU_DRAW_MIN_LY > 0 || GBJIT_PPU_DRAW_MAX_LY < 144
+    /* Row hidden by the display crop — skip the per-line render.
+     * The framebuffer slot stays at whatever was last written. The
+     * preprocessor #if avoids emitting an always-false `u8 < 0`
+     * comparison when the macros are left at their no-crop defaults. */
+    if (ly < (u8)GBJIT_PPU_DRAW_MIN_LY || ly >= (u8)GBJIT_PPU_DRAW_MAX_LY) {
+        return;
+    }
+#endif
 #if GBJIT_FRAMEBUFFER_DOUBLE_BUFFER
     u8 *line = &m->framebuffer_back[(u32)ly * 160];
 #else
@@ -235,22 +336,77 @@ static void ppu_draw_line(mmu *m, u8 ly) {
         u8 pixel_row = (u8)(bg_y & 7);
         const u8 *tilemap_row = &m->vram[tilemap_base + tile_row * 32];
         u16 row_off = (u16)(pixel_row * 2);
-        /* Render a tile (8 pixels) at a time. Each tile contributes
-         * 2 bytes of bitplane data shared by all its pixels, so doing
-         * the lookup + 2-byte load once per 8 px instead of once per
-         * px cuts BG cost roughly in half. The inner per-pixel work
-         * is just a bit shift + two stores. */
+#if GBJIT_PPU_FAST_BG_RENDERER
+        ensure_bg_luts(bgp);
         int x = 0;
         u8 bg_x = scx;
-        u8 pc   = (u8)(bg_x & 7u);     /* starting pixel-column inside the first tile */
+        u8 pc   = (u8)(bg_x & 7u);
+        /* Leading partial tile (pc != 0): slow per-pixel until we
+         * reach an 8-pixel boundary in the framebuffer. */
+        if (pc != 0) {
+            u8 tile_col = (u8)((bg_x >> 3) & 0x1Fu);
+            u8 tile_id  = tilemap_row[tile_col];
+            u16 tile_addr = unsigned_tiles
+                          ? (u16)(tile_id * 16)
+                          : (u16)(0x1000 + (i8)tile_id * 16);
+            u8 b0 = m->vram[tile_addr + row_off];
+            u8 b1 = m->vram[tile_addr + row_off + 1u];
+            for (; pc < 8 && x < 160; pc++, x++, bg_x++) {
+                u8 bit = (u8)(7u - pc);
+                u8 cid = (u8)((((b1 >> bit) & 1u) << 1) | ((b0 >> bit) & 1u));
+                bg_color_id[x] = cid;
+                line[x] = bg_shade[cid];
+            }
+        }
+        /* Aligned fast path: 8 pixels per tile via two 4-bit LUT lookups. */
+        while (x + 8 <= 160) {
+            u8 tile_col = (u8)((bg_x >> 3) & 0x1Fu);
+            u8 tile_id  = tilemap_row[tile_col];
+            u16 tile_addr = unsigned_tiles
+                          ? (u16)(tile_id * 16)
+                          : (u16)(0x1000 + (i8)tile_id * 16);
+            u8 b0 = m->vram[tile_addr + row_off];
+            u8 b1 = m->vram[tile_addr + row_off + 1u];
+            u32 cids_h = bg_cid_lut[b0 >> 4][b1 >> 4];
+            u32 cids_l = bg_cid_lut[b0 & 0xF][b1 & 0xF];
+            u32 sha_h  = bg_shade_lut[b0 >> 4][b1 >> 4];
+            u32 sha_l  = bg_shade_lut[b0 & 0xF][b1 & 0xF];
+            memcpy(&bg_color_id[x],     &cids_h, 4);
+            memcpy(&bg_color_id[x + 4], &cids_l, 4);
+            memcpy(&line[x],            &sha_h,  4);
+            memcpy(&line[x + 4],        &sha_l,  4);
+            x += 8;
+            bg_x += 8;
+        }
+        /* Trailing partial tile. */
+        while (x < 160) {
+            u8 tile_col = (u8)((bg_x >> 3) & 0x1Fu);
+            u8 tile_id  = tilemap_row[tile_col];
+            u16 tile_addr = unsigned_tiles
+                          ? (u16)(tile_id * 16)
+                          : (u16)(0x1000 + (i8)tile_id * 16);
+            u8 b0 = m->vram[tile_addr + row_off];
+            u8 b1 = m->vram[tile_addr + row_off + 1u];
+            for (pc = 0; pc < 8 && x < 160; pc++, x++, bg_x++) {
+                u8 bit = (u8)(7u - pc);
+                u8 cid = (u8)((((b1 >> bit) & 1u) << 1) | ((b0 >> bit) & 1u));
+                bg_color_id[x] = cid;
+                line[x] = bg_shade[cid];
+            }
+        }
+#else
+        /* Per-pixel bit-extract path (legacy). */
+        int x = 0;
+        u8 bg_x = scx;
+        u8 pc   = (u8)(bg_x & 7u);
         while (x < 160) {
             u8 tile_col = (u8)((bg_x >> 3) & 0x1Fu);
             u8 tile_id  = tilemap_row[tile_col];
             u16 tile_addr;
             if (unsigned_tiles) {
-                tile_addr = (u16)(tile_id * 16);                /* base $8000 */
+                tile_addr = (u16)(tile_id * 16);
             } else {
-                tile_addr = (u16)(0x1000 + (i8)tile_id * 16);   /* base $9000 */
+                tile_addr = (u16)(0x1000 + (i8)tile_id * 16);
             }
             u8 b0 = m->vram[tile_addr + row_off];
             u8 b1 = m->vram[tile_addr + row_off + 1u];
@@ -262,6 +418,7 @@ static void ppu_draw_line(mmu *m, u8 ly) {
             }
             pc = 0;
         }
+#endif
     } else {
         for (int x = 0; x < 160; x++) {
             bg_color_id[x] = 0;
