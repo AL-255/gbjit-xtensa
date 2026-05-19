@@ -37,7 +37,8 @@ foreach(_opt
         GBJIT_PPU_DRAW_MAX_X
         GBJIT_ARENA_KB
         GBJIT_PPU_ASYNC
-        GBJIT_DISPATCHER_SERVICE_SHORTCUT)
+        GBJIT_DISPATCHER_SERVICE_SHORTCUT
+        GBJIT_DISPATCHER_CHAIN_BATCH)
     if(DEFINED ${_opt})
         add_compile_definitions(${_opt}=${${_opt}})
     endif()

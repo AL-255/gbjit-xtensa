@@ -841,16 +841,6 @@ void gbjit_dispatcher_run_until(gbjit_dispatcher *d, u64 until) {
 
 #if defined(ESP_PLATFORM)
         enter_block_native(b, cpu);
-        /* The JIT block runs in CALL0 ABI inside enter_block_native's
-         * windowed frame. On plain ESP32 (LX6) the windowed save/restore
-         * around this call doesn't reliably preserve every caller-side
-         * register the GCC scheduler relied on (we've seen `d` end up
-         * with a flash-rodata literal after the call returns, which
-         * faults on the next store). Force the compiler to spill all
-         * live values to memory before the call and reload them after:
-         * a no-op asm with a "memory" clobber, plus listing every
-         * candidate register so GCC can't keep any of them live across
-         * the boundary. */
         __asm__ volatile("" :::
             "a2","a3","a4","a5","a6","a7",
             "a8","a9","a10","a11","a12","a13","a14","a15",
@@ -861,14 +851,52 @@ void gbjit_dispatcher_run_until(gbjit_dispatcher *d, u64 until) {
         GBJIT_STAT_INC(d, blocks_executed);
 
         if (d->no_cache) {
-            /* Don't hand a pointer to a doomed block to the chain cache;
-             * free the gbjit_block struct (the arena gets reset on the
-             * next iteration). */
             gbjit_block_free(b);
             prev = NULL;
         } else {
             prev = b;
         }
+
+        /* Block-batching fast path: while the just-executed block has a
+         * cached successor matching the new PC, call it directly
+         * without going through the dispatcher's outer-iter checks
+         * (rom_bank_dirty, sm83_service_interrupts, halt, ime_pending,
+         * interp_fallback, chain-update, etc.).
+         *
+         * Compile-time gated via GBJIT_DISPATCHER_CHAIN_BATCH — set to
+         * the max number of extra blocks per outer iter. 0 disables
+         * the batch entirely (every block goes through the slow
+         * dispatcher loop). 4 is a reasonable default — small enough
+         * that IRQ-wake latency stays bounded to a few hundred GB
+         * cycles, big enough to amortise the outer-loop fat. */
+#ifndef GBJIT_DISPATCHER_CHAIN_BATCH
+#define GBJIT_DISPATCHER_CHAIN_BATCH 4
+#endif
+#if GBJIT_DISPATCHER_CHAIN_BATCH > 0 && defined(ESP_PLATFORM)
+        if (likely(prev && !d->no_cache)) {
+            for (int _batch = 0; _batch < GBJIT_DISPATCHER_CHAIN_BATCH; _batch++) {
+                if (cpu->cycles >= until) break;
+                if (cpu->halted || cpu->ime_pending) break;
+                gbjit_block *_next = NULL;
+                for (int _i = 0; _i < GBJIT_CHAIN_PREDICTOR_WAYS; _i++) {
+                    if (prev->predicted_next_pc[_i] == cpu->pc
+                            && prev->predicted_next[_i]) {
+                        _next = prev->predicted_next[_i];
+                        break;
+                    }
+                }
+                if (!_next) break;
+                GBJIT_STAT_INC(d, chain_hits);
+                enter_block_native(_next, cpu);
+                __asm__ volatile("" :::
+                    "a2","a3","a4","a5","a6","a7",
+                    "a8","a9","a10","a11","a12","a13","a14","a15",
+                    "memory");
+                GBJIT_STAT_INC(d, blocks_executed);
+                prev = _next;
+            }
+        }
+#endif
 
         /* `stopped` is unrecoverable — STOP halts the CPU clock until
          * reset. HALT alone is not terminal: the next iteration's

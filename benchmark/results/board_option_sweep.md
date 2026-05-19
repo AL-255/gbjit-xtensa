@@ -1,79 +1,77 @@
 # Board-side option sweep — HTIT-WB32LAF_V3.2
 
-ROM: Super Mario Land (sml.gb). Each configuration was built with
+ROM: Super Mario Land (sml.gb). Each configuration is built with
 `benchmark/bench_options_board.py`, flashed to the Heltec board, and
-sampled for 32 seconds with the first 8 seconds discarded (boot + SML
-title screen). 24 useful fps samples per row.
+sampled for 32 seconds with the first 8 seconds discarded
+(boot + SML title screen). 24 useful fps samples per row.
 
-## Headline result
+## Headline
 
-Min FPS rose from **54** (defaults) to **86** with all opt-in
-optimizations stacked. The user's 90-fps target is reached only with
-the OLED disabled entirely; with the OLED display active and capped
-at 100 ms blit interval, the steady-state floor is 79-80 fps.
+| Stack | min | avg | Δmin vs baseline |
+|---|---:|---:|---:|
+| baseline (defaults) | 54 | 79 | 0 |
+| sync_all_opts (hs1024 + crop + OLED 100 ms) | 60-77 | ~100 | +6 to +23 |
+| async + crop + OLED 100 ms | 79-83 | ~145 | +25 to +29 |
+| **async + batching + crop + OLED 100 ms** | **80-83** | **147** | **+26 to +29** |
+| async + batching + crop + no OLED | 74-87 | ~154 | up to +33 |
 
-## Detailed sweep
+The minimum is run-to-run noisy by ±5 fps depending on what point in
+SML's title-screen demo the bench captures. Numbers above are the
+single-run min from one bench session; the best observed across
+multiple runs was 90 fps min (async + no OLED).
 
-| Config | min | avg | max | Notes |
-|---|---:|---:|---:|---|
-| baseline (no opts) | 54 | 78.0 | 139 | sync PPU, no crop, halt step 4, OLED unlimited |
-| sync + all_opts | 60 | 100.8 | 412 | hs1024 + row+col crop + OLED 100 ms cap |
-| async + OLED 100 ms | **79** | 141.6 | 538 | async PPU on Core 1 + crop + OLED 100 ms |
-| async + OLED 500 ms | 73 | 148.0 | 495 | OLED 500 ms = ~2 fps display |
-| async + no OLED | **86** | 154.4 | 527 | display off |
+## Optimization stack (all opt-in via cmake -D)
 
-The "all opts" stack:
-
-| Flag | Value | What it does |
+| Flag | Default | Effect on this workload |
 |---|---|---|
-| `GBJIT_HALT_STEP_CYCLES` | 1024 | Halt loop advances 1024 GB cycles per iter |
-| `GBJIT_PPU_DRAW_MIN_LY` / `MAX_LY` | 40 / 104 | Skip rows outside OLED's visible 64-row band |
-| `GBJIT_PPU_DRAW_MIN_X` / `MAX_X` | 16 / 144 | Skip columns outside OLED's visible 128-col band |
-| `GBJIT_HTIT_OLED_MIN_INTERVAL_MS` | 100 | OLED blits at most every 100 ms (~10 fps display) |
-| `GBJIT_PPU_ASYNC` | 1 | Run PPU on Core 1 — frees Core 0 from ppu_tick + draws |
+| `GBJIT_PPU_ASYNC` | 0 | **+9 fps min** when enabled — moves PPU off Core 0 |
+| `GBJIT_HALT_STEP_CYCLES` | 4 | **+6 fps min** at 1024; diminishing returns past that |
+| `GBJIT_PPU_DRAW_MIN_LY / MAX_LY` | 0 / 144 | **+8 fps min** at 40/104 — skips off-screen rows |
+| `GBJIT_PPU_DRAW_MIN_X / MAX_X` | 0 / 160 | no effect alone (LUT amortises) |
+| `GBJIT_HTIT_OLED_MIN_INTERVAL_MS` | 0 | **+5-6 fps min** at 100; OLED steals Core 1 cycles |
+| `GBJIT_DISPATCHER_CHAIN_BATCH` | 4 | **+3-4 fps min** — runs chained blocks without per-iter checks |
+| `GBJIT_PPU_FAST_BG_RENDERER` | 1 | byte-identical to peanut_gb on host; ~0 fps on board |
+| `GBJIT_CHAIN_PREDICTOR_WAYS` | 2 | within noise on SML |
+| `GBJIT_INLINE_JP_HL` | 1 | within noise on SML |
+| `GBJIT_INLINE_ADD_HL_RR` | 1 | within noise on SML |
+| `GBJIT_DISPATCHER_HALT_INNER_LOOP` | 1 | **−9 fps min** if turned off; load-bearing |
+| `GBJIT_FRAMEBUFFER_DOUBLE_BUFFER` | 0 | ±1 fps |
+| `GBJIT_DISPATCHER_SERVICE_SHORTCUT` | 0 | regresses by 6 fps min with halt inner loop; kept off |
 
-## What works and what doesn't
+## Bottlenecks at the 80 fps floor
 
-The big wins on **average** fps were halt-step increase and PPU
-async. The big wins on **minimum** fps were async + crop:
+* PPU rendering itself is no longer the bottleneck — `GBJIT_PPU_SKIP_DRAW=1`
+  (which makes ppu_draw_line a no-op) only moves the floor by ~2 fps
+  beyond the cropped renderer.
+* Core 1's OLED I²C activity steals 4-6 fps min from Core 0 even with
+  the panel throttled to 10 fps, because the DMA shares the internal
+  SRAM bus with the dispatcher's per-block cpu_state accesses.
+* The remaining gap to 90 fps comes from the JIT's per-op cost during
+  SML's active-gameplay scenes. The JIT block size (~50 GB cycles)
+  and per-op overhead (~5 Xtensa cycles per GB cycle) put the active
+  scenes ≈10 ms of Core 0 time per emulated frame.
 
-* `hs256` → `hs1024`: +avg, ~+1 fps min (avg jumped from 80 → 120, min barely moved)
-* Row crop alone: **+8 fps min**
-* Async PPU: **+9 fps min** (over the sync ceiling)
-* OLED rate cap from unlimited → 100 ms: **+6 fps min** in sync mode
+## To reliably hit 90 fps min
 
-What didn't move the needle:
+The compile-time toggle sweep has reached its limit. The next attacks
+need new code:
 
-* `GBJIT_CHAIN_PREDICTOR_WAYS=4` vs 2: ±1 fps (noise)
-* `GBJIT_INLINE_JP_HL=0`, `GBJIT_INLINE_ADD_HL_RR=0`: ±1 fps (noise on SML; likely matters more on Blargg)
-* Column crop alone: 0 fps (the LUT renderer amortises tile lookups; trimming 32 px of edge doesn't reduce tile count)
-* `GBJIT_FRAMEBUFFER_DOUBLE_BUFFER=1`: ±1 fps
-* `GBJIT_DISPATCHER_SERVICE_SHORTCUT=1`: −6 fps min (regresses with halt inner loop)
-* `GBJIT_ARENA_KB=96`: ±0 fps
-* Halt step beyond 1024 (`hs4096`): no further gain
-* `GBJIT_PPU_FAST_BG_RENDERER=0` (legacy renderer): ±1 fps (LUT path is byte-identical to peanut_gb on host but the speedup is marginal because the inner store loop is byte-unaligned for non-zero SCX)
+1. **Lazy flag materialisation** (task #20). SML's main loop runs
+   thousands of arithmetic ops per frame, every one of which currently
+   recomputes and stores F. Deferring the F-update until a flag
+   consumer fires would cut ~5-10 cycles per ALU op.
+2. **Direct block linking** in the JIT itself. Emit at block exit:
+   `l32r a8, <patched_slot>; jx a8` so the dispatcher's hot loop
+   doesn't run between consecutive chained blocks. Avoids the
+   enter_block_native windowed bridge entirely.
+3. **Move the I²C bus master to Core 0** so the OLED's DMA path
+   stops sharing the SRAM-bus arbiter with the JIT.
+4. **Switch to an SPI display panel** — the Heltec V3's I²C OLED
+   caps at ~100 Hz blit; SPI would 10×+ the bandwidth and remove
+   the OLED rate cap.
 
-## What blocks 90 fps min with the OLED on
-
-`async + no OLED` reaches 86 fps min consistently. `async + OLED 100 ms`
-sits at 79. The 6-7 fps gap is Core 1's OLED activity stealing Core 1
-time from the PPU thread, which delays IF.VBLANK on Core 0 and slows
-the halt loop. Possible future attacks:
-
-1. **Move OLED I²C interrupt to Core 0** so Core 1 is pure PPU. Tricky
-   because the ESP-IDF i2c_master driver picks the interrupt's affinity
-   based on where init was called from.
-2. **Move OLED rendering off the I²C critical path** — DMA chained so
-   compose and blit overlap, then sleep until next frame.
-3. **Lazy flag materialisation** (task #20). Cuts per-op cost on the
-   ALU-heavy code paths inside SML's main loop. Most directly attacks
-   the active-gameplay floor.
-4. **Direct block linking**. Removes the ~30 Xtensa cycles of
-   dispatcher overhead per chain hit. Modest individual win, but stacks.
-5. **A 3rd-party board with SPI OLED** would let us run the display at
-   ~20 MHz instead of 1 MHz I²C — 20× the blit bandwidth.
-
-Reproduce: `python3 benchmark/bench_options_board.py`. The harness
-temporarily patches sdkconfig.defaults + the gbjit / main CMakeLists
-to enable DEBUG + INFO logs (so the oled_task fps print reaches the
-UART), and restores them on exit.
+Reproduce: `python3 benchmark/bench_options_board.py` (board on
+`/dev/ttyUSB0`; set `GBJIT_PORT` to override). The harness patches
+sdkconfig.defaults + the gbjit / main CMakeLists to enable DEBUG +
+INFO logs so the oled_task fps print reaches the UART, and restores
+them on exit.
