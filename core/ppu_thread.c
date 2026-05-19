@@ -40,13 +40,14 @@ void ppu_thread_start(struct cpu_state *cpu) {
     if (s_ppu_task) return;
     s_ppu_run = true;
     /* Stack: ppu_tick is shallow (no recursion, leaf-ish), 4 KB is
-     * comfortable. Priority: above idle so it actually runs; below the
-     * default app_main priority so a runaway PPU loop can't lock out
-     * the CPU side (which is on the other core anyway, but kept low
-     * defensively). */
+     * comfortable. Priority: tskIDLE_PRIORITY + 1 — same as the OLED
+     * task. They round-robin via FreeRTOS time slicing on Core 1. */
+#ifndef GBJIT_PPU_THREAD_PRIORITY
+#define GBJIT_PPU_THREAD_PRIORITY (tskIDLE_PRIORITY + 1)
+#endif
     BaseType_t ok = xTaskCreatePinnedToCore(
         ppu_task, "gbjit_ppu", 4096, cpu,
-        tskIDLE_PRIORITY + 1, &s_ppu_task,
+        GBJIT_PPU_THREAD_PRIORITY, &s_ppu_task,
         1 /* Core 1 */);
     if (ok != pdPASS) {
         s_ppu_task = NULL;

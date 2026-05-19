@@ -22,8 +22,8 @@ COMPONENT_CMAKE = BOARD / "components/gbjit/CMakeLists.txt"
 MAIN_CMAKE = BOARD / "main/CMakeLists.txt"
 SDKCONFIG_DEFAULTS = BOARD / "sdkconfig.defaults"
 PORT = os.environ.get("GBJIT_PORT", "/dev/ttyUSB0")
-SAMPLE_TIME = 22       # seconds of serial capture per config
-SKIP_FIRST_S = 6       # discard the first N seconds (boot + title screen)
+SAMPLE_TIME = 32       # seconds of serial capture per config
+SKIP_FIRST_S = 8       # discard the first N seconds (boot + title screen)
 IDF_EXPORT = Path.home() / ".espressif/v6.0.1/esp-idf/export.sh"
 
 # (label, dict-of-cmake-defines).
@@ -40,13 +40,13 @@ _ALL_ON = {
     "GBJIT_HTIT_OLED_MIN_INTERVAL_MS": 100,
     **_CROP_FULL,
 }
+_ASYNC = {**_ALL_ON, "GBJIT_PPU_ASYNC": 1}
 CONFIGS = [
     ("baseline_default",        {}),
-    ("all_opts",                _ALL_ON),
-    ("all_opts_shortcut_off",   {**_ALL_ON, "GBJIT_DISPATCHER_SERVICE_SHORTCUT": 0}),
-    ("all_opts_no_oled",        {**_ALL_ON, "GBJIT_HTIT_OLED_ENABLE": 0}),
-    ("all_opts_skip_no_oled",   {**_ALL_ON, "GBJIT_PPU_SKIP_DRAW": 1,
-                                 "GBJIT_HTIT_OLED_ENABLE": 0}),
+    ("sync_all_opts",           _ALL_ON),
+    ("async_oled_100ms",        _ASYNC),
+    ("async_oled_500ms",        {**_ASYNC, "GBJIT_HTIT_OLED_MIN_INTERVAL_MS": 500}),
+    ("async_no_oled",           {**_ASYNC, "GBJIT_HTIT_OLED_ENABLE": 0}),
 ]
 
 def patch_for_bench():
