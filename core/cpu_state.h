@@ -59,4 +59,21 @@ void cpu_reset(cpu_state *cpu, struct mmu *mmu);
 static inline u8 cpu_get_f(const cpu_state *cpu) { return cpu->f & 0xF0u; }
 static inline void cpu_set_f(cpu_state *cpu, u8 v) { cpu->f = v & 0xF0u; }
 
+/* Wrap-safe cycle-timestamp comparison.
+ *
+ * `cpu_state.cycles` is a free-running T-cycle counter. The JIT writes
+ * back only its low 32 bits (one store, no carry) for speed, so the
+ * effective counter wraps every 2^32 cycles (~17 min of GB time). That
+ * wrap is expected and harmless *as long as* timestamps are compared
+ * modularly: a plain `now >= deadline` breaks the moment `now` wraps
+ * past `deadline`, freezing whatever waits on it (the PPU, the timer).
+ *
+ * gb_cycles_reached() compares via a signed 32-bit difference, so it is
+ * correct across a wrap provided the two stamps are < 2^31 apart — PPU
+ * and timer deadlines are at most a frame or two ahead, far inside that.
+ * Returns true once `now` has reached or passed `deadline`. */
+static inline bool gb_cycles_reached(u64 now, u64 deadline) {
+    return (i32)((u32)now - (u32)deadline) >= 0;
+}
+
 #endif

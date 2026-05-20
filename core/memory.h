@@ -66,6 +66,26 @@ typedef struct mmu {
      * mmu_read8). */
     u8       rom_bank_dirty;
 
+    /* Self-modifying-code tracking for the JIT. Games that run code from
+     * RAM (WRAM / HRAM) and then overwrite it — blargg's per-instruction
+     * test runner rewrites its WRAM code between sub-tests — leave the
+     * JIT holding a stale translation of the old bytes. ROM-region SMC
+     * is already covered by rom_bank_dirty; this covers RAM.
+     *
+     * `jit_page_state` is indexed by 256-byte GB page (addr >> 8):
+     *   0 = no JIT block compiled from this page
+     *   1 = a block was compiled here (clean)
+     *   2 = a block was compiled here AND the page has since been written
+     * The dispatcher sets state 1 in insert_block; mmu_write8 promotes
+     * 1 → 2 (and raises jit_smc_dirty) on a write to a code page; the
+     * dispatcher polls jit_smc_dirty before each block, invalidates the
+     * dirty pages, and resets their state. Writes to pages with state 0
+     * (the overwhelming majority — stack, variables) cost just one array
+     * load + branch, so the common case stays cheap. The interpreter
+     * never sets state 1, so it pays nothing. */
+    u8       jit_smc_dirty;
+    u8       jit_page_state[256];
+
     /* Back-pointer to the CPU. ppu_tick uses cpu->cycles as its time base
      * and writes back into io[$44]/io[$41]; left NULL the PPU model is
      * inert and reads return the raw IO bytes. */

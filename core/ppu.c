@@ -613,8 +613,11 @@ void ppu_tick(struct cpu_state *cpu) {
 
     /* Fast-path early-return — most dispatcher iterations span fewer
      * cycles than the next state transition. The deadline is reset
-     * after every transition (or every LCDC edge). */
-    if (cpu->cycles < m->ppu_next_event_cycles
+     * after every transition (or every LCDC edge). The comparison is
+     * wrap-safe: cpu->cycles is a 32-bit free-running counter, so a
+     * plain `cycles < deadline` would early-return forever once the
+     * counter wraps past the deadline. */
+    if (!gb_cycles_reached(cpu->cycles, m->ppu_next_event_cycles)
             && m->io[LCDC_REG] == m->ppu_last_lcdc) {
         return;
     }

@@ -325,7 +325,10 @@ static void insert_block(gbjit_dispatcher *d, gbjit_block *block) {
     b->next = (dispatcher_bucket *)d->buckets[idx];
     d->buckets[idx] = (gbjit_block *)b;
 
-    /* Register the block on every 256-byte SMC page it overlaps. */
+    /* Register the block on every 256-byte SMC page it overlaps, and
+     * tell the mmu that page now holds JIT code (state 0 → 1) so a
+     * later write to it raises jit_smc_dirty. Leave state 2 alone — a
+     * write may have landed between compile and insert. */
     u32 first_page = block->gb_pc_start >> GBJIT_SMC_PAGE_SHIFT;
     u32 last_page  = (block->gb_pc_end > 0 ? (u32)((block->gb_pc_end - 1) >> GBJIT_SMC_PAGE_SHIFT)
                                            : first_page);
@@ -335,6 +338,8 @@ static void insert_block(gbjit_dispatcher *d, gbjit_block *block) {
         node->b = block;
         node->next = (smc_page_node *)d->smc_pages[p];
         d->smc_pages[p] = node;
+        if (d->cpu && d->cpu->mmu && d->cpu->mmu->jit_page_state[p] == 0u)
+            d->cpu->mmu->jit_page_state[p] = 1u;
     }
 }
 
@@ -487,41 +492,56 @@ void gbjit_dispatcher_invalidate_addr(gbjit_dispatcher *d, u16 gb_addr) {
 __attribute__((noinline))
 /* `noinline` is load-bearing: when this function gets inlined into
  * `gbjit_dispatcher_run_until`, the JIT block (which doesn't allocate
- * its own stack frame) inherits the dispatcher's `a1`. If a deeper
- * call from inside the JIT trampolines causes a window overflow, the
- * Xtensa overflow handler spills the live a0..a3 to a1+0..15 — i.e.
- * to the dispatcher's stack frame, on top of compiler-managed locals
- * stored there. On LX6 (plain ESP32) this corrupts the dispatcher's
- * `d` pointer and a subsequent `d->blocks_executed++` faults trying
- * to write to the literal slot it accidentally pointed at.
+ * its own stack frame) inherits the dispatcher's `a1`. Forcing
+ * `enter_block_native` to be a real function call gives the JIT block
+ * its own `a1` (this function's frame).
  *
- * Forcing `enter_block_native` to be a real function call gives the
- * JIT block its own `a1` (this function's frame); the overflow handler
- * spills into a1+0..15 here, which we keep clear (return PC saved at
- * offset 16, above the spill zone). */
+ * Saving the windowed return PC across the CALL0 is the subtle part.
+ * The Xtensa window-overflow handler spills a function's a0..a3 to
+ * *its own SP - 16* and (for a CALL8 frame) a4..a7 to *SP - 32* — i.e.
+ * into the TOP of the callee's frame. `enter_block_native`'s natural
+ * frame is just 32 bytes (`entry a1,32`, no locals), which means its
+ * ENTIRE frame doubles as `run_until`'s a0..a7 spill area. Saving our
+ * return PC anywhere in a 32-byte frame (the old code used offset 16)
+ * lands it squarely on `run_until`'s spilled a0 slot: when a deep
+ * helper call from inside a JIT block triggers a window overflow, the
+ * handler and our manual save clobber each other, and the `retw` below
+ * returns to a garbage PC — control flow derails and faults somewhere
+ * unrelated (observed as a bogus `gbjit_block_free` crash).
+ *
+ * Fix: force a large frame with `pad[]` so there is real frame space
+ * BELOW the caller's save area, and stash the return PC at the very
+ * bottom (`a1 + 0`). The bottom of the frame is below run_until's spill
+ * area (always the TOP 16/32/48 bytes), below our own a0..a7 spill
+ * area (always BELOW our SP), and untouched by helper frames (also
+ * below our SP) — the only safe a1-relative slot. `a1` is the one
+ * register that survives the CALL0, so an a1-relative save is the only
+ * option for restoring a0 after the call. */
 __attribute__((noinline))
 static void enter_block_native(gbjit_block *b, cpu_state *cpu) {
     uint32_t fn = (uint32_t)(uintptr_t)(b->code + b->entry_off);
+    /* Padding to inflate our frame well past the caller's worst-case
+     * save area (48 bytes for a CALL12 caller). The compiler places
+     * locals BELOW that save area, so with this present `a1 + 0` is
+     * guaranteed to sit in our own private frame space. `volatile` +
+     * the "memory" clobber keep it from being optimised away. */
+    volatile uint32_t pad[12];
+    pad[0] = fn;
     /* Pin `cpu` into a2 — CALL0 callees receive their first argument there.
      * Pin `fn` into a8 — CALLX0's target register, free across the call. */
     register uint32_t a2_cpu asm("a2") = (uint32_t)(uintptr_t)cpu;
     register uint32_t a8_fn  asm("a8") = fn;
     asm volatile (
-        /* Save windowed return PC to offset 16 (NOT 0) — the Xtensa window
-         * overflow handler uses offsets 0..15 of every windowed function's
-         * frame to spill the live a0..a3 if a deeper CALL{N} overflows. If
-         * we saved at offset 0 here, the spill of our (now-clobbered) a0
-         * would overwrite our manual save, and the RETW at function exit
-         * would see CALLINC=0 instead of 2 and trap with IllegalInstr. */
-        "s32i a0, a1, 16\n"     /* save windowed return PC above save-area */
+        "s32i a0, a1, 0\n"      /* save windowed return PC at frame bottom */
         "callx0 %1\n"           /* CALL0 into the JIT block */
-        "l32i a0, a1, 16\n"     /* restore windowed return PC */
+        "l32i a0, a1, 0\n"      /* restore windowed return PC */
         : "+r"(a2_cpu)
         : "r"(a8_fn)
         : "a3","a4","a5","a6","a7","a9","a10","a11","a12","a13","a14","a15",
           "memory"
     );
     (void)b;
+    (void)pad;
 }
 #else
 
@@ -621,29 +641,40 @@ static void enter_block_sim(gbjit_block *b, cpu_state *cpu) {
 #define unlikely(x) __builtin_expect(!!(x), 0)
 #endif
 
+/* Hot-loop state for gbjit_dispatcher_run_until, parked in .bss rather
+ * than on the stack.
+ *
+ * The dispatcher calls into JIT-emitted code through enter_block_native,
+ * a windowed-ABI `call8`. Deep helper-call nesting under the JIT block
+ * can trigger an Xtensa window-overflow exception; the overflow handler
+ * spills the overflowed frames' registers into stack-frame save areas.
+ * On ESP32-S3 those spill offsets overlap whatever stack slots the
+ * compiler picked for run_until's live locals — so the cached `d`
+ * pointer would come back corrupted after the call (classic symptom:
+ * `d` reloads as a flash address 0x3C02xxxx or near-NULL, and the next
+ * `d->blocks_executed++` faults with LoadProhibited / LoadStorePIFAddr).
+ *
+ * A stack-padding workaround didn't reliably move the slots clear of
+ * the spill window. Keeping the state in .bss instead is robust: the
+ * window-overflow handler only ever writes stack frames, never .bss,
+ * so these survive the call and the post-call reload is always sane.
+ * run_until is not reentrant (one dispatch loop per core), so file-
+ * static storage is fine. */
+static gbjit_dispatcher *s_run_d;
+static cpu_state        *s_run_cpu;
+static gbjit_block      *s_run_prev;
+static u64               s_run_until;
+
 __attribute__((hot))
-void gbjit_dispatcher_run_until(gbjit_dispatcher *d, u64 until) {
-#if defined(ESP_PLATFORM) && !defined(CONFIG_IDF_TARGET_ESP32S3)
-    /* Xtensa LX6 windowed-ABI workaround: when this function does its
-     * inner `call8` (to enter_block_native) and that call's downstream
-     * trampoline `call8` triggers a window-overflow exception, the
-     * overflow handler (_WindowOverflow8 in xtensa_vectors.S) spills
-     * the overflowed frame's a4..a7 to byte offsets +16, +20, +24, +28
-     * within OUR stack frame. The compiler's stack-slot allocator
-     * happily uses those same offsets for our locals (in particular
-     * the cached `d + offsetof(blocks_executed-region)` value at SP+20)
-     * — every overflow corrupts that slot, and the post-call reload
-     * faults dereferencing the spilled register value as if it were a
-     * pointer. Reserving 64 bytes of padding at the bottom of the frame
-     * forces the compiler to push its locals above the spill window,
-     * so the overflow handler writes into untouched padding instead of
-     * load-bearing state. `volatile` + the dummy write keep it from
-     * being optimised out. */
-    volatile uint8_t _gbjit_overflow_pad[64];
-    _gbjit_overflow_pad[0] = 0;
-#endif
-    cpu_state *cpu = d->cpu;
-    gbjit_block *prev = NULL;
+void gbjit_dispatcher_run_until(gbjit_dispatcher *d_param, u64 until_param) {
+    s_run_d     = d_param;
+    s_run_until = until_param;
+    s_run_cpu   = d_param->cpu;
+    s_run_prev  = NULL;
+#define d     s_run_d
+#define until s_run_until
+#define cpu   s_run_cpu
+#define prev  s_run_prev
 
     while (cpu->cycles < until) {
         /* MBC bank switched since last iteration → invalidate every JIT
@@ -658,6 +689,27 @@ void gbjit_dispatcher_run_until(gbjit_dispatcher *d, u64 until) {
                 gbjit_dispatcher_invalidate_addr(d, (u16)a);
             }
             cpu->mmu->rom_bank_dirty = 0;
+            prev = NULL;
+        }
+        /* Self-modifying code: a RAM page that a JIT block was compiled
+         * from has since been written (mmu_write8 set jit_page_state to
+         * 2 and raised jit_smc_dirty). Invalidate every block on each
+         * such page so the next dispatch recompiles from the new bytes.
+         * Games that run + rewrite code in WRAM/HRAM (blargg's per-
+         * instruction test runner) depend on this; without it the JIT
+         * executes a stale translation of the old code. */
+        if (unlikely(cpu->mmu->jit_smc_dirty)) {
+            u8 *st = cpu->mmu->jit_page_state;
+            for (u32 p = 0; p < GBJIT_SMC_PAGE_COUNT; p++) {
+                if (st[p] == 2u) {
+                    gbjit_dispatcher_invalidate_addr(
+                        d, (u16)(p << GBJIT_SMC_PAGE_SHIFT));
+                    /* Page has no blocks now; insert_block re-marks it
+                     * to state 1 when the page is recompiled. */
+                    st[p] = 0u;
+                }
+            }
+            cpu->mmu->jit_smc_dirty = 0;
             prev = NULL;
         }
         /* Service pending interrupts and wake from HALT before each block.
@@ -684,7 +736,7 @@ void gbjit_dispatcher_run_until(gbjit_dispatcher *d, u64 until) {
             mmu *_m = cpu->mmu;
             bool _need_service = cpu->halted
                 || cpu->ime_pending
-                || cpu->cycles >= _m->ppu_next_event_cycles
+                || gb_cycles_reached(cpu->cycles, _m->ppu_next_event_cycles)
                 || _m->io[0x40] != _m->ppu_last_lcdc
                 || (_m->io[0x0F] & _m->ie & 0x1Fu) != 0;
             if (unlikely(_need_service)) {
@@ -714,7 +766,7 @@ void gbjit_dispatcher_run_until(gbjit_dispatcher *d, u64 until) {
             mmu *m_halt = cpu->mmu;
             do {
                 cpu->cycles += GBJIT_HALT_STEP_CYCLES;
-                if (cpu->cycles >= m_halt->ppu_next_event_cycles
+                if (gb_cycles_reached(cpu->cycles, m_halt->ppu_next_event_cycles)
                         || m_halt->io[0x40] != m_halt->ppu_last_lcdc) {
                     ppu_tick(cpu);
                 }
@@ -877,6 +929,13 @@ void gbjit_dispatcher_run_until(gbjit_dispatcher *d, u64 until) {
             for (int _batch = 0; _batch < GBJIT_DISPATCHER_CHAIN_BATCH; _batch++) {
                 if (cpu->cycles >= until) break;
                 if (cpu->halted || cpu->ime_pending) break;
+                /* Bail to the outer loop if the just-run block wrote a
+                 * JIT code page, or switched the MBC ROM bank — in
+                 * either case the chained successor may now be a stale
+                 * translation. The outer loop's rom_bank_dirty /
+                 * jit_smc_dirty handlers invalidate the affected blocks;
+                 * the batch must not enter one first. */
+                if (cpu->mmu->jit_smc_dirty || cpu->mmu->rom_bank_dirty) break;
                 gbjit_block *_next = NULL;
                 for (int _i = 0; _i < GBJIT_CHAIN_PREDICTOR_WAYS; _i++) {
                     if (prev->predicted_next_pc[_i] == cpu->pc
@@ -905,4 +964,8 @@ void gbjit_dispatcher_run_until(gbjit_dispatcher *d, u64 until) {
          * on halted — sm83_run_until handles it the same way. */
         if (unlikely(cpu->stopped)) break;
     }
+#undef d
+#undef until
+#undef cpu
+#undef prev
 }

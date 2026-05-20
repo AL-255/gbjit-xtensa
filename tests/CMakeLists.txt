@@ -25,3 +25,9 @@ add_test(NAME smc COMMAND test_smc)
 # Manual diagnostic tool (not registered as a ctest) — point at a .gb ROM.
 add_executable(test_stepwise_diff test_stepwise_diff.c)
 target_link_libraries(test_stepwise_diff PRIVATE gbjit_jit)
+
+# Manual soak tool (not a ctest): runs a ROM through the dispatcher for a
+# large cycle budget. Debug builds keep emit_xtensa.c's bounds asserts
+# live. Used to exercise the cycle-counter wrap (~2^32 T-cycles).
+add_executable(run_sml_host run_sml_host.c)
+target_link_libraries(run_sml_host PRIVATE gbjit_jit)

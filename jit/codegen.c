@@ -196,9 +196,14 @@ static u32 detect_back_edge_target(const u8 *ops_opcode, const u16 *ops_pc,
 static void emit_sync_state(xt_emit *e) {
     /* s16i a11, a13, OFF_PC */
     xt_s16i(e, 11, 13, OFF_PC);
-    /* l32i a14, a13, OFF_CYCLES ; add a14, a14, a12 ; s32i a14, a13, OFF_CYCLES
-     * (we update only the low 32 bits of the u64 — sufficient for any
-     * reasonable session; ~4G cycles ≈ 17 minutes of GB time.) */
+    /* Accumulate the block's cycle delta into the low 32 bits of
+     * cpu->cycles. That low word is a *free-running* counter: it wraps
+     * every 2^32 T-cycles and that is fine. Every consumer treats it as
+     * a 32-bit modular timestamp — deltas are computed as
+     * `(u32)(now - prev)` and deadlines via wrap-safe signed-difference
+     * compares (see cycles_reached() in core/ppu.c). Rippling a carry
+     * into the high word would just move the wrap to 2^64; it would not
+     * make a consumer that does a plain magnitude compare correct. */
     xt_l32i(e, 14, 13, OFF_CYCLES);
     xt_add (e, 14, 14, 12);
     xt_s32i(e, 14, 13, OFF_CYCLES);
@@ -443,6 +448,41 @@ typedef struct {
     bool       internalised_back_edge;
 } inline_ctx;
 
+/* Self-modifying-code guard for inlined RAM stores.
+ *
+ * An inlined store writes GB memory with a direct `s8i`, bypassing
+ * mmu_write8 — and therefore bypassing the SMC page-dirty marking that
+ * lets the dispatcher invalidate JIT blocks compiled from rewritten
+ * code (blargg's per-instruction test runner rewrites its WRAM code,
+ * which without this guard leaves the JIT running a stale translation).
+ *
+ * Emits: if mmu->jit_page_state[gb_addr >> 8] != 0 (a JIT block was
+ * compiled from that 256-byte page) branch away — the caller routes
+ * that branch to the op's existing slow path (the sm83_step helper),
+ * which goes through mmu_write8 and marks the page dirty. Pages with no
+ * JIT code (state 0 — every RAM page for a ROM-resident game like SML)
+ * fall straight through: 5 instructions, no behaviour change.
+ *
+ * `addr_reg` holds the 16-bit GB address; `s1`/`s2` are scratch regs;
+ * `ps_lit` is a literal slot (pre-allocated by the caller before any
+ * emission) holding &mmu->jit_page_state[0]. Returns the BNEZ position
+ * for the caller to patch to the slow path. */
+static u32 emit_smc_guard(xt_emit *e, inline_ctx *ictx,
+                          u8 addr_reg, u8 s1, u8 s2, i32 ps_lit) {
+    xt_extui(e, s1, addr_reg, 8, 7);          /* s1 = addr >> 8 (GB page) */
+    u32 pc_off = ictx->entry_off + e->len;
+    emit_l32r_at(e, s2, (u32)ps_lit, pc_off); /* s2 = &jit_page_state[0] */
+    xt_add  (e, s2, s2, s1);
+    xt_l8ui (e, s1, s2, 0);                   /* s1 = jit_page_state[page] */
+    u32 br = e->len;
+    xt_bnez (e, s1, 4);                       /* page has code → slow path */
+    return br;
+}
+
+/* Literal value for the SMC guard: &mmu->jit_page_state[0]. */
+#define SMC_PS_BASE(ictx) \
+    ((ictx)->mmu_base_value + (u32)offsetof(mmu, jit_page_state))
+
 /* Try to inline a GB op. Returns true on success, false to request the
  * helper-fallback path. */
 static bool inline_op(xt_emit *e, u8 opcode, u16 pc, inline_ctx *ictx) {
@@ -489,6 +529,14 @@ static bool inline_op(xt_emit *e, u8 opcode, u16 pc, inline_ctx *ictx) {
             ictx->mmu_base_value + (u32)offsetof(mmu, wram) - 0xC000u;
         i32 wram_lit = lit_alloc_u32(ictx->L, wram_base_minus_C000);
         if (wram_lit < 0) return false;
+        /* SMC guard literal — pre-allocate so a pool-full failure is
+         * caught before any emission. Stores only: a load can't
+         * invalidate a JIT block. */
+        i32 ps_lit = -1;
+        if (!is_load) {
+            ps_lit = lit_alloc_u32(ictx->L, SMC_PS_BASE(ictx));
+            if (ps_lit < 0) return false;
+        }
 
         /* Load HL. */
         xt_l16ui(e, 3, 13, OFF_HL);
@@ -500,6 +548,13 @@ static bool inline_op(xt_emit *e, u8 opcode, u16 pc, inline_ctx *ictx) {
         /* Branch to slow path if NOT in WRAM. */
         u32 br_to_slow = e->len;
         xt_bnez(e, 4, 4);   /* placeholder offset */
+
+        /* SMC guard: a store to a page that holds JIT code routes to
+         * the helper so the page gets marked for invalidation. */
+        i32 br_smc = -1;
+        if (!is_load) {
+            br_smc = (i32)emit_smc_guard(e, ictx, 3, 4, 5, ps_lit);
+        }
 
         /* --- Fast path --- */
         u32 pc_off = ictx->entry_off + e->len;
@@ -529,6 +584,7 @@ static bool inline_op(xt_emit *e, u8 opcode, u16 pc, inline_ctx *ictx) {
 
         u32 end_pos = e->len;
         patch_branch_to(e, br_to_slow, slow_pos);
+        if (br_smc >= 0) patch_branch_to(e, (u32)br_smc, slow_pos);
         patch_j_to(e, j_to_end, end_pos);
         return true;
     }
@@ -631,6 +687,8 @@ static bool inline_op(xt_emit *e, u8 opcode, u16 pc, inline_ctx *ictx) {
             ictx->mmu_base_value + (u32)offsetof(mmu, wram) - 0xC000u;
         i32 wram_lit = lit_alloc_u32(ictx->L, wram_base_minus_C000);
         if (wram_lit < 0) return false;
+        i32 ps_lit = lit_alloc_u32(ictx->L, SMC_PS_BASE(ictx));
+        if (ps_lit < 0) return false;
 
         xt_l16ui(e, 9, 13, OFF_HL);
         xt_extui(e, 4, 9, 13, 2);
@@ -638,6 +696,9 @@ static bool inline_op(xt_emit *e, u8 opcode, u16 pc, inline_ctx *ictx) {
 
         u32 br_to_slow = e->len;
         xt_bnez(e, 4, 4);
+
+        /* SMC guard — store to a JIT-code page routes to the helper. */
+        u32 br_smc = emit_smc_guard(e, ictx, 9, 4, 5, ps_lit);
 
         u32 pc_off = ictx->entry_off + e->len;
         emit_l32r_at(e, 5, (u32)wram_lit, pc_off);
@@ -657,6 +718,7 @@ static bool inline_op(xt_emit *e, u8 opcode, u16 pc, inline_ctx *ictx) {
 
         u32 end_pos = e->len;
         patch_branch_to(e, br_to_slow, slow_pos);
+        patch_branch_to(e, br_smc, slow_pos);
         patch_j_to(e, j_to_end, end_pos);
         return true;
     }
@@ -1235,16 +1297,42 @@ static bool inline_op(xt_emit *e, u8 opcode, u16 pc, inline_ctx *ictx) {
         if (!byte_addr) return false;          /* IO / VRAM / ECHO → helper */
         i32 lit_off = lit_alloc_u32(ictx->L, byte_addr);
         if (lit_off < 0) return false;         /* pool full → helper */
-        u32 pc_off = ictx->entry_off + e->len;
-        emit_l32r_at(e, 2, (u32)lit_off, pc_off);
-        if (opcode == 0xFA) {                  /* LD A,(a16) */
+        if (opcode == 0xFA) {                  /* LD A,(a16) — load, branchless */
+            u32 pc_off = ictx->entry_off + e->len;
+            emit_l32r_at(e, 2, (u32)lit_off, pc_off);
             xt_l8ui(e, 3, 2, 0);
             xt_s8i(e, 3, 13, OFF_A);
-        } else {                               /* LD (a16),A */
-            xt_l8ui(e, 3, 13, OFF_A);
-            xt_s8i(e, 3, 2, 0);
+            emit_advance(e, 3, 16);
+            return true;
         }
+        /* LD (a16),A — store. SMC guard on the (compile-time-constant)
+         * destination page: if a JIT block was compiled from it, route
+         * to the helper so the page is marked for invalidation. */
+        i32 ps_lit = lit_alloc_u32(ictx->L,
+                                   SMC_PS_BASE(ictx) + (u32)(a16 >> 8));
+        if (ps_lit < 0) return false;
+        u32 pc_off = ictx->entry_off + e->len;
+        emit_l32r_at(e, 4, (u32)ps_lit, pc_off);
+        xt_l8ui(e, 4, 4, 0);                   /* a4 = jit_page_state[page] */
+        u32 br_smc = e->len;
+        xt_bnez(e, 4, 4);
+        /* Fast path. */
+        pc_off = ictx->entry_off + e->len;
+        emit_l32r_at(e, 2, (u32)lit_off, pc_off);
+        xt_l8ui(e, 3, 13, OFF_A);
+        xt_s8i(e, 3, 2, 0);
         emit_advance(e, 3, 16);
+        u32 j_to_end = e->len;
+        xt_j(e, 4);
+        /* Slow path. */
+        u32 slow_pos = e->len;
+        emit_sync_state(e);
+        xt_mov(e, 2, 13);
+        emit_callx0_helper(e, ictx->lit_off[HELPER_SM83_STEP], ictx->entry_off);
+        emit_reload_state(e, ictx->lit_off[ADDR_CPU_BASE], ictx->entry_off);
+        u32 end_pos = e->len;
+        patch_branch_to(e, br_smc, slow_pos);
+        patch_j_to(e, j_to_end, end_pos);
         return true;
     }
 
@@ -1290,16 +1378,41 @@ static bool inline_op(xt_emit *e, u8 opcode, u16 pc, inline_ctx *ictx) {
         if (!byte_addr) return false;
         i32 lit_off = lit_alloc_u32(ictx->L, byte_addr);
         if (lit_off < 0) return false;
-        u32 pc_off = ictx->entry_off + e->len;
-        emit_l32r_at(e, 2, (u32)lit_off, pc_off);
-        if (opcode == 0xF0) {                  /* LDH A,(n8) */
+        if (opcode == 0xF0) {                  /* LDH A,(n8) — load */
+            u32 pc_off = ictx->entry_off + e->len;
+            emit_l32r_at(e, 2, (u32)lit_off, pc_off);
             xt_l8ui(e, 3, 2, 0);
             xt_s8i(e, 3, 13, OFF_A);
-        } else {                               /* LDH (n8),A */
-            xt_l8ui(e, 3, 13, OFF_A);
-            xt_s8i(e, 3, 2, 0);
+            emit_advance(e, 2, 12);
+            return true;
         }
+        /* LDH (n8),A — HRAM store, page 0xFF. SMC guard so a write to
+         * HRAM-resident code (rare, but the OAM-DMA routine lives
+         * there) routes to the helper for invalidation. */
+        i32 ps_lit = lit_alloc_u32(ictx->L, SMC_PS_BASE(ictx) + 0xFFu);
+        if (ps_lit < 0) return false;
+        u32 pc_off = ictx->entry_off + e->len;
+        emit_l32r_at(e, 4, (u32)ps_lit, pc_off);
+        xt_l8ui(e, 4, 4, 0);
+        u32 br_smc = e->len;
+        xt_bnez(e, 4, 4);
+        /* Fast path. */
+        pc_off = ictx->entry_off + e->len;
+        emit_l32r_at(e, 2, (u32)lit_off, pc_off);
+        xt_l8ui(e, 3, 13, OFF_A);
+        xt_s8i(e, 3, 2, 0);
         emit_advance(e, 2, 12);
+        u32 j_to_end = e->len;
+        xt_j(e, 4);
+        /* Slow path. */
+        u32 slow_pos = e->len;
+        emit_sync_state(e);
+        xt_mov(e, 2, 13);
+        emit_callx0_helper(e, ictx->lit_off[HELPER_SM83_STEP], ictx->entry_off);
+        emit_reload_state(e, ictx->lit_off[ADDR_CPU_BASE], ictx->entry_off);
+        u32 end_pos = e->len;
+        patch_branch_to(e, br_smc, slow_pos);
+        patch_j_to(e, j_to_end, end_pos);
         return true;
     }
 
@@ -1887,6 +2000,14 @@ epilogue:
     }
     xt_l32i(&e, 0, 13, OFF_JITRETPC);
     xt_jx(&e, 0);
+
+    /* Emission overflowed the per-block budget (n_ops * BYTES_PER_OP +
+     * PROLOGUE_EPILOGUE_BYTES). The emitter dropped every write past the
+     * buffer so nothing was corrupted — but the block is incomplete and
+     * must not run. Bail; the dispatcher falls back to the interpreter
+     * for this PC. Should never happen with the current op set, but a
+     * silent IRAM scribble here would be an un-debuggable random crash. */
+    if (e.overflow) return NULL;
 
     /* Final flush of the word-pack accumulator — any partial-word tail
      * needs to be stored to buf before execution. The codecache_alloc

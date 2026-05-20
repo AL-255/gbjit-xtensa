@@ -162,6 +162,19 @@ u8 mmu_read8(mmu *m, u16 addr) {
     return m->ie;
 }
 
+/* Flag a self-modifying-code write. If a JIT block was compiled from
+ * the 256-byte page containing `addr` (state 1), promote it to dirty
+ * (state 2) and raise the global flag the dispatcher polls. Pages with
+ * no compiled code (state 0) cost one load + branch and nothing more —
+ * which is every write under the pure interpreter. */
+static inline void smc_mark(mmu *m, u16 addr) {
+    u8 *st = &m->jit_page_state[addr >> 8];
+    if (*st == 1u) {
+        *st = 2u;
+        m->jit_smc_dirty = 1u;
+    }
+}
+
 void mmu_write8(mmu *m, u16 addr, u8 v) {
     if (addr < 0x8000u) {
         /* MBC1 control register writes — see Pan Docs "Memory Bank
@@ -192,10 +205,16 @@ void mmu_write8(mmu *m, u16 addr, u8 v) {
          * which is what almost every small MBC1 cart actually uses. */
         return;
     }
-    if (addr < 0xA000u) { m->vram[addr - 0x8000u] = v; return; }
+    if (addr < 0xA000u) { smc_mark(m, addr); m->vram[addr - 0x8000u] = v; return; }
     if (addr < 0xC000u) return;
-    if (addr < 0xE000u) { m->wram[addr - 0xC000u] = v; return; }
-    if (addr < 0xFE00u) { m->wram[(addr - 0xE000u) & 0x1FFFu] = v; return; }
+    if (addr < 0xE000u) { smc_mark(m, addr); m->wram[addr - 0xC000u] = v; return; }
+    if (addr < 0xFE00u) {
+        /* Echo RAM mirrors WRAM $C000..$DDFF — JIT blocks register
+         * under the canonical WRAM page, so flag that one. */
+        smc_mark(m, (u16)(0xC000u + ((addr - 0xE000u) & 0x1FFFu)));
+        m->wram[(addr - 0xE000u) & 0x1FFFu] = v;
+        return;
+    }
     if (addr < 0xFEA0u) { m->oam[addr - 0xFE00u] = v; return; }
     if (addr < 0xFF00u) return;
     if (addr < 0xFF80u) {
@@ -239,7 +258,7 @@ void mmu_write8(mmu *m, u16 addr, u8 v) {
         }
         return;
     }
-    if (addr < 0xFFFFu) { m->hram[addr - 0xFF80u] = v; return; }
+    if (addr < 0xFFFFu) { smc_mark(m, addr); m->hram[addr - 0xFF80u] = v; return; }
     m->ie = v;
 }
 

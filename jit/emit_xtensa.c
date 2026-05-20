@@ -31,6 +31,7 @@ void xt_init(xt_emit *e, u8 *buf, u32 cap) {
     e->len = 0;
     e->cap = cap;
     e->word_acc = 0;
+    e->overflow = false;
 }
 
 void xt_flush_pending(xt_emit *e) {
@@ -60,6 +61,9 @@ static inline void emit_byte_packed(xt_emit *e, u8 b) {
 
 static inline u32 emit24(xt_emit *e, u32 w) {
     assert(e->len + 3 <= e->cap);
+    /* Release builds have no assert: a real bounds check keeps a
+     * budget-busting block from scribbling past the codecache arena. */
+    if (e->len + 3 > e->cap) { e->overflow = true; return 0; }
     emit_byte_packed(e, (u8)(w & 0xFFu));
     emit_byte_packed(e, (u8)((w >> 8) & 0xFFu));
     emit_byte_packed(e, (u8)((w >> 16) & 0xFFu));
@@ -288,6 +292,7 @@ u32 xt_extui(xt_emit *e, u8 ar, u8 at, u8 shiftimm, u8 maskimm) {
 
 u32 xt_raw32(xt_emit *e, u32 word) {
     assert(e->len + 4 <= e->cap);
+    if (e->len + 4 > e->cap) { e->overflow = true; return 0; }
     e->buf[e->len + 0] = (u8)(word & 0xFF);
     e->buf[e->len + 1] = (u8)((word >> 8) & 0xFF);
     e->buf[e->len + 2] = (u8)((word >> 16) & 0xFF);

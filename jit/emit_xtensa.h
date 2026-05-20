@@ -12,6 +12,13 @@ typedef struct {
     u8  *buf;
     u32  len;
     u32  cap;
+    /* Set true the first time an emit would exceed `cap`. The emit is
+     * dropped (nothing written past the buffer) and every later emit is
+     * also dropped. gbjit_compile_block checks this after emission and
+     * discards the whole block — a too-fat block becomes a clean interp
+     * fallback instead of a silent write past the codecache arena.
+     * (In debug builds the bounds assert still fires first.) */
+    bool overflow;
     /* Word-packing accumulator: holds the bytes for the in-progress
      * 4-byte word. Flushed to buf via a 32-bit store every time len
      * crosses a 4-byte boundary, and on xt_flush_pending() at the end
