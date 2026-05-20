@@ -1815,8 +1815,11 @@ gbjit_block *gbjit_compile_block(codecache *cc, cpu_state *cpu, u16 pc_start,
         /* Zero path */
         u32 zero_pos = e.len;
         patch_branch_to(&e, zero_path_pos, zero_pos);
-        xt_movi(&e, 5, 2047);                /* 4092 doesn't fit in MOVI's 12-bit */
-        xt_addi(&e, 5, 5, 2045);             /* 2047 + 2045 = 4092 */
+        /* a5 = 4092. MOVI's 12-bit signed immediate caps at 2047 and
+         * ADDI's at +127, so neither reaches 4092 directly. Build it
+         * as 1023 << 2 (1023 fits MOVI, 4092 = 1023 * 4). */
+        xt_movi(&e, 5, 1023);
+        xt_slli(&e, 5, 5, 2);                /* 1023 << 2 = 4092 */
         u32 end_pos = e.len;
         patch_j_to(&e, j_to_end, end_pos);
 
