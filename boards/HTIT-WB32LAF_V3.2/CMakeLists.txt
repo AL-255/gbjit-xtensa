@@ -24,9 +24,12 @@ idf_build_set_property(MINIMAL_BUILD ON)
 # QEMU virtual-LCD builds (-DGBJIT_QEMU_LCD=1) override the crop
 # defaults to render the full 160×144 GB frame — the host viewer
 # shows the whole screen, not just the OLED's centre window.
-if(NOT DEFINED GBJIT_PPU_ASYNC)
-    set(GBJIT_PPU_ASYNC 0)
-endif()
+# GBJIT_PPU_ASYNC is intentionally NOT defaulted or propagated here.
+# The source uses `#ifdef GBJIT_PPU_ASYNC` (definedness, not value), so
+# exporting `GBJIT_PPU_ASYNC=0` project-wide would still select the
+# async path. The gbjit component's own CMakeLists handles it correctly
+# — it only defines the macro (as =1) when the value is truthy, so the
+# default and an explicit `-DGBJIT_PPU_ASYNC=0` both mean synchronous.
 if(NOT DEFINED GBJIT_HALT_STEP_CYCLES)
     set(GBJIT_HALT_STEP_CYCLES 1024)
 endif()
@@ -83,7 +86,6 @@ foreach(_opt
         GBJIT_PPU_DRAW_MIN_X
         GBJIT_PPU_DRAW_MAX_X
         GBJIT_ARENA_KB
-        GBJIT_PPU_ASYNC
         GBJIT_HTIT_OLED_ENABLE
         GBJIT_HTIT_OLED_MIN_INTERVAL_MS
         GBJIT_DISPATCHER_SERVICE_SHORTCUT
