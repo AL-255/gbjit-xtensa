@@ -18,11 +18,12 @@ P6 PPM images. No third-party packages, so it runs under any Python
 
 Usage:
     python3 tools/qemu_lcd.py [--host H] [--port P] [--scale N]
-                              [--wait] [--save-dir DIR]
+                              [--wait] [--save-dir DIR] [--frames N]
 
 --wait        retry the connection until QEMU's socket is up.
 --save-dir    headless: write each frame as DIR/frameNNNNN.ppm and
               skip the window (no display needed).
+--frames N    headless: exit after N frames (smoke tests / CI).
 """
 import argparse
 import os
@@ -157,11 +158,12 @@ def run_window(reader, scale):
     return 0
 
 
-def run_headless(reader, save_dir):
+def run_headless(reader, save_dir, max_frames=0):
     os.makedirs(save_dir, exist_ok=True)
     saved = 0
     last = -1
-    print(f"saving frames to {save_dir}/ — Ctrl-C to stop")
+    stop = f"{max_frames} frames" if max_frames else "Ctrl-C"
+    print(f"saving frames to {save_dir}/ — stops after {stop}")
     try:
         while reader.alive or reader.latest is not None:
             if reader.count != last and reader.latest is not None:
@@ -170,6 +172,8 @@ def run_headless(reader, save_dir):
                 with open(path, "wb") as f:
                     f.write(reader.latest)
                 saved += 1
+                if max_frames and saved >= max_frames:
+                    break
             else:
                 time.sleep(0.01)
     except KeyboardInterrupt:
@@ -189,6 +193,9 @@ def main():
                     help="retry the connection until QEMU is up")
     ap.add_argument("--save-dir",
                     help="headless: write each frame as a PPM here")
+    ap.add_argument("--frames", type=int, default=0,
+                    help="headless: exit after this many frames (0 = run "
+                         "until Ctrl-C); useful for smoke tests / CI")
     args = ap.parse_args()
 
     try:
@@ -203,7 +210,7 @@ def main():
     reader.start()
 
     if args.save_dir:
-        return run_headless(reader, args.save_dir)
+        return run_headless(reader, args.save_dir, args.frames)
     return run_window(reader, args.scale)
 
 
