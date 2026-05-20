@@ -23,12 +23,23 @@ idf_component_register(
         "app_main.c"
         "ssd1306.c"
         "oled_task.c"
-    PRIV_REQUIRES gbjit esp_timer esp_driver_i2c esp_driver_gpio
+        "qemu_lcd.c"
+    PRIV_REQUIRES gbjit esp_timer esp_driver_i2c esp_driver_gpio esp_driver_uart
     EMBED_FILES "${_embed_rom}"
     INCLUDE_DIRS "."
 )
 target_compile_definitions(${COMPONENT_LIB} PRIVATE ${_rom_define})
 target_compile_options(${COMPONENT_LIB} PRIVATE -Wall -Wextra -O3)
+
+# QEMU virtual-LCD mode. When GBJIT_QEMU_LCD=1, app_main streams the
+# 160x144 framebuffer over UART1 (see main/qemu_lcd.c) instead of
+# driving the I2C OLED — the host viewer tools/qemu_lcd.py renders it.
+# Build + run with tools/qemu_lcd_run.sh.
+if(NOT DEFINED GBJIT_QEMU_LCD)
+    set(GBJIT_QEMU_LCD 0)
+endif()
+target_compile_definitions(${COMPONENT_LIB} PRIVATE
+    GBJIT_QEMU_LCD=${GBJIT_QEMU_LCD})
 
 # Optional wall-clock frame-rate cap. The pacer (in app_main.c) busy-
 # waits at every frame boundary to hold emulation at the requested

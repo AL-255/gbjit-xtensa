@@ -18,6 +18,11 @@
 
 #include "board.h"
 #include "oled_task.h"
+#include "qemu_lcd.h"
+
+#ifndef GBJIT_QEMU_LCD
+#define GBJIT_QEMU_LCD 0
+#endif
 
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -128,9 +133,17 @@ void app_main(void) {
 #endif
     cpu_reset(&s_cpu, &s_mmu);
 
+    /* Display path. The physical I2C OLED can't be exercised under
+     * QEMU (no SSD1306 device model), so a QEMU build streams the
+     * full 160x144 framebuffer out UART1 to a host-side viewer
+     * instead. Hardware builds bring up the real OLED task. */
+#if GBJIT_QEMU_LCD
+    qemu_lcd_start(&s_cpu);
+#else
     /* Bring up the OLED task first (Core 1, low prio) — it'll sleep
      * until the PPU bumps frame_seq. */
     oled_task_start(&s_cpu);
+#endif
 
     /* PPU on Core 1 alongside the OLED task. The dispatcher on Core 0
      * won't call ppu_tick under GBJIT_PPU_ASYNC; Core 1's task does. */
