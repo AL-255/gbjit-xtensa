@@ -83,6 +83,9 @@ uncontended) and `benchmark/plot_cache_sweep.py`.
 
 ## Quick start — host
 
+See **[RUN.md](RUN.md)** for the full run guide — host, unit tests,
+QEMU virtual LCD, real hardware, and the benchmark sweeps.
+
 ```sh
 sudo apt install build-essential cmake ninja-build python3            # one-time
 cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
