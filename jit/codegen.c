@@ -62,6 +62,11 @@
 /* Limits. */
 #define MAX_OPS_PER_BLOCK 32
 
+#ifdef DEBUG
+/* Codecache density probe — see the accumulation in gbjit_compile_block. */
+u64 gbjit_cc_reserved = 0, gbjit_cc_actual = 0, gbjit_cc_n = 0;
+#endif
+
 /* Generous size budget per op. Worst-case inline is currently ALU with eager
  * flags (~24 Xtensa instructions = 72 bytes). Helper fallback is ~32 bytes.
  * Round up to 96 to leave headroom for future inlining additions. */
@@ -1848,7 +1853,10 @@ gbjit_block *gbjit_compile_block(codecache *cc, cpu_state *cpu, u16 pc_start,
     /* Reserve. */
     u32 lit_bytes = LITERAL_POOL_BYTES;
     u32 code_bytes = PROLOGUE_EPILOGUE_BYTES + n_ops * BYTES_PER_OP;
-    u32 total = align_up_4(lit_bytes) + align_up_4(code_bytes);
+    /* 8-aligned: the evicting code cache (GBJIT_JIT_EVICT) tracks free
+     * spans at 8-byte granularity, so block sizes must be 8-aligned for
+     * codecache_free to return exactly what codecache_alloc reserved. */
+    u32 total = (align_up_4(lit_bytes) + align_up_4(code_bytes) + 7u) & ~7u;
     u8 *base = codecache_alloc(cc, total);
     if (!base) return NULL;
     memset(base, 0, total);
@@ -2007,7 +2015,10 @@ epilogue:
      * must not run. Bail; the dispatcher falls back to the interpreter
      * for this PC. Should never happen with the current op set, but a
      * silent IRAM scribble here would be an un-debuggable random crash. */
-    if (e.overflow) return NULL;
+    if (e.overflow) {
+        codecache_free(cc, (u32)(base - cc->base), total);
+        return NULL;
+    }
 
     /* Final flush of the word-pack accumulator — any partial-word tail
      * needs to be stored to buf before execution. The codecache_alloc
@@ -2017,13 +2028,32 @@ epilogue:
 
     codecache_finalize(cc, base + entry_off, e.len);
 
+    /* The block reserved a worst-case `total`; it actually occupies the
+     * literal pool (entry_off) plus the emitted code (e.len). Hand the
+     * unused tail back so the next compile packs in immediately after —
+     * blocks emit only ~half their worst-case budget, so this roughly
+     * doubles how much of a working set fits a given arena. */
+    u32 actual = (entry_off + e.len + 7u) & ~7u;
+    codecache_trim(cc, base, actual, total);
+
+#ifdef DEBUG
+    /* Codecache density probe: worst-case `total` vs the trimmed size. */
+    extern u64 gbjit_cc_reserved, gbjit_cc_actual, gbjit_cc_n;
+    gbjit_cc_reserved += total;
+    gbjit_cc_actual   += actual;
+    gbjit_cc_n        += 1;
+#endif
+
     gbjit_block *b = (gbjit_block *)calloc(1, sizeof(*b));
-    if (!b) return NULL;
+    if (!b) {
+        codecache_free(cc, (u32)(base - cc->base), actual);
+        return NULL;
+    }
     b->gb_pc_start = pc_start;
     b->gb_pc_end = cur;
     b->n_ops = n_ops;
     b->code = base;
-    b->code_size = total;
+    b->code_size = actual;
     b->entry_off = entry_off;
     b->succ_pc[0] = 0xFFFFu;
     b->succ_pc[1] = 0xFFFFu;

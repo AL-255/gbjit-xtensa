@@ -238,6 +238,14 @@ typedef struct smc_page_node {
     struct smc_page_node *next;
 } smc_page_node;
 
+/* Code-cache eviction callbacks — defined past the run-loop statics they
+ * touch; see the definitions. One per policy (GBJIT_JIT_EVICT). */
+#if GBJIT_JIT_EVICT == 1
+static u32  dispatcher_evict_coldest(void *ctx);
+#elif GBJIT_JIT_EVICT == 2
+static void dispatcher_evict_range(void *ctx, u32 start, u32 end);
+#endif
+
 bool gbjit_dispatcher_init(gbjit_dispatcher *d, cpu_state *cpu) {
     memset(d, 0, sizeof(*d));
     d->cpu = cpu;
@@ -254,6 +262,15 @@ bool gbjit_dispatcher_init(gbjit_dispatcher *d, cpu_state *cpu) {
              (unsigned)GBJIT_ARENA_KB, s_jit_arena);
 #endif
     codecache_init(&d->cc, (u8 *)d->arena, d->arena_cap);
+#if GBJIT_JIT_EVICT == 1
+    /* Coldness: free-list allocator evicts our coldest cached block. */
+    d->cc.evict     = dispatcher_evict_coldest;
+    d->cc.evict_ctx = d;
+#elif GBJIT_JIT_EVICT == 2
+    /* Circular: ring allocator evicts whatever it is about to overwrite. */
+    d->cc.evict_range = dispatcher_evict_range;
+    d->cc.evict_ctx   = d;
+#endif
     d->interp_fallback = false;
     /* Prefetch defaults — depth 4, walking both succ_pc[0] (the
      * taken / unconditional / CALL-target path) and succ_pc[1] (the
@@ -320,6 +337,11 @@ static gbjit_block *find_block(gbjit_dispatcher *d, u16 pc) {
 
 static void insert_block(gbjit_dispatcher *d, gbjit_block *block) {
     u32 idx = block->gb_pc_start & (GBJIT_BLOCK_BUCKETS - 1u);
+#if GBJIT_JIT_EVICT == 1
+    /* Stamp it hot so a prefetch-driven compile right after can't pick a
+     * just-built (never-executed) block as the coldest victim. */
+    block->tag = ++d->jit_epoch;
+#endif
     dispatcher_bucket *b = (dispatcher_bucket *)calloc(1, sizeof(*b));
     b->b = block;
     b->next = (dispatcher_bucket *)d->buckets[idx];
@@ -474,6 +496,12 @@ void gbjit_dispatcher_invalidate_addr(gbjit_dispatcher *d, u16 gb_addr) {
         remove_block_from_smc(d, blk);
         remove_block_from_buckets(d, blk);
         clear_dangling_predictions(d, blk);
+#if GBJIT_JIT_EVICT
+        /* Return the block's arena span to the free list so the bytes
+         * are reusable — invalidation, unlike a bump-mode reset, frees
+         * one block at a time. */
+        codecache_free(&d->cc, (u32)(blk->code - d->cc.base), blk->code_size);
+#endif
         gbjit_block_free(blk);
         free(node);
         GBJIT_STAT_INC(d, smc_invalidations);
@@ -664,6 +692,64 @@ static gbjit_dispatcher *s_run_d;
 static cpu_state        *s_run_cpu;
 static gbjit_block      *s_run_prev;
 static u64               s_run_until;
+
+/* Both eviction callbacks run inside gbjit_compile_block, between block
+ * executions, so no evicted block can be running. The one block reachable
+ * from outside the bucket table is the run loop's `s_run_prev` (chain
+ * predecessor); null it if it is a victim so the post-compile chain
+ * update can't touch freed memory. */
+#if GBJIT_JIT_EVICT == 1
+/* Coldness: the free-list allocator calls this when no free span fits.
+ * Drop the coldest cached block (lowest last-use tag — approximate LRU)
+ * and hand its span back. Returns bytes freed, or 0 if nothing is left
+ * to evict (request larger than the whole arena → interp fallback). */
+static u32 dispatcher_evict_coldest(void *ctx) {
+    gbjit_dispatcher *d = (gbjit_dispatcher *)ctx;
+    gbjit_block *victim = NULL;
+    for (u32 i = 0; i < GBJIT_BLOCK_BUCKETS; i++) {
+        for (dispatcher_bucket *bk = (dispatcher_bucket *)d->buckets[i];
+             bk; bk = bk->next) {
+            if (!victim || bk->b->tag < victim->tag) victim = bk->b;
+        }
+    }
+    if (!victim) return 0;
+    u32 off  = (u32)(victim->code - d->cc.base);
+    u32 size = victim->code_size;
+    remove_block_from_smc(d, victim);
+    remove_block_from_buckets(d, victim);
+    clear_dangling_predictions(d, victim);
+    if (victim == s_run_prev) s_run_prev = NULL;
+    gbjit_block_free(victim);
+    codecache_free(&d->cc, off, size);
+    return size;
+}
+#elif GBJIT_JIT_EVICT == 2
+/* Circular: the ring allocator calls this with the arena byte range it
+ * is about to overwrite. Drop every cached block overlapping it (the
+ * oldest-compiled run). No tag, no policy — pure FIFO by ring position. */
+static void dispatcher_evict_range(void *ctx, u32 start, u32 end) {
+    gbjit_dispatcher *d = (gbjit_dispatcher *)ctx;
+    for (;;) {
+        gbjit_block *victim = NULL;
+        for (u32 i = 0; i < GBJIT_BLOCK_BUCKETS && !victim; i++) {
+            for (dispatcher_bucket *bk = (dispatcher_bucket *)d->buckets[i];
+                 bk; bk = bk->next) {
+                u32 o = (u32)(bk->b->code - d->cc.base);
+                if (o < end && o + bk->b->code_size > start) {
+                    victim = bk->b;
+                    break;
+                }
+            }
+        }
+        if (!victim) break;
+        remove_block_from_smc(d, victim);
+        remove_block_from_buckets(d, victim);
+        clear_dangling_predictions(d, victim);
+        if (victim == s_run_prev) s_run_prev = NULL;
+        gbjit_block_free(victim);
+    }
+}
+#endif
 
 __attribute__((hot))
 void gbjit_dispatcher_run_until(gbjit_dispatcher *d_param, u64 until_param) {
@@ -857,6 +943,7 @@ void gbjit_dispatcher_run_until(gbjit_dispatcher *d_param, u64 until_param) {
             }
             if (!b) {
                 sm83_step(cpu);
+                GBJIT_STAT_INC(d, interp_steps);
                 prev = NULL;
                 continue;
             }
@@ -891,6 +978,9 @@ void gbjit_dispatcher_run_until(gbjit_dispatcher *d_param, u64 until_param) {
             }
         }
 
+#if GBJIT_JIT_EVICT == 1
+        b->tag = ++d->jit_epoch;          /* mark hot for the evictor */
+#endif
 #if defined(ESP_PLATFORM)
         enter_block_native(b, cpu);
         __asm__ volatile("" :::
@@ -946,6 +1036,9 @@ void gbjit_dispatcher_run_until(gbjit_dispatcher *d_param, u64 until_param) {
                 }
                 if (!_next) break;
                 GBJIT_STAT_INC(d, chain_hits);
+#if GBJIT_JIT_EVICT == 1
+                _next->tag = ++d->jit_epoch;
+#endif
                 enter_block_native(_next, cpu);
                 __asm__ volatile("" :::
                     "a2","a3","a4","a5","a6","a7",

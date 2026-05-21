@@ -34,6 +34,7 @@ typedef struct gbjit_dispatcher {
     u64 cache_flushes;
     u64 chain_hits;
     u64 chain_misses;
+    u64 interp_steps;   /* GB ops run via sm83_step on the compile-fail path */
 
     /* Falls back to interpreter when codegen unavailable. */
     bool interp_fallback;
@@ -69,6 +70,12 @@ typedef struct gbjit_dispatcher {
      * size / arena capacity in blocks). */
     bool evict_on_full;
     u64  arena_resets;
+
+    /* Monotonic epoch for the evicting code cache (GBJIT_JIT_EVICT=1).
+     * Bumped on every block compile and execute; stamped into
+     * gbjit_block.tag so the evictor can pick the least-recently-used
+     * block. Plain counter — unused when eviction is off. */
+    u64  jit_epoch;
 } gbjit_dispatcher;
 
 bool gbjit_dispatcher_init(gbjit_dispatcher *d, cpu_state *cpu);

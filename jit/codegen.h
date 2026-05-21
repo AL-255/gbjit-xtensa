@@ -70,6 +70,12 @@ typedef struct gbjit_block {
      *   succ_pc[1] = fall-through PC for conditional branches (JR cc,
      *                JP cc, CALL cc); 0xFFFF for unconditional terminators. */
     u16  succ_pc[2];
+
+    /* Coldness tag for the evicting code cache (GBJIT_JIT_EVICT=1). Set to
+     * the dispatcher's monotonically-increasing epoch each time the block
+     * is compiled or executed; the evictor drops the block with the
+     * lowest tag (least-recently-used). Unused when eviction is off. */
+    u64  tag;
 } gbjit_block;
 
 /* Compile from `pc` for one basic block. Allocates from `cc`. `helper_addr`
