@@ -229,12 +229,30 @@ void mmu_write8(mmu *m, u16 addr, u8 v) {
         if (addr == 0xFF04u) { m->io[io_addr] = 0; m->timer_div_acc = 0; return; }
         if (addr == 0xFF05u) { m->io[io_addr] = v; m->timer_tima_acc = 0; return; }
         m->io[io_addr] = v;
-        /* Blargg serial trap: writing $81 to FF02 transmits FF01. */
-        if (addr == 0xFF02u && v == 0x81u && m->serial_sink) {
-            m->serial_sink(m->serial_sink_ctx, m->io[0x01]);
-            /* Self-clear the transfer-start bit. */
-            m->io[0x02] = (u8)(v & 0x7Fu);
-            /* Also request a serial interrupt for completeness. */
+        /* Serial transfer, internal clock (SC $FF02 bit 7 = start, bit 0
+         * = internal clock → this GB drives the transfer, so it always
+         * completes). With no link cable the 8 bits shift out against an
+         * open bus and 0xFF shifts back in. Complete it immediately:
+         * clear the start bit, load 0xFF into SB, raise the serial IRQ.
+         *
+         * This is essential, not cosmetic — a game that starts an
+         * internal-clock transfer then busy-waits on SC bit 7 (or HALTs
+         * for the serial IRQ) hangs forever otherwise. Tetris's link-
+         * cable detection, run right after the copyright screen, does
+         * exactly this; without completion it never reaches the title
+         * screen. A real cable would take ~4096 cycles, but no
+         * commercial game's no-cable path depends on that latency.
+         *
+         * Slave transfers (bit 0 = 0, external clock) are left pending —
+         * with no cable they genuinely never complete, and games time
+         * those out themselves. */
+        if (addr == 0xFF02u && (v & 0x81u) == 0x81u) {
+            /* Blargg's test ROMs print by writing the char to SB then
+             * $81 to SC — feed the sink before SB is overwritten. */
+            if (m->serial_sink)
+                m->serial_sink(m->serial_sink_ctx, m->io[0x01]);
+            m->io[0x01] = 0xFFu;                  /* received: open bus */
+            m->io[0x02] = (u8)(v & 0x7Fu);        /* clear start bit */
 #ifdef GBJIT_PPU_ASYNC
             __atomic_fetch_or(&m->io[0x0F], INT_SERIAL, __ATOMIC_RELAXED);
 #else
