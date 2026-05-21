@@ -237,6 +237,12 @@ void app_main(void) {
      * cost outweighs the first-encounter latency it saves. The lazy
      * chain-miss compile path picks up new blocks on demand. */
     disp.prefetch_enabled = false;
+#if GBJIT_BOARD_INTERP
+    /* Benchmark baseline: route every block through the reference
+     * interpreter (sm83_step) instead of the JIT — measures the
+     * no-JIT floor for the FPS sweep. Opt-in, off by default. */
+    disp.interp_fallback = true;
+#endif
     ESP_LOGI(TAG, "starting CPU — Core 0 dispatcher, Core 1 PPU+OLED, prefetch off");
     gbjit_dispatcher_run_until(&disp, ~(uint64_t)0);
     ESP_LOGI(TAG, "dispatcher returned (pc=%04X halted=%d cycles=%" PRIu64 ")",

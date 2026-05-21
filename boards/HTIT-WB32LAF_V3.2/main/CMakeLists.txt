@@ -55,6 +55,14 @@ endif()
 target_compile_definitions(${COMPONENT_LIB} PRIVATE
     GBJIT_FPS_PROBE=${GBJIT_FPS_PROBE})
 
+# Benchmark baseline: -DGBJIT_BOARD_INTERP=1 runs the reference
+# interpreter instead of the JIT (the no-JIT FPS floor). Off by default.
+if(NOT DEFINED GBJIT_BOARD_INTERP)
+    set(GBJIT_BOARD_INTERP 0)
+endif()
+target_compile_definitions(${COMPONENT_LIB} PRIVATE
+    GBJIT_BOARD_INTERP=${GBJIT_BOARD_INTERP})
+
 # Optional wall-clock frame-rate cap. The pacer (in app_main.c) busy-
 # waits at every frame boundary to hold emulation at the requested
 # fps. Set to 60 (or any positive value) to lock to that rate; leave

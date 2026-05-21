@@ -55,9 +55,33 @@ int main(int argc, char **argv) {
             fflush(stdout);
         }
     }
-    printf("done: cycles=%llu pc=%04X frames=%u blocks_compiled=%llu\n",
+    /* Workload profile. blocks_compiled counts *every* compile, so with
+     * eviction it includes recompiles; blocks_executed counts every
+     * block run. exec/compile is the amortisation factor — how many
+     * times the average compiled block runs before it is dropped. A
+     * value near 1 means the JIT pays its full compile cost per run. */
+    u64 bc = d.blocks_compiled, be = d.blocks_executed;
+    printf("done: cycles=%llu pc=%04X frames=%u\n"
+           "  blocks_compiled=%llu blocks_executed=%llu exec/compile=%.1f\n"
+           "  chain_hits=%llu chain_misses=%llu interp_steps=%llu\n",
            (unsigned long long)cpu.cycles, cpu.pc, m.frame_seq,
-           (unsigned long long)d.blocks_compiled);
+           (unsigned long long)bc, (unsigned long long)be,
+           bc ? (double)be / (double)bc : 0.0,
+           (unsigned long long)d.chain_hits,
+           (unsigned long long)d.chain_misses,
+           (unsigned long long)d.interp_steps);
+    {
+        extern u64 gbjit_cc_reserved, gbjit_cc_actual, gbjit_cc_n;
+        if (gbjit_cc_n)
+            printf("  codecache: %llu compiles, reserved=%llu actual=%llu "
+                   "density=%.0f%% (avg reserved=%llu actual=%llu B/block)\n",
+                   (unsigned long long)gbjit_cc_n,
+                   (unsigned long long)gbjit_cc_reserved,
+                   (unsigned long long)gbjit_cc_actual,
+                   100.0 * (double)gbjit_cc_actual / (double)gbjit_cc_reserved,
+                   (unsigned long long)(gbjit_cc_reserved / gbjit_cc_n),
+                   (unsigned long long)(gbjit_cc_actual / gbjit_cc_n));
+    }
     gbjit_dispatcher_shutdown(&d);
     free(rom);
     return 0;
