@@ -76,6 +76,15 @@ typedef struct gbjit_block {
      * is compiled or executed; the evictor drops the block with the
      * lowest tag (least-recently-used). Unused when eviction is off. */
     u64  tag;
+
+    /* 1 iff this block is a "coarse-spin-safe" self-loop: its terminator
+     * is a conditional JR back to gb_pc_start and every body op is
+     * register-pure or an HRAM read — no IO-register read (LY/STAT
+     * advance with the PPU, so such a loop must not be spun without
+     * ticking it), no stack/RAM op. The dispatcher's self-loop fast
+     * path re-enters such a block directly, bounded by an iteration
+     * cap, instead of paying the outer-loop overhead per iteration. */
+    u8   self_loop;
 } gbjit_block;
 
 /* Compile from `pc` for one basic block. Allocates from `cc`. `helper_addr`

@@ -981,6 +981,7 @@ void gbjit_dispatcher_run_until(gbjit_dispatcher *d_param, u64 until_param) {
 #if GBJIT_JIT_EVICT == 1
         b->tag = ++d->jit_epoch;          /* mark hot for the evictor */
 #endif
+        u16 sp_before_block = cpu->sp;
 #if defined(ESP_PLATFORM)
         enter_block_native(b, cpu);
         __asm__ volatile("" :::
@@ -998,6 +999,54 @@ void gbjit_dispatcher_run_until(gbjit_dispatcher *d_param, u64 until_param) {
         } else {
             prev = b;
         }
+
+        /* Self-loop fast path. A block flagged `self_loop` at compile
+         * time — a conditional JR back to its own start with a
+         * register/HRAM-pure body — is a busy-wait or delay loop. While
+         * it stays taken, re-enter the same already-compiled block
+         * directly, up to GBJIT_SELFLOOP_MAX times, skipping the
+         * outer-iteration preamble.
+         *
+         * This is deliberately the *exact* structure of the block-batch
+         * below — enter_block in a tight loop, no interleaved C call —
+         * so it carries the chain-batch's proven safety. The PPU is not
+         * ticked inside; the bounded spin leaves it at most a batch's
+         * worth of cycles stale, which the outer loop's service catches
+         * up on exit. The compile-time flag already excludes LY/STAT
+         * polls (which must see the PPU advance) and stack ops; entry
+         * is further gated on a clean state. GBJIT_DISPATCHER_SELFLOOP=0
+         * disables it. */
+#ifndef GBJIT_DISPATCHER_SELFLOOP
+#define GBJIT_DISPATCHER_SELFLOOP 1
+#endif
+#ifndef GBJIT_SELFLOOP_MAX
+#define GBJIT_SELFLOOP_MAX 64
+#endif
+#if GBJIT_DISPATCHER_SELFLOOP
+        if (likely(prev && !d->no_cache) && b->self_loop
+                && cpu->pc == b->gb_pc_start
+                && cpu->sp == sp_before_block
+                && !cpu->halted && !cpu->ime_pending && !cpu->stopped
+                && !cpu->mmu->jit_smc_dirty && !cpu->mmu->rom_bank_dirty
+                && (cpu->mmu->io[0x0F] & cpu->mmu->ie & 0x1Fu) == 0
+                && cpu->cycles < until) {
+            for (int _spin = 0; _spin < GBJIT_SELFLOOP_MAX; _spin++) {
+#if defined(ESP_PLATFORM)
+                enter_block_native(b, cpu);
+                __asm__ volatile("" ::: "a2","a3","a4","a5","a6","a7",
+                    "a8","a9","a10","a11","a12","a13","a14","a15","memory");
+#else
+                enter_block_sim(b, cpu);
+#endif
+                GBJIT_STAT_INC(d, blocks_executed);
+                if (cpu->pc != b->gb_pc_start
+                        || cpu->sp != sp_before_block
+                        || cpu->cycles >= until)
+                    break;
+            }
+            continue;
+        }
+#endif
 
         /* Block-batching fast path: while the just-executed block has a
          * cached successor matching the new PC, call it directly

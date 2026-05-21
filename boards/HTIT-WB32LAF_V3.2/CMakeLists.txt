@@ -98,7 +98,9 @@ foreach(_opt
         GBJIT_HTIT_OLED_ENABLE
         GBJIT_HTIT_OLED_MIN_INTERVAL_MS
         GBJIT_DISPATCHER_SERVICE_SHORTCUT
-        GBJIT_DISPATCHER_CHAIN_BATCH)
+        GBJIT_DISPATCHER_CHAIN_BATCH
+        GBJIT_DISPATCHER_SELFLOOP
+        GBJIT_SELFLOOP_MAX)
     if(DEFINED ${_opt})
         idf_build_set_property(COMPILE_DEFINITIONS
             "${_opt}=${${_opt}}" APPEND)

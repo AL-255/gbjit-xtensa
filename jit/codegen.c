@@ -1890,6 +1890,40 @@ gbjit_block *gbjit_compile_block(codecache *cc, cpu_state *cpu, u16 pc_start,
              && (i8)mmu_read8(cpu->mmu, (u16)(ops_pc[2] + 1)) == -5    /* target == pc_start */
              && mmu_read8(cpu->mmu, (u16)(ops_pc[0] + 1)) >= 0x80u);   /* HRAM flag */
 
+    /* --- Generic self-loop detection (dispatcher self-loop fast path) ---
+     *
+     * True iff the terminator is a conditional JR back to pc_start and
+     * every body op is "coarse-spin safe": register-pure, or an HRAM
+     * read (LDH A,(n8) with n8 >= 0x80). An IO-register read (LY/STAT
+     * etc.) disqualifies it — those advance with the PPU, and the
+     * dispatcher spins the loop without ticking the PPU, so a loop
+     * polling them could skip the value it waits for. Stack/RAM ops
+     * disqualify it too (they are op_touches_mmu). The flag is stored
+     * on the block so the dispatcher need not re-derive it. */
+    bool is_self_loop = false;
+    {
+        u8 term = ops_opcode[n_ops - 1];
+        if (n_ops >= 2 &&
+            (term == 0x20 || term == 0x28 || term == 0x30 || term == 0x38)) {
+            i8  d   = (i8)mmu_read8(cpu->mmu, (u16)(ops_pc[n_ops - 1] + 1));
+            u16 tgt = (u16)(ops_pc[n_ops - 1] + 2 + d);
+            if (tgt == pc_start) {
+                bool body_ok = true;
+                for (u32 i = 0; i + 1 < n_ops; i++) {
+                    u8 op = ops_opcode[i];
+                    if (op == 0xF0) {                  /* LDH A,(n8): HRAM only */
+                        if (mmu_read8(cpu->mmu, (u16)(ops_pc[i] + 1)) < 0x80u) {
+                            body_ok = false; break;
+                        }
+                    } else if (op_touches_mmu(op)) {   /* stack/RAM/IO op */
+                        body_ok = false; break;
+                    }
+                }
+                is_self_loop = body_ok;
+            }
+        }
+    }
+
     /* Reserve. */
     u32 lit_bytes = LITERAL_POOL_BYTES;
     u32 code_bytes = PROLOGUE_EPILOGUE_BYTES + n_ops * BYTES_PER_OP;
@@ -2096,6 +2130,7 @@ epilogue:
     b->code = base;
     b->code_size = actual;
     b->entry_off = entry_off;
+    b->self_loop = is_self_loop ? 1u : 0u;
     b->succ_pc[0] = 0xFFFFu;
     b->succ_pc[1] = 0xFFFFu;
 
