@@ -1,6 +1,6 @@
-# Choose which ROM to embed. Defaults to Super Mario Land; pass
-# `idf.py -DBOARD_ROM=blargg_06 build` to switch to the Blargg cpu_instrs
-# 06-ld_r_r sub-test for correctness checks on the OLED.
+# Choose which ROM to embed. Defaults to Super Mario Land. Pass
+#   -DBOARD_ROM=blargg_06   Blargg cpu_instrs 06-ld_r_r correctness test
+#   -DBOARD_ROM=tetris      Tetris (roms/Tetris_JUE_V1.1.gb)
 if(NOT DEFINED BOARD_ROM)
     set(BOARD_ROM "sml")
 endif()
@@ -13,6 +13,9 @@ set(_rom_dir "${GBJIT_ROOT}/port/esp32s3/main")
 if(BOARD_ROM STREQUAL "blargg_06")
     set(_embed_rom "${_rom_dir}/blargg_06.gb")
     set(_rom_define "BOARD_ROM_BLARGG=1")
+elseif(BOARD_ROM STREQUAL "tetris")
+    set(_embed_rom "${GBJIT_ROOT}/roms/Tetris_JUE_V1.1.gb")
+    set(_rom_define "BOARD_ROM_TETRIS=1")
 else()
     set(_embed_rom "${_rom_dir}/sml.gb")
     set(_rom_define "BOARD_ROM_SML=1")
@@ -40,6 +43,17 @@ if(NOT DEFINED GBJIT_QEMU_LCD)
 endif()
 target_compile_definitions(${COMPONENT_LIB} PRIVATE
     GBJIT_QEMU_LCD=${GBJIT_QEMU_LCD})
+
+# FPS probe. When GBJIT_FPS_PROBE=1, app_main installs a frame-complete
+# callback that measures emulation throughput (frames/wall-second) and
+# logs a running average + lowest 1-second window over the serial
+# console. Off by default — purely a measurement aid.
+#   idf.py -DGBJIT_FPS_PROBE=1 build
+if(NOT DEFINED GBJIT_FPS_PROBE)
+    set(GBJIT_FPS_PROBE 0)
+endif()
+target_compile_definitions(${COMPONENT_LIB} PRIVATE
+    GBJIT_FPS_PROBE=${GBJIT_FPS_PROBE})
 
 # Optional wall-clock frame-rate cap. The pacer (in app_main.c) busy-
 # waits at every frame boundary to hold emulation at the requested

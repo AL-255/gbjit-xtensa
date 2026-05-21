@@ -42,6 +42,12 @@ static const char *TAG = "gbjit";
 extern const uint8_t rom_start[] asm("_binary_blargg_06_gb_start");
 extern const uint8_t rom_end  [] asm("_binary_blargg_06_gb_end");
 static const char *ROM_LABEL = "blargg_06";
+#elif defined(BOARD_ROM_TETRIS)
+/* EMBED_FILES mangles non-alphanumerics in the path basename to '_', so
+ * roms/Tetris_JUE_V1.1.gb → _binary_Tetris_JUE_V1_1_gb_{start,end}. */
+extern const uint8_t rom_start[] asm("_binary_Tetris_JUE_V1_1_gb_start");
+extern const uint8_t rom_end  [] asm("_binary_Tetris_JUE_V1_1_gb_end");
+static const char *ROM_LABEL = "tetris";
 #else
 extern const uint8_t rom_start[] asm("_binary_sml_gb_start");
 extern const uint8_t rom_end  [] asm("_binary_sml_gb_end");
@@ -95,6 +101,62 @@ static void frame_pacer(struct mmu *m) {
 }
 #endif
 
+/* --- FPS probe ------------------------------------------------------
+ *
+ * Opt-in via -DGBJIT_FPS_PROBE=1. A frame-complete callback (Core 0,
+ * fired from ppu_tick once per emulated frame) measures how many GB
+ * frames the emulator produces per wall-clock second — i.e. emulation
+ * throughput. The lowest 1-second window and the worst single frame
+ * are tracked internally every second (compare-only, no I/O); a
+ * summary is logged only every FPS_LOG_PERIOD_S seconds so the serial
+ * write — which blocks Core 0 — barely perturbs the number it reports.
+ * The first 3 s are skipped as warm-up (boot + cold JIT compilation).
+ * Logging uses ESP_LOGE so it survives the release ERROR log level. */
+#if GBJIT_FPS_PROBE
+#ifndef FPS_LOG_PERIOD_S
+#define FPS_LOG_PERIOD_S 10
+#endif
+static void fps_probe(struct mmu *m) {
+    (void)m;
+    static bool     started, warm;
+    static int64_t  t_anchor, t_win, t_prev;
+    static uint32_t total, win_frames, log_div;
+    static int      min_win = 1 << 30;
+    static int64_t  worst_frame_us;
+
+    int64_t now = esp_timer_get_time();
+    if (!started) { started = true; t_anchor = t_win = t_prev = now; return; }
+
+    if (!warm) {
+        if (now - t_anchor < 3000000) { t_prev = now; return; }
+        warm = true;
+        t_anchor = t_win = t_prev = now;       /* re-anchor past warm-up */
+        return;
+    }
+
+    int64_t frame_us = now - t_prev;
+    t_prev = now;
+    if (frame_us > worst_frame_us) worst_frame_us = frame_us;
+    total++;
+    win_frames++;
+
+    if (now - t_win >= 1000000) {
+        int win_fps = (int)((int64_t)win_frames * 1000000 / (now - t_win));
+        if (win_fps < min_win) min_win = win_fps;
+        t_win = now;
+        win_frames = 0;
+        if (++log_div >= FPS_LOG_PERIOD_S) {
+            log_div = 0;
+            int avg = (int)((int64_t)total * 1000000 / (now - t_anchor));
+            ESP_LOGE("fps", "%s avg=%d min=%d worst=%lldms (%llds)",
+                     ROM_LABEL, avg, min_win,
+                     (long long)(worst_frame_us / 1000),
+                     (long long)((now - t_anchor) / 1000000));
+        }
+    }
+}
+#endif
+
 #ifdef DEBUG
 static void serial_sink(void *ctx, uint8_t b) {
     (void)ctx;
@@ -130,6 +192,10 @@ void app_main(void) {
     s_pacer_anchor_us = esp_timer_get_time();
     s_pacer_frame_count = 0;
     s_mmu.frame_complete_cb = frame_pacer;
+#elif GBJIT_FPS_PROBE
+    /* Throughput measurement (mutually exclusive with the pacer — a
+     * capped frame rate would make the FPS number meaningless). */
+    s_mmu.frame_complete_cb = fps_probe;
 #endif
     cpu_reset(&s_cpu, &s_mmu);
 

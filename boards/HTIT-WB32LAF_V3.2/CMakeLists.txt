@@ -33,6 +33,14 @@ idf_build_set_property(MINIMAL_BUILD ON)
 if(NOT DEFINED GBJIT_HALT_STEP_CYCLES)
     set(GBJIT_HALT_STEP_CYCLES 1024)
 endif()
+# JIT codecache arena. The 64 KB core default starves larger games:
+# an on-board arena sweep with Tetris showed a hard cliff — 46 fps at
+# <=88 KB (working set spills the bump allocator; the overflow blocks
+# fall back to the interpreter permanently) jumping to ~145 fps at
+# 96 KB once the whole working set is JIT-resident. 96 KB is the knee.
+if(NOT DEFINED GBJIT_ARENA_KB)
+    set(GBJIT_ARENA_KB 96)
+endif()
 if(GBJIT_QEMU_LCD)
     # Full-frame render for the virtual LCD.
     if(NOT DEFINED GBJIT_PPU_DRAW_MIN_LY)
