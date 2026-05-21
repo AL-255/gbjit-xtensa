@@ -451,6 +451,11 @@ typedef struct {
      * an internal Xtensa branch, the op is no longer a block terminator
      * — gbjit_compile_block keeps walking forward instead of stopping. */
     bool       internalised_back_edge;
+    /* Set for an IO/HRAM-flag busy-wait block (see is_io_poll_halt in
+     * gbjit_compile_block): the JR cc emission then also stores 1 into
+     * cpu->halted on the spin-taken path, so the dispatcher fast-forwards
+     * the wait through its HALT inner loop instead of re-iterating. */
+    bool       emit_halt_on_spin;
 } inline_ctx;
 
 /* Self-modifying-code guard for inlined RAM stores.
@@ -942,6 +947,14 @@ static bool inline_op(xt_emit *e, u8 opcode, u16 pc, inline_ctx *ictx) {
         /* Taken-block. */
         emit_load_u16(e, 11, target, 2);
         xt_addi(e, 12, 12, 12);
+        if (ictx->emit_halt_on_spin) {
+            /* IO/HRAM-flag busy-wait: the spin-taken path also sets
+             * cpu->halted so the dispatcher fast-forwards the wait via
+             * its HALT inner loop. a4 is dead here (it held F & mask,
+             * already consumed by the branch above). */
+            xt_movi(e, 4, 1);
+            xt_s8i(e, 4, 13, OFF_HALTED);
+        }
 
         /* Jump to end. */
         u32 j_pos = e->len;
@@ -1850,6 +1863,33 @@ gbjit_block *gbjit_compile_block(codecache *cc, cpu_state *cpu, u16 pc_start,
     }
     (void)is_dec_a_loop;
 
+    /* --- IO/HRAM-flag busy-wait fast path ---
+     *
+     * Pattern:  LDH A,(n8) ; AND A | OR A ; JR Z,-5
+     * with n8 in HRAM ($FF80..$FFFE) and the JR target == pc_start (a
+     * self-loop). This spins until an HRAM flag becomes non-zero — and
+     * that flag can only change when an interrupt handler runs. Tetris's
+     * main loop polls $FF85 exactly this way; it is ~600x hotter than
+     * any other block, and re-iterating the JIT translation ~28M times
+     * is pure overhead while the GB CPU does nothing useful.
+     *
+     * The block is compiled normally, but the JR cc's spin-taken path
+     * additionally sets cpu->halted (see inline_ctx.emit_halt_on_spin).
+     * The dispatcher then fast-forwards the wait with its proven HALT
+     * inner loop — advance cycles, tick the PPU, service the IRQ that
+     * runs the handler — instead of re-entering the block. When the
+     * handler sets the flag, the next pass takes the not-taken path,
+     * leaves cpu->halted clear, and the loop exits exactly as a literal
+     * spin would. HRAM-only: an IO-register poll (LY/STAT/JOYP/...) is
+     * not IRQ-terminated and must NOT be converted to a HALT. */
+    bool is_io_poll_halt =
+            (n_ops == 3
+             && ops_opcode[0] == 0xF0                                  /* LDH A,(n8) */
+             && (ops_opcode[1] == 0xA7 || ops_opcode[1] == 0xB7)       /* AND A / OR A */
+             && ops_opcode[2] == 0x28                                  /* JR Z */
+             && (i8)mmu_read8(cpu->mmu, (u16)(ops_pc[2] + 1)) == -5    /* target == pc_start */
+             && mmu_read8(cpu->mmu, (u16)(ops_pc[0] + 1)) >= 0x80u);   /* HRAM flag */
+
     /* Reserve. */
     u32 lit_bytes = LITERAL_POOL_BYTES;
     u32 code_bytes = PROLOGUE_EPILOGUE_BYTES + n_ops * BYTES_PER_OP;
@@ -1974,6 +2014,7 @@ gbjit_block *gbjit_compile_block(codecache *cc, cpu_state *cpu, u16 pc_start,
         inline_ctx ictx = {
             cpu->mmu, &L, entry_off, mmu_base_value, lit_off,
             ops_pc, ops_code_off, i, is_back_edge, false,
+            is_io_poll_halt,
         };
         if (inline_op(&e, opcode, op_pc, &ictx)) {
             /* Any terminator op (HALT/JR/JP/...) — once inlined the block
