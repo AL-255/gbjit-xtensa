@@ -160,6 +160,23 @@ source $IDF_PATH/export.sh
 python3 benchmark/bench_options_board.py        # board on /dev/ttyUSB0
 ```
 
+### Tetris FPS arena sweep (real hardware)
+
+`benchmark/fps_sweep.sh` flashes the Heltec board and measures Tetris
+frames/wall-second for the interpreter baseline and JIT modes 0/1/2
+(no-eviction / coldness / circular) across 32–128 KB code-cache arenas;
+`benchmark/fps_plot.py` renders the avg/min plots. Results land in
+`benchmark/results/tetris_arena_sweep.csv` + `bench_avg.png` / `bench_min.png`.
+
+```sh
+source $IDF_PATH/export.sh
+bash benchmark/fps_sweep.sh        # board on /dev/ttyUSB0, ~40 min
+python3 benchmark/fps_plot.py
+```
+
+Best measured config is coldness eviction (`-DGBJIT_JIT_EVICT=1`) at a
+96 KB arena — 264 fps vs the 74 fps interpreter baseline.
+
 ### QEMU instruction-count bench
 
 `benchmark/run_bench.sh` drives `qemu-system-xtensa` on the

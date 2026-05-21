@@ -62,6 +62,23 @@
 /* Limits. */
 #define MAX_OPS_PER_BLOCK 32
 
+/* The HRAM-flag io-poll-halt fast path (is_io_poll_halt) and the DEC-A
+ * OAM-DMA closed form (is_dec_a_loop) are BOTH kept on — the generic
+ * self-loop does not subsume either:
+ *
+ *  - is_io_poll_halt converts Tetris's hot FF85 wait into a HALT
+ *    fast-forward (skip ~1024 idle cycles per step). The generic
+ *    self-loop instead *spins* the loop — 64 real block executions per
+ *    outer trip. A board benchmark with io-poll-halt disabled measured
+ *    a ~26% regression (mode 1 / 96 KB: 264 -> 195 fps), so it stays.
+ *    -DGBJIT_IO_POLL_HALT=0 disables it (for A/B comparison).
+ *
+ *  - is_dec_a_loop computes the wait loop's end state in O(1) rather
+ *    than iterating it at all — also beyond what spinning can do. */
+#ifndef GBJIT_IO_POLL_HALT
+#define GBJIT_IO_POLL_HALT 1
+#endif
+
 #ifdef DEBUG
 /* Codecache density probe — see the accumulation in gbjit_compile_block. */
 u64 gbjit_cc_reserved = 0, gbjit_cc_actual = 0, gbjit_cc_n = 0;
@@ -1883,7 +1900,8 @@ gbjit_block *gbjit_compile_block(codecache *cc, cpu_state *cpu, u16 pc_start,
      * spin would. HRAM-only: an IO-register poll (LY/STAT/JOYP/...) is
      * not IRQ-terminated and must NOT be converted to a HALT. */
     bool is_io_poll_halt =
-            (n_ops == 3
+            (GBJIT_IO_POLL_HALT
+             && n_ops == 3
              && ops_opcode[0] == 0xF0                                  /* LDH A,(n8) */
              && (ops_opcode[1] == 0xA7 || ops_opcode[1] == 0xB7)       /* AND A / OR A */
              && ops_opcode[2] == 0x28                                  /* JR Z */

@@ -68,6 +68,12 @@ throughput is sub-optimal.
 | Codegen-time region resolution for absolute LD | ✅ — no runtime branch for known a16 |
 | Dispatcher-level predicted-next chain cache | ✅ — ~94 % hit rate on the Blargg sub-tests |
 | Codegen-level direct chaining (patchable L32R+JX) | ⏸ scaffolded, not emitted yet |
+| Code-cache reservation trimming (`codecache_trim`) | ✅ — blocks emit ~54 % of their worst-case budget; trimming the slack ~doubles how much of a working set fits an arena |
+| Code-cache eviction (`GBJIT_JIT_EVICT` 0/1/2 = bump / coldness-LRU / circular-FIFO) | ✅ — coldness eviction is the fastest config on Tetris |
+| OAM-DMA `DEC A;JR NZ` closed form (`is_dec_a_loop`) | ✅ — computes the wait's end state in O(1), no iteration |
+| HRAM-flag busy-wait fast path (`is_io_poll_halt`) | ✅ — Tetris's hot FF85 wait → HALT fast-forward; ~+42 % board fps (`GBJIT_IO_POLL_HALT`) |
+| Generic dispatcher self-loop fast path (`GBJIT_DISPATCHER_SELFLOOP`) | ✅ — re-enters any register/HRAM-pure self-loop block directly; JIT modes 0/1/2, overhead-neutral |
+| Internal-clock serial transfer completion | ✅ — non-Blargg ROMs no longer hang on the never-clearing serial start bit |
 | Lazy flag materialisation | ❌ planned |
 | Per-flag dead-code elimination | ❌ planned |
 
@@ -98,6 +104,29 @@ The qemu number is bounded by qemu's instruction-by-instruction Xtensa
 emulation overhead (typically 5–10× slower than the real S3 at 240 MHz).
 At 24 MHz emulated, that's still 5.8× DMG and the same JIT on a real S3
 should clear 60–100 MHz of T-cycles (15–25× DMG).
+
+## Benchmark — Tetris on the Heltec board
+
+`benchmark/fps_sweep.sh` flashes the HTIT-WB32LAF_V3.2 board and measures
+Tetris frames/wall-second across the JIT code-cache modes and arena
+sizes (`benchmark/fps_plot.py` renders the plots in `benchmark/results/`):
+
+| arena | no-eviction | coldness/LRU | circular/FIFO |
+|------:|------------:|-------------:|--------------:|
+| 64 KB | 166 | 138 | 124 |
+| 96 KB | 165 | **264** | 191 |
+| 128 KB | 166 | **268** | 214 |
+
+Interpreter baseline 74 fps. Best config: **coldness eviction + 96 KB →
+264 fps** (3.6× the interpreter, ~4.4× a real Game Boy), same IRAM as
+the no-eviction default. No-eviction caps at ~166 because its
+interpreter-fallback tail can never become JIT-resident; eviction has no
+such cap. Below ~56 KB every JIT mode is slower than the interpreter —
+the cache is too small to be worth it.
+
+Tetris also exercises the busy-loop fast paths: the `is_io_poll_halt`
+HRAM-flag patch is worth ~+42 % here (an A/B with it disabled measured
+264 → 195 fps, see `benchmark/results/selfloop_ab.md`).
 
 ## ESP32-S3 build & run
 

@@ -100,7 +100,8 @@ foreach(_opt
         GBJIT_DISPATCHER_SERVICE_SHORTCUT
         GBJIT_DISPATCHER_CHAIN_BATCH
         GBJIT_DISPATCHER_SELFLOOP
-        GBJIT_SELFLOOP_MAX)
+        GBJIT_SELFLOOP_MAX
+        GBJIT_IO_POLL_HALT)
     if(DEFINED ${_opt})
         idf_build_set_property(COMPILE_DEFINITIONS
             "${_opt}=${${_opt}}" APPEND)
