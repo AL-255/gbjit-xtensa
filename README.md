@@ -43,43 +43,51 @@ before the arena filled.
 
 | Arena | jit (cold) | jit (pre-compiled) | jit (no prefetch) | Blocks |
 |------:|-----------:|-------------------:|------------------:|-------:|
-|  4 KB |  4.51 MHz | 5.25 MHz | 4.51 MHz | 7 |
-|  8 KB |  5.85     | 7.21     | 5.92     | 11 |
-| 16 KB |  6.25     | 11.08    | 6.32     | 21 |
-| 32 KB |  6.13     | 11.03    | 6.28     | 31 |
-| 48 KB |  9.19     | 18.72    | 10.14    | 57 |
-| **64 KB (default)** | 9.90 | 22.11    | 11.03 | 77 |
-| **96 KB**           | **13.67** | 22.56 | 12.79 | 122 |
-| 128 KB| 12.22     | 22.46    | 12.45    | 133 |
-| 192 KB| 13.65     | **23.03** | 12.94 | 133 |
+|  4 KB |  7.34 MHz |  9.72 MHz |  8.76 MHz |  11 |
+|  8 KB |  8.16     | 10.70     |  9.47     |  22 |
+| 16 KB |  7.51     | 10.73     |  9.22     |  39 |
+| 32 KB | 14.15     | 23.97     | 19.89     |  81 |
+| 48 KB | 20.91     | 43.65     | 21.36     | 121 |
+| **64 KB (default)** | **22.46** | 43.80 | 22.67 | 133 |
+| **96 KB**           | 21.64 | **45.49** | **22.76** | 133 |
+| 128 KB| 22.42     | 41.02     | 22.74     | 133 |
+| 192 KB| 22.03     | 43.03     | 21.98     | 133 |
 
-Interpreter baseline: **9.48 MHz** / 2.26× DMG.
+Interpreter baseline: **10.93 MHz** / 2.61× DMG.
 
 What the curves say:
 
 - **jit (cold)** pays the on-the-fly compile cost during the measured
-  window — flat-ish past 96 KB at ~13–14 MHz because the working set
-  (133 blocks) fits comfortably and there's nothing more to compile.
+  window — it climbs steeply through 32–48 KB, then sits flat at
+  ~21–22.5 MHz from 48 KB onward, where the 133-block working set fits
+  and there's nothing more to compile.
 - **jit (pre-compiled)** runs a warm-up pass first, then resets `cpu_
   state` and benches; the measured window contains zero compiles. Once
-  the arena is ≥ 64 KB it sits in the 22–23 MHz band (~2.4× interp);
-  the gap vs cold-start (~9 MHz at 96 KB) is the JIT compile cost.
+  the arena is ≥ 48 KB it sits in the 41–45 MHz band (~4× interp); the
+  gap vs cold-start (~22 MHz at 64 KB) is the JIT compile cost.
 - **jit (no prefetch)** is the cached path with the static-successor
   prefetch disabled, so each new block reaches the cache via a chain
   miss instead of a depth-4 walk at first compile. Tracks the cold
-  curve within noise — prefetch is a marginal first-encounter win,
-  not a steady-state speedup. See
+  curve within noise — slightly *above* it below 48 KB, where skipping
+  the prefetch walk trims first-compile work inside the measured
+  window. Prefetch is a marginal first-encounter cost here, not a
+  steady-state win. See
   [`benchmark/results/prefetch_investigation.md`](benchmark/results/prefetch_investigation.md)
   for the full depth + evict-policy sweep.
-- **Under 48 KB every JIT mode falls below the interp.** The arena
-  fills before SML's hot blocks are compiled, the dispatcher
-  recompiles the same blocks, and per-call dispatcher overhead +
-  recompile cost exceed the interp's per-op switch-table dispatch.
+- **At 16 KB and below the cold / no-prefetch JIT fall below the
+  interp.** The arena fills before SML's hot blocks are all compiled,
+  the dispatcher recompiles the same blocks, and per-call dispatcher
+  overhead + recompile cost exceed the interp's per-op switch-table
+  dispatch. From 32 KB up every JIT mode clears the baseline.
 
-Reproduce: `benchmark/run_cache_sweep.sh` (parallel IDF builds,
-then a worker-pool of qemu-xtensa runs pinned one-per-CPU via
-`taskset -c` so each run's wall-clock-tied virtual timer is
-uncontended) and `benchmark/plot_cache_sweep.py`.
+Reproduce: `benchmark/run_cache_sweep.sh` (parallel IDF builds, then
+qemu-xtensa runs whose wall-clock-tied virtual timer must stay
+uncontended — on Linux one run is pinned per CPU via `taskset -c`; on
+macOS, which has no per-process CPU affinity, the runs are serialised)
+and `benchmark/plot_cache_sweep.py`. macOS also needs GNU `timeout`
+(`brew install coreutils`); the numbers above were captured on an
+Apple-silicon host, so they sit above the figures from the original
+Linux run — compare curve shape rather than absolute MHz across hosts.
 
 ## Quick start — host
 
