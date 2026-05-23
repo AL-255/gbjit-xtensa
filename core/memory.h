@@ -56,6 +56,16 @@ typedef struct mmu {
     u8       rom_bank;
     u16      rom_banks;
 
+    /* Joypad button mask. Bit per button, 1 = pressed:
+     *   bit 0 = A, 1 = B, 2 = Select, 3 = Start
+     *   bit 4 = Right, 5 = Left, 6 = Up, 7 = Down
+     * The JOYP ($FF00) read consults this together with the P14/P15 row
+     * select the CPU wrote into io[0x00]. Default 0 = no buttons pressed
+     * (matches the previous behaviour where reads always returned 0xCF
+     * in the low nibble). Test harnesses can drive scripted inputs by
+     * mutating this directly between dispatcher iterations. */
+    u8       buttons;
+
     /* Set by mmu_write8 whenever MBC bank-control writes change the bank
      * currently mapped at $4000..$7FFF. The JIT dispatcher polls this
      * flag before entering each block and invalidates any cached blocks

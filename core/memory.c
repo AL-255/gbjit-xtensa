@@ -1,5 +1,6 @@
 #include "memory.h"
 #include "cpu_state.h"
+#include "ppu.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -152,7 +153,20 @@ u8 mmu_read8(mmu *m, u16 addr) {
          * low nibble is 0 and SML interprets it as "all buttons held"
          * which trips the soft-reset check at $07DA. */
         if (io_addr == 0x00) {
-            return (u8)(m->io[0x00] | 0xCFu);
+            /* JOYP: bits 6/7 always 1, bits 4/5 are P14/P15 row selects
+             * driven by the CPU, low 4 bits are the OR of the selected
+             * row(s) with the buttons mask inverted (0 = pressed).
+             * Default buttons=0 reproduces the historical "no input"
+             * behaviour (low nibble reads as 0xF). */
+            u8 sel = (u8)(m->io[0x00] & 0x30u);
+            u8 nib = 0x0Fu;
+            if (!(sel & 0x10u)) {           /* P14 = 0: direction row */
+                nib &= (u8)~((m->buttons >> 4) & 0x0Fu);
+            }
+            if (!(sel & 0x20u)) {           /* P15 = 0: action-button row */
+                nib &= (u8)~(m->buttons & 0x0Fu);
+            }
+            return (u8)(0xC0u | sel | nib);
         }
         /* LY ($FF44) and STAT ($FF41) are maintained by ppu_tick from
          * cpu->cycles; reads just return the cached IO byte. */
@@ -219,6 +233,25 @@ void mmu_write8(mmu *m, u16 addr, u8 v) {
     if (addr < 0xFF00u) return;
     if (addr < 0xFF80u) {
         u8 io_addr = (u8)(addr - 0xFF00u);
+        /* For PPU/timer registers, snap the PPU state machine up to the
+         * write cycle before the new value lands. Without this, the next
+         * ppu_tick computes its delta from a stale ppu_last_cpu_cycles
+         * and re-processes the pre-write cycles in the post-write state
+         * — most visibly, an LCDC ON-edge re-runs the OFF-period cycles
+         * as if they were in OAM scan, drifting LY/STAT by tens of
+         * cycles relative to the reference interpreter (whose per-
+         * instruction tick keeps ppu_last_cpu_cycles fresh).
+         *
+         * Set covers every byte the PPU/timer either reads back into
+         * (LCDC/STAT/scrolls/palettes/WY-WX), responds to as an event
+         * (DMA), or counts cycles against (DIV/TIMA). FF00/FF02/FF0F
+         * are joypad/serial/IF — unrelated to the PPU's cycle accounting
+         * and skipped to avoid the timer_tick overhead on every IF read-
+         * modify-write the IRQ path emits. */
+        if (io_addr == 0x04u || io_addr == 0x05u
+                || (io_addr >= 0x40u && io_addr <= 0x4Bu)) {
+            ppu_flush(m->cpu);
+        }
         /* Timer write quirks (Pan Docs §"Timer Registers"):
          *  - FF04 (DIV): any write resets the visible byte to 0; also
          *    reset the prescaler accumulator so the next tick uses the

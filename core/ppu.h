@@ -28,4 +28,15 @@ struct cpu_state;
  * became true since the previous call. */
 void ppu_tick(struct cpu_state *cpu);
 
+/* Force-advance the PPU model up to cpu->cycles, bypassing the fast-path
+ * early return. Call this immediately before mutating a PPU/timer IO
+ * register that takes effect at cpu->cycles — without it, the next
+ * ppu_tick would compute its delta from an older ppu_last_cpu_cycles and
+ * mis-attribute the pre-write cycles to the post-write state (e.g. the
+ * cycles between a stale last_cyc and an LCDC ON-edge get re-processed in
+ * the new ON state, drifting LY/STAT versus the reference interpreter).
+ * Also called before inlined PPU/timer IO reads in the JIT so the io[]
+ * byte reflects the state at cpu->cycles. */
+void ppu_flush(struct cpu_state *cpu);
+
 #endif
