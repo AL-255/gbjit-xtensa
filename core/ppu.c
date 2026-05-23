@@ -2,6 +2,7 @@
 #include "cpu_state.h"
 #include "memory.h"
 #include <string.h>   /* memcpy — frame buffer swap, tile-row pack/unpack */
+#include "profiler.h"
 
 /* Fast tile-row renderer.
  *
@@ -603,6 +604,7 @@ static void timer_tick(mmu *m, u64 cycles_now) {
 
 void ppu_tick(struct cpu_state *cpu) {
     if (!cpu || !cpu->mmu) return;
+    PROF_BEGIN(PROF_PPU);
     mmu *m = cpu->mmu;
 
     /* Timer first — runs every tick regardless of the PPU early-return,
@@ -619,6 +621,7 @@ void ppu_tick(struct cpu_state *cpu) {
      * counter wraps past the deadline. */
     if (!gb_cycles_reached(cpu->cycles, m->ppu_next_event_cycles)
             && m->io[LCDC_REG] == m->ppu_last_lcdc) {
+        PROF_END(PROF_PPU);
         return;
     }
 
@@ -640,6 +643,7 @@ void ppu_tick(struct cpu_state *cpu) {
         while (m->ppu_lcd_off_count >= LCD_FRAME_CYCLES)
             m->ppu_lcd_off_count -= LCD_FRAME_CYCLES;
         ppu_recompute_next_event(m, cpu->cycles);
+        PROF_END(PROF_PPU);
         return;
     }
 
@@ -756,4 +760,5 @@ void ppu_tick(struct cpu_state *cpu) {
     }
 
     ppu_recompute_next_event(m, cpu->cycles);
+    PROF_END(PROF_PPU);
 }

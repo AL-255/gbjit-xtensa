@@ -16,7 +16,7 @@ add_compile_options(-Wall -Wextra -Wshadow -Wno-unused-parameter -fno-strict-ali
 # gbjit_host's printf line and the unit tests both read these. The
 # production board firmware (boards/*) intentionally does NOT define
 # DEBUG, so those increments are compiled out of the hot path.
-add_compile_definitions(DEBUG=1)
+#add_compile_definitions(DEBUG=1)
 
 # Propagate the JIT/PPU build-time toggles so the host build can A/B
 # them too. Each is optional — when undefined the C source picks up

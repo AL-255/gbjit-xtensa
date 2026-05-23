@@ -181,11 +181,32 @@ typedef struct mmu {
      * the implementation). Host harnesses leave it NULL so unit tests
      * and the differential benches run as fast as the host allows. */
     void (*frame_complete_cb)(struct mmu *m);
+
+    /* Joypad state — active-high bitmask of currently pressed buttons.
+     * Bit layout mirrors the Paperboy GB_BTN_* defines:
+     *   bit 0 = A,  bit 1 = B,  bit 2 = SELECT, bit 3 = START
+     *   bit 4 = RIGHT, bit 5 = LEFT, bit 6 = UP, bit 7 = DOWN
+     * Use mmu_set_joypad_state() to update. mmu_read8($FF00) converts
+     * to the active-low JOYP format the game expects. */
+    u8 joypad_state;
+
+    /* Optional IO read/write callbacks for peripheral emulation (e.g.
+     * APU). Called from mmu_read8/mmu_write8 for addresses in the IO
+     * region $FF00..$FF7F (excluding $FF00 JOYP which is handled
+     * separately). NULL by default (no-op). The read callback receives
+     * the current raw io[] byte and may return a modified value; the
+     * write callback is called after the io[] store. */
+    u8   (*io_read_cb)(void *ctx, u16 addr, u8 val);
+    void (*io_write_cb)(void *ctx, u16 addr, u8 val);
+    void *io_cb_ctx;
 } mmu;
 
 void gb_mmu_init(mmu *m);
 void mmu_destroy(mmu *m);   /* free heap-allocated ROM buffer */
 bool mmu_load_rom(mmu *m, const u8 *data, size_t len);
+
+/* Set the joypad button state (active-high Paperboy bitmask). */
+void mmu_set_joypad_state(mmu *m, u8 state);
 
 u8   mmu_read8 (mmu *m, u16 addr);
 void mmu_write8(mmu *m, u16 addr, u8  v);

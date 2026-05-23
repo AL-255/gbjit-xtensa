@@ -146,17 +146,26 @@ u8 mmu_read8(mmu *m, u16 addr) {
          * return the row-select bits PLUS the 4 button bits of the
          * selected row (0 = pressed). Bits 6,7 are always 1.
          *
-         * We have no physical input, so all four button bits read as
-         * 1 (none pressed). SML's polling routine at bank-3 $4800
-         * depends on this — if reads return the raw stored byte, the
-         * low nibble is 0 and SML interprets it as "all buttons held"
-         * which trips the soft-reset check at $07DA. */
+         * `joypad_state` carries the active-high Paperboy bitmask
+         * (GB_BTN_A=bit0 ... GB_BTN_DOWN=bit7). Convert to the
+         * active-low JOYP nibble for whichever row(s) are selected. */
         if (io_addr == 0x00) {
-            return (u8)(m->io[0x00] | 0xCFu);
+            u8 sel      = m->io[0x00];
+            u8 action_lo = (u8)(~m->joypad_state)       & 0x0Fu; /* A,B,Sel,Start */
+            u8 dir_lo    = (u8)(~(m->joypad_state >> 4)) & 0x0Fu; /* R,L,Up,Down */
+            u8 lo4 = 0x0Fu;
+            if (!(sel & 0x20u)) lo4 &= action_lo; /* P15 low → action row */
+            if (!(sel & 0x10u)) lo4 &= dir_lo;    /* P14 low → direction row */
+            return (u8)((sel & 0x30u) | 0xC0u | lo4);
         }
         /* LY ($FF44) and STAT ($FF41) are maintained by ppu_tick from
          * cpu->cycles; reads just return the cached IO byte. */
-        return m->io[io_addr];
+        {
+            u8 val = m->io[io_addr];
+            if (m->io_read_cb)
+                val = m->io_read_cb(m->io_cb_ctx, addr, val);
+            return val;
+        }
     }
     if (addr < 0xFFFFu) return m->hram[addr - 0xFF80u];
     return m->ie;
@@ -274,10 +283,16 @@ void mmu_write8(mmu *m, u16 addr, u8 v) {
                 m->oam[i] = mmu_read8(m, (u16)(src + i));
             }
         }
+        if (m->io_write_cb)
+            m->io_write_cb(m->io_cb_ctx, addr, v);
         return;
     }
     if (addr < 0xFFFFu) { smc_mark(m, addr); m->hram[addr - 0xFF80u] = v; return; }
     m->ie = v;
+}
+
+void mmu_set_joypad_state(mmu *m, u8 state) {
+    m->joypad_state = state;
 }
 
 u16 mmu_read16(mmu *m, u16 addr) {
