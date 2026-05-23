@@ -602,29 +602,13 @@ static void timer_tick(mmu *m, u64 cycles_now) {
 
 /* --- Main entry -------------------------------------------------------- */
 
-void ppu_tick(struct cpu_state *cpu) {
-    if (!cpu || !cpu->mmu) return;
-    PROF_BEGIN(PROF_PPU);
+/* Body of ppu_tick after the early-return check. Factored out so that
+ * ppu_flush() can run it unconditionally — see core/ppu.h for the why.
+ * Always advances ppu_last_cpu_cycles to cpu->cycles, applies any LCDC
+ * edge currently pending, and drains any state-machine transitions that
+ * the accumulated delta crosses. */
+static void ppu_advance(struct cpu_state *cpu) {
     mmu *m = cpu->mmu;
-
-    /* Timer first — runs every tick regardless of the PPU early-return,
-     * because SML and others poll DIV / wait for TIMA-overflow IRQ even
-     * when no PPU state transition is due. The cost is just two adds +
-     * a compare on the fast path. */
-    timer_tick(m, cpu->cycles);
-
-    /* Fast-path early-return — most dispatcher iterations span fewer
-     * cycles than the next state transition. The deadline is reset
-     * after every transition (or every LCDC edge). The comparison is
-     * wrap-safe: cpu->cycles is a 32-bit free-running counter, so a
-     * plain `cycles < deadline` would early-return forever once the
-     * counter wraps past the deadline. */
-    if (!gb_cycles_reached(cpu->cycles, m->ppu_next_event_cycles)
-            && m->io[LCDC_REG] == m->ppu_last_lcdc) {
-        PROF_END(PROF_PPU);
-        return;
-    }
-
     /* LCDC enable/disable edge detection — games typically write LCDC
      * via mmu_write8 which the JIT routes through its helper, so by the
      * time we get here the byte in m->io[$40] is current. */
@@ -643,7 +627,6 @@ void ppu_tick(struct cpu_state *cpu) {
         while (m->ppu_lcd_off_count >= LCD_FRAME_CYCLES)
             m->ppu_lcd_off_count -= LCD_FRAME_CYCLES;
         ppu_recompute_next_event(m, cpu->cycles);
-        PROF_END(PROF_PPU);
         return;
     }
 
@@ -760,5 +743,39 @@ void ppu_tick(struct cpu_state *cpu) {
     }
 
     ppu_recompute_next_event(m, cpu->cycles);
+}
+
+void ppu_tick(struct cpu_state *cpu) {
+    if (!cpu || !cpu->mmu) return;
+    PROF_BEGIN(PROF_PPU);
+    mmu *m = cpu->mmu;
+
+    /* Timer first — runs every tick regardless of the PPU early-return,
+     * because SML and others poll DIV / wait for TIMA-overflow IRQ even
+     * when no PPU state transition is due. The cost is just two adds +
+     * a compare on the fast path. */
+    timer_tick(m, cpu->cycles);
+
+    /* Fast-path early-return — most dispatcher iterations span fewer
+     * cycles than the next state transition. The deadline is reset
+     * after every transition (or every LCDC edge). The comparison is
+     * wrap-safe: cpu->cycles is a 32-bit free-running counter, so a
+     * plain `cycles < deadline` would early-return forever once the
+     * counter wraps past the deadline. */
+    if (!gb_cycles_reached(cpu->cycles, m->ppu_next_event_cycles)
+            && m->io[LCDC_REG] == m->ppu_last_lcdc) {
+        PROF_END(PROF_PPU);
+        return;
+    }
+
+    ppu_advance(cpu);
+    PROF_END(PROF_PPU);
+}
+
+void ppu_flush(struct cpu_state *cpu) {
+    if (!cpu || !cpu->mmu) return;
+    PROF_BEGIN(PROF_PPU);
+    timer_tick(cpu->mmu, cpu->cycles);
+    ppu_advance(cpu);
     PROF_END(PROF_PPU);
 }
