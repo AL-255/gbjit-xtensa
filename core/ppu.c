@@ -300,12 +300,35 @@ static inline u8 fetch_tile_pixel(const u8 *vram, u16 tile_addr_vram_rel,
 #define GBJIT_PPU_DRAW_MAX_X 160
 #endif
 
-/* Render scanline `ly` into m->framebuffer. Called at LCD_TRANSFER →
- * LCD_HBLANK; reads OAM, VRAM, BGP/OBP0/OBP1, LCDC, SCY/SCX, WY/WX
- * which must reflect the final state for this line. */
-static void ppu_draw_line(mmu *m, u8 ly) {
+/* Per-scanline register snapshot. ppu_draw_line_ex renders a line purely
+ * from this + a VRAM/OAM pointer pair, so the same renderer serves the live
+ * mmu (synchronous), the deferred flush, and the Core-1 render thread (which
+ * holds a small private snapshot instead of the whole mmu). */
+typedef struct {
+    u8 lcdc, bgp, scx, scy, obp0, obp1, wx;
+    u8 latched_wy;
+    u8 window_line;   /* window line counter value at this scanline's draw */
+} ppu_lstate;
+
+/* The window's internal line counter advances iff the window would render on
+ * this scanline (mirrors the predicate inside ppu_draw_line_ex). */
+static bool ppu_window_active(mmu *m, u8 ly) {
+    u8 lcdc = m->io[LCDC_REG];
+    if (!(lcdc & LCDC_WINDOW_ENABLE)) return false;
+    if (!(lcdc & LCDC_BG_ENABLE))     return false;
+    if (ly < m->ppu_latched_wy)       return false;
+    if (m->io[WX_REG] >= 167)         return false;
+    return true;
+}
+
+/* Render scanline `ly` into fb_base from the line registers `L` and the
+ * given VRAM/OAM. Pure: reads only its arguments, writes only fb_base, never
+ * advances window_line (the caller owns that). Called at LCD_TRANSFER →
+ * LCD_HBLANK with state that reflects the final values for this line. */
+static void ppu_draw_line_ex(u8 *fb_base, const u8 *vram, const u8 *oam,
+                             const ppu_lstate *L, u8 ly) {
 #if GBJIT_PPU_SKIP_DRAW
-    (void)m; (void)ly;
+    (void)fb_base; (void)vram; (void)oam; (void)L; (void)ly;
     return;
 #endif
 #if GBJIT_PPU_DRAW_MIN_LY > 0 || GBJIT_PPU_DRAW_MAX_LY < 144
@@ -317,17 +340,13 @@ static void ppu_draw_line(mmu *m, u8 ly) {
         return;
     }
 #endif
-#if GBJIT_FRAMEBUFFER_DOUBLE_BUFFER
-    u8 *line = &m->framebuffer_back[(u32)ly * 160];
-#else
-    u8 *line = &m->framebuffer[(u32)ly * 160];
-#endif
-    u8 lcdc = m->io[LCDC_REG];
+    u8 *line = &fb_base[(u32)ly * 160];
+    u8 lcdc = L->lcdc;
 
     /* DMG: if BG_ENABLE is clear, BG (and window) render as color 0. We
      * fill the line with shade-0 (BGP[0]) up front so sprites can still
      * draw over it. */
-    u8 bgp = m->io[BGP_REG];
+    u8 bgp = L->bgp;
     u8 bg_shade[4] = {
         (u8)(bgp & 3), (u8)((bgp >> 2) & 3),
         (u8)((bgp >> 4) & 3), (u8)((bgp >> 6) & 3),
@@ -335,13 +354,13 @@ static void ppu_draw_line(mmu *m, u8 ly) {
     u8 bg_color_id[160];                /* raw 0..3 before palette, for sprite/bg priority */
 
     if (lcdc & LCDC_BG_ENABLE) {
-        u8 scx = m->io[SCX_REG], scy = m->io[SCY_REG];
+        u8 scx = L->scx, scy = L->scy;
         u16 tilemap_base = (lcdc & LCDC_BG_TILEMAP_HI) ? 0x1C00 : 0x1800;
         bool unsigned_tiles = (lcdc & LCDC_BG_TILEDATA_LO) != 0;
         u8 bg_y = (u8)(ly + scy);
         u8 tile_row = (u8)(bg_y >> 3);
         u8 pixel_row = (u8)(bg_y & 7);
-        const u8 *tilemap_row = &m->vram[tilemap_base + tile_row * 32];
+        const u8 *tilemap_row = &vram[tilemap_base + tile_row * 32];
         u16 row_off = (u16)(pixel_row * 2);
         const int min_x = GBJIT_PPU_DRAW_MIN_X;
         const int max_x = GBJIT_PPU_DRAW_MAX_X;
@@ -358,8 +377,8 @@ static void ppu_draw_line(mmu *m, u8 ly) {
             u16 tile_addr = unsigned_tiles
                           ? (u16)(tile_id * 16)
                           : (u16)(0x1000 + (i8)tile_id * 16);
-            u8 b0 = m->vram[tile_addr + row_off];
-            u8 b1 = m->vram[tile_addr + row_off + 1u];
+            u8 b0 = vram[tile_addr + row_off];
+            u8 b1 = vram[tile_addr + row_off + 1u];
             for (; pc < 8 && x < max_x; pc++, x++, bg_x++) {
                 u8 bit = (u8)(7u - pc);
                 u8 cid = (u8)((((b1 >> bit) & 1u) << 1) | ((b0 >> bit) & 1u));
@@ -374,8 +393,8 @@ static void ppu_draw_line(mmu *m, u8 ly) {
             u16 tile_addr = unsigned_tiles
                           ? (u16)(tile_id * 16)
                           : (u16)(0x1000 + (i8)tile_id * 16);
-            u8 b0 = m->vram[tile_addr + row_off];
-            u8 b1 = m->vram[tile_addr + row_off + 1u];
+            u8 b0 = vram[tile_addr + row_off];
+            u8 b1 = vram[tile_addr + row_off + 1u];
             u32 cids_h = bg_cid_lut[b0 >> 4][b1 >> 4];
             u32 cids_l = bg_cid_lut[b0 & 0xF][b1 & 0xF];
             u32 sha_h  = bg_shade_lut[b0 >> 4][b1 >> 4];
@@ -394,8 +413,8 @@ static void ppu_draw_line(mmu *m, u8 ly) {
             u16 tile_addr = unsigned_tiles
                           ? (u16)(tile_id * 16)
                           : (u16)(0x1000 + (i8)tile_id * 16);
-            u8 b0 = m->vram[tile_addr + row_off];
-            u8 b1 = m->vram[tile_addr + row_off + 1u];
+            u8 b0 = vram[tile_addr + row_off];
+            u8 b1 = vram[tile_addr + row_off + 1u];
             for (pc = 0; pc < 8 && x < max_x; pc++, x++, bg_x++) {
                 u8 bit = (u8)(7u - pc);
                 u8 cid = (u8)((((b1 >> bit) & 1u) << 1) | ((b0 >> bit) & 1u));
@@ -417,8 +436,8 @@ static void ppu_draw_line(mmu *m, u8 ly) {
             } else {
                 tile_addr = (u16)(0x1000 + (i8)tile_id * 16);
             }
-            u8 b0 = m->vram[tile_addr + row_off];
-            u8 b1 = m->vram[tile_addr + row_off + 1u];
+            u8 b0 = vram[tile_addr + row_off];
+            u8 b1 = vram[tile_addr + row_off + 1u];
             for (; pc < 8 && x < max_x; pc++, x++, bg_x++) {
                 u8 bit = (u8)(7u - pc);
                 u8 cid = (u8)((((b1 >> bit) & 1u) << 1) | ((b0 >> bit) & 1u));
@@ -439,18 +458,18 @@ static void ppu_draw_line(mmu *m, u8 ly) {
      * map (LCDC bit 6). DMG: window only renders if BG_ENABLE is set
      * too (yes, the BG_ENABLE bit gates the window in DMG mode). */
     if ((lcdc & LCDC_WINDOW_ENABLE) && (lcdc & LCDC_BG_ENABLE)
-            && ly >= m->ppu_latched_wy) {
-        u8 wx = m->io[WX_REG];
+            && ly >= L->latched_wy) {
+        u8 wx = L->wx;
         if (wx < 167) {
             int start_x = (wx >= 7) ? (wx - 7) : 0;
             if (start_x < GBJIT_PPU_DRAW_MIN_X) start_x = GBJIT_PPU_DRAW_MIN_X;
             int end_x = GBJIT_PPU_DRAW_MAX_X;
             u16 tilemap_base = (lcdc & LCDC_WINDOW_TILEMAP_HI) ? 0x1C00 : 0x1800;
             bool unsigned_tiles = (lcdc & LCDC_BG_TILEDATA_LO) != 0;
-            u8 wy_internal = m->window_line;
+            u8 wy_internal = L->window_line;
             u8 tile_row = (u8)(wy_internal >> 3);
             u8 pixel_row = (u8)(wy_internal & 7);
-            const u8 *tilemap_row = &m->vram[tilemap_base + tile_row * 32];
+            const u8 *tilemap_row = &vram[tilemap_base + tile_row * 32];
             u16 row_off = (u16)(pixel_row * 2);
             int x = start_x;
             int win_x = x - (int)wx + 7;
@@ -464,8 +483,8 @@ static void ppu_draw_line(mmu *m, u8 ly) {
                 } else {
                     tile_addr = (u16)(0x1000 + (i8)tile_id * 16);
                 }
-                u8 b0 = m->vram[tile_addr + row_off];
-                u8 b1 = m->vram[tile_addr + row_off + 1u];
+                u8 b0 = vram[tile_addr + row_off];
+                u8 b1 = vram[tile_addr + row_off + 1u];
                 for (; pc < 8 && x < end_x; pc++, x++, win_x++) {
                     u8 bit = (u8)(7u - pc);
                     u8 cid = (u8)((((b1 >> bit) & 1u) << 1) | ((b0 >> bit) & 1u));
@@ -474,7 +493,6 @@ static void ppu_draw_line(mmu *m, u8 ly) {
                 }
                 pc = 0;
             }
-            m->window_line++;
         }
     }
 
@@ -490,13 +508,13 @@ static void ppu_draw_line(mmu *m, u8 ly) {
         visible_obj vis[10];
         int nvis = 0;
         for (int i = 0; i < 40 && nvis < 10; i++) {
-            u8 sy = m->oam[i * 4 + 0];
+            u8 sy = oam[i * 4 + 0];
             int top = (int)sy - 16;
             if ((int)ly < top || (int)ly >= top + obj_h) continue;
             vis[nvis].y    = sy;
-            vis[nvis].x    = m->oam[i * 4 + 1];
-            vis[nvis].tile = m->oam[i * 4 + 2];
-            vis[nvis].attr = m->oam[i * 4 + 3];
+            vis[nvis].x    = oam[i * 4 + 1];
+            vis[nvis].tile = oam[i * 4 + 2];
+            vis[nvis].attr = oam[i * 4 + 3];
             vis[nvis].oam_idx = (u8)i;
             nvis++;
         }
@@ -509,7 +527,7 @@ static void ppu_draw_line(mmu *m, u8 ly) {
             }
         }
         /* Render in reverse (lower X / earlier OAM wins). */
-        u8 obp0 = m->io[OBP0_REG], obp1 = m->io[OBP1_REG];
+        u8 obp0 = L->obp0, obp1 = L->obp1;
         for (int s = nvis - 1; s >= 0; s--) {
             int top = (int)vis[s].y - 16;
             int left = (int)vis[s].x - 8;
@@ -526,8 +544,8 @@ static void ppu_draw_line(mmu *m, u8 ly) {
              * pixel below. Same logic as fetch_tile_pixel but pulled
              * out of the 8-iteration inner loop. */
             u16 row_addr = (u16)(tile_addr + (u16)(row_in_sprite * 2));
-            u8 b0 = m->vram[row_addr];
-            u8 b1 = m->vram[row_addr + 1u];
+            u8 b0 = vram[row_addr];
+            u8 b1 = vram[row_addr + 1u];
             bool flip_x = (vis[s].attr & OAM_FLIP_X) != 0;
             bool bg_prio = (vis[s].attr & OAM_BG_PRIO) != 0;
             /* Early skip if the whole sprite is outside the column crop. */
@@ -546,6 +564,25 @@ static void ppu_draw_line(mmu *m, u8 ly) {
             }
         }
     }
+}
+
+/* Synchronous renderer: draw scanline `ly` from the live mmu, advancing the
+ * window line counter exactly as the GB PPU does. This is the non-offload
+ * draw path (and the reference the offload paths reproduce). */
+static void ppu_draw_line(mmu *m, u8 ly) {
+    ppu_lstate L = {
+        .lcdc = m->io[LCDC_REG], .bgp = m->io[BGP_REG],
+        .scx = m->io[SCX_REG],   .scy = m->io[SCY_REG],
+        .obp0 = m->io[OBP0_REG], .obp1 = m->io[OBP1_REG],
+        .wx = m->io[WX_REG],     .latched_wy = m->ppu_latched_wy,
+        .window_line = m->window_line,
+    };
+#if GBJIT_FRAMEBUFFER_DOUBLE_BUFFER
+    ppu_draw_line_ex(m->framebuffer_back, m->vram, m->oam, &L, ly);
+#else
+    ppu_draw_line_ex(m->framebuffer, m->vram, m->oam, &L, ly);
+#endif
+    if (ppu_window_active(m, ly)) m->window_line++;
 }
 
 /* --- PPU render offload (per-line register log + deferred render) ------
@@ -573,13 +610,10 @@ static void ppu_draw_line(mmu *m, u8 ly) {
  * line (it advances only on window-active lines), so the replay needs no
  * live PPU state. */
 #if GBJIT_PPU_OFFLOAD
-typedef struct {
-    u8 lcdc, bgp, scx, scy, obp0, obp1, wx;
-    u8 latched_wy;
-    u8 window_line;   /* window line counter value at this scanline's draw */
-} ppu_lstate;
-
-static ppu_lstate s_line_log[LCD_HEIGHT];
+#if GBJIT_FRAMEBUFFER_DOUBLE_BUFFER
+#error "GBJIT_PPU_OFFLOAD writes m->framebuffer directly; not compatible with GBJIT_FRAMEBUFFER_DOUBLE_BUFFER"
+#endif
+static ppu_lstate s_line_log[LCD_HEIGHT];   /* ppu_lstate defined above */
 static int s_cap_count;   /* scanlines captured so far this frame (0..144) */
 static int s_rendered;    /* scanlines already drawn this frame (0..s_cap_count) */
 
@@ -612,19 +646,6 @@ __attribute__((destructor)) static void diag_report(void) {
 }
 #endif
 
-/* Mirror of ppu_draw_line's window-active predicate (lines 441-444): the
- * window's internal line counter advances iff the window would render on
- * this scanline. Capture uses this to keep window_line in step without
- * drawing. */
-static bool ppu_window_active(mmu *m, u8 ly) {
-    u8 lcdc = m->io[LCDC_REG];
-    if (!(lcdc & LCDC_WINDOW_ENABLE)) return false;
-    if (!(lcdc & LCDC_BG_ENABLE))     return false;
-    if (ly < m->ppu_latched_wy)       return false;
-    if (m->io[WX_REG] >= 167)         return false;
-    return true;
-}
-
 /* Called at mode3→0 instead of ppu_draw_line: record the per-line register
  * state, then advance window_line exactly as ppu_draw_line would have. VRAM
  * and OAM are NOT snapshotted — they are flushed lazily (see below). */
@@ -647,39 +668,15 @@ static void ppu_capture_line(mmu *m, u8 ly) {
     if (ppu_window_active(m, ly)) m->window_line++;
 }
 
-/* Replay captured scanlines [from,to) through ppu_draw_line using the
- * registers in `log` and m's CURRENT VRAM/OAM, writing m->framebuffer.
- * The live io[]/latched_wy/window_line are saved and restored so the PPU
- * state machine is undisturbed (VBlank STAT/IF/LY are already set by the
- * caller). `m` and `log` may be the live mmu+s_line_log (synchronous flush)
- * or a render-thread snapshot (mmu copy + log copy on core 1). */
-static void ppu_render_lines(mmu *m, const ppu_lstate *log, int from, int to) {
-    if (from >= to) return;
-    u8 s_lcdc = m->io[LCDC_REG], s_bgp = m->io[BGP_REG];
-    u8 s_scx = m->io[SCX_REG],   s_scy = m->io[SCY_REG];
-    u8 s_obp0 = m->io[OBP0_REG],  s_obp1 = m->io[OBP1_REG];
-    u8 s_wx = m->io[WX_REG];
-    u8 s_wy = m->ppu_latched_wy,  s_wl = m->window_line;
-
+/* Replay captured scanlines [from,to) into `fb` from `log` + the given
+ * VRAM/OAM, via the pure ppu_draw_line_ex. No mmu state is touched, so this
+ * runs identically on the emul core (live fb/vram/oam + s_line_log) and on
+ * the render thread (live fb + a private VRAM/OAM/log snapshot). */
+static void ppu_render_lines(u8 *fb, const u8 *vram, const u8 *oam,
+                             const ppu_lstate *log, int from, int to) {
     for (int ly = from; ly < to; ly++) {
-        const ppu_lstate *L = &log[ly];
-        m->io[LCDC_REG] = L->lcdc;
-        m->io[BGP_REG]  = L->bgp;
-        m->io[SCX_REG]  = L->scx;
-        m->io[SCY_REG]  = L->scy;
-        m->io[OBP0_REG] = L->obp0;
-        m->io[OBP1_REG] = L->obp1;
-        m->io[WX_REG]   = L->wx;
-        m->ppu_latched_wy = L->latched_wy;
-        m->window_line    = L->window_line;
-        ppu_draw_line(m, (u8)ly);
+        ppu_draw_line_ex(fb, vram, oam, &log[ly], (u8)ly);
     }
-
-    m->io[LCDC_REG] = s_lcdc; m->io[BGP_REG] = s_bgp;
-    m->io[SCX_REG]  = s_scx;  m->io[SCY_REG] = s_scy;
-    m->io[OBP0_REG] = s_obp0; m->io[OBP1_REG] = s_obp1;
-    m->io[WX_REG]   = s_wx;
-    m->ppu_latched_wy = s_wy;  m->window_line = s_wl;
 }
 
 /* Flush captured-but-undrawn scanlines NOW with the current VRAM/OAM.
@@ -691,7 +688,8 @@ static void ppu_render_lines(mmu *m, const ppu_lstate *log, int from, int to) {
  * reference renderer's own block-granular draw point. */
 void ppu_offload_flush(struct mmu *m) {
     if (s_rendered < s_cap_count) {
-        ppu_render_lines(m, s_line_log, s_rendered, s_cap_count);
+        ppu_render_lines(m->framebuffer, m->vram, m->oam, s_line_log,
+                         s_rendered, s_cap_count);
         s_rendered = s_cap_count;
     }
     gbjit_ppu_have_pending = 0;
@@ -724,6 +722,7 @@ void ppu_offload_flush(struct mmu *m) {
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "esp_heap_caps.h"
+#include "esp_log.h"
 typedef SemaphoreHandle_t ofl_sem;
 #define OFL_SEM_NEW()   xSemaphoreCreateBinary()
 #define OFL_SEM_GIVE(s) xSemaphoreGive(s)
@@ -739,23 +738,28 @@ static sem_t ofl_host_sem_new(void) { sem_t s; sem_init(&s, 0, 0); return s; }
 static void  ofl_host_sem_wait(sem_t *s) { while (sem_wait(s) != 0) {} }
 #endif
 
-static mmu        *s_render_mmu;             /* private ctx: snapshot vram/oam + own fb */
-static ppu_lstate  s_render_log[LCD_HEIGHT]; /* snapshot of the per-line register log */
-static mmu        *s_render_dst;             /* live mmu to copy finished scanlines into */
+/* Private render context: a VRAM/OAM/log snapshot the thread renders from
+ * while the emul core mutates the live ones. ~9.6 KB (no framebuffer — the
+ * thread draws straight into the live framebuffer, which the emul core does
+ * not touch until it render_wait()s). Small enough to fit internal SRAM. */
+typedef struct {
+    u8 vram[VRAM_SIZE];
+    u8 oam[OAM_SIZE];
+    ppu_lstate log[LCD_HEIGHT];
+} ppu_render_ctx;
+
+static ppu_render_ctx *s_rctx;               /* snapshot the thread renders from */
+static u8         *s_render_fb;              /* live framebuffer to draw into */
 static int         s_render_from, s_render_to;
 static volatile bool s_render_inflight = false;
 static volatile bool s_render_started  = false;
 static volatile bool s_render_run      = false;
 static ofl_sem s_sem_go, s_sem_done;
 
-/* The actual render, run on the render thread. */
+/* The actual render, run on the render thread: straight into the live fb. */
 static void render_worker(void) {
-    ppu_render_lines(s_render_mmu, s_render_log, s_render_from, s_render_to);
-    if (s_render_to > s_render_from) {
-        memcpy(&s_render_dst->framebuffer[(size_t)s_render_from * 160],
-               &s_render_mmu->framebuffer[(size_t)s_render_from * 160],
-               (size_t)(s_render_to - s_render_from) * 160);
-    }
+    ppu_render_lines(s_render_fb, s_rctx->vram, s_rctx->oam, s_rctx->log,
+                     s_render_from, s_render_to);
 }
 
 #if defined(ESP_PLATFORM)
@@ -796,30 +800,39 @@ void ppu_offload_render_wait(void) {
  * needs. If the thread isn't up, render synchronously on the caller. */
 static void ppu_offload_kick(mmu *src, int from, int to) {
     if (!s_render_started) {
-        ppu_render_lines(src, s_line_log, from, to);
+        ppu_render_lines(src->framebuffer, src->vram, src->oam, s_line_log, from, to);
         return;
     }
     ppu_offload_render_wait();                 /* render ctx now free to reuse */
-    memcpy(s_render_mmu->vram, src->vram, VRAM_SIZE);
-    memcpy(s_render_mmu->oam,  src->oam,  OAM_SIZE);
-    memcpy(s_render_log, s_line_log, sizeof(s_render_log));
-    s_render_dst  = src;
-    s_render_from = from;
-    s_render_to   = to;
-    s_render_inflight = true;
-    OFL_SEM_GIVE(s_sem_go);
+    if (to > from) {
+        memcpy(s_rctx->vram, src->vram, VRAM_SIZE);
+        memcpy(s_rctx->oam,  src->oam,  OAM_SIZE);
+        memcpy(s_rctx->log,  s_line_log, sizeof(s_rctx->log));
+        s_render_fb   = src->framebuffer;
+        s_render_from = from;
+        s_render_to   = to;
+        s_render_inflight = true;
+        OFL_SEM_GIVE(s_sem_go);
+    }
 }
 
 void ppu_offload_thread_start(void) {
     if (s_render_started) return;
 #if defined(ESP_PLATFORM)
-    s_render_mmu = (mmu *)heap_caps_malloc(sizeof(mmu),
+    s_rctx = (ppu_render_ctx *)heap_caps_malloc(sizeof(*s_rctx),
                         MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!s_rctx) {
+        ESP_LOGW("gb_render", "render ctx alloc failed (%u B) -> synchronous render",
+                 (unsigned)sizeof(*s_rctx));
+        return;                                /* fall back to synchronous render */
+    }
+    ESP_LOGI("gb_render", "PPU offload: Core 1 render task; ctx=%u B; free internal heap=%u B",
+             (unsigned)sizeof(*s_rctx),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
 #else
-    s_render_mmu = (mmu *)malloc(sizeof(mmu));
+    s_rctx = (ppu_render_ctx *)malloc(sizeof(*s_rctx));
+    if (!s_rctx) return;                       /* fall back to synchronous render */
 #endif
-    if (!s_render_mmu) return;                 /* fall back to synchronous render */
-    memset(s_render_mmu, 0, sizeof(mmu));
     s_sem_go   = OFL_SEM_NEW();
     s_sem_done = OFL_SEM_NEW();
     s_render_run = true;
@@ -827,10 +840,10 @@ void ppu_offload_thread_start(void) {
     BaseType_t ok = xTaskCreatePinnedToCore(render_task_fn, "gb_render", 4096,
                                             NULL, tskIDLE_PRIORITY + 1,
                                             &s_render_task, 1 /* Core 1 */);
-    if (ok != pdPASS) { s_render_run = false; free(s_render_mmu); s_render_mmu = NULL; return; }
+    if (ok != pdPASS) { s_render_run = false; free(s_rctx); s_rctx = NULL; return; }
 #else
     if (pthread_create(&s_render_pthread, NULL, render_task_fn, NULL) != 0) {
-        s_render_run = false; free(s_render_mmu); s_render_mmu = NULL; return;
+        s_render_run = false; free(s_rctx); s_rctx = NULL; return;
     }
 #endif
     s_render_started = true;
@@ -849,8 +862,8 @@ void ppu_offload_thread_stop(void) {
     s_render_run = false;
     OFL_SEM_GIVE(s_sem_go);
     pthread_join(s_render_pthread, NULL);
-    free(s_render_mmu);
-    s_render_mmu = NULL;
+    free(s_rctx);
+    s_rctx = NULL;
     s_render_started = false;
 #endif
 }
@@ -864,7 +877,8 @@ static void ppu_render_frame_from_log(mmu *m) {
 #if GBJIT_PPU_OFFLOAD_THREAD
     ppu_offload_kick(m, s_rendered, s_cap_count);
 #else
-    ppu_render_lines(m, s_line_log, s_rendered, s_cap_count);
+    ppu_render_lines(m->framebuffer, m->vram, m->oam, s_line_log,
+                     s_rendered, s_cap_count);
 #endif
     s_rendered = s_cap_count;
     gbjit_ppu_have_pending = 0;
