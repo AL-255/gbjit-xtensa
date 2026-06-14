@@ -215,7 +215,14 @@ void mmu_write8(mmu *m, u16 addr, u8 v) {
          * which is what almost every small MBC1 cart actually uses. */
         return;
     }
-    if (addr < 0xA000u) { smc_mark(m, addr); m->vram[addr - 0x8000u] = v; return; }
+    if (addr < 0xA000u) {
+#if GBJIT_PPU_OFFLOAD
+        /* Mid-frame VRAM write: render any captured scanlines first, while
+         * VRAM still holds the bytes they were captured under. */
+        if (gbjit_ppu_have_pending) ppu_offload_flush(m);
+#endif
+        smc_mark(m, addr); m->vram[addr - 0x8000u] = v; return;
+    }
     if (addr < 0xC000u) return;
     if (addr < 0xE000u) { smc_mark(m, addr); m->wram[addr - 0xC000u] = v; return; }
     if (addr < 0xFE00u) {
@@ -225,7 +232,12 @@ void mmu_write8(mmu *m, u16 addr, u8 v) {
         m->wram[(addr - 0xE000u) & 0x1FFFu] = v;
         return;
     }
-    if (addr < 0xFEA0u) { m->oam[addr - 0xFE00u] = v; return; }
+    if (addr < 0xFEA0u) {
+#if GBJIT_PPU_OFFLOAD
+        if (gbjit_ppu_have_pending) ppu_offload_flush(m);
+#endif
+        m->oam[addr - 0xFE00u] = v; return;
+    }
     if (addr < 0xFF00u) return;
     if (addr < 0xFF80u) {
         u8 io_addr = (u8)(addr - 0xFF00u);
@@ -304,6 +316,10 @@ void mmu_write8(mmu *m, u16 addr, u8 v) {
          * identical for the typical use pattern (and faster than emul-
          * ating the DMA byte-by-byte). */
         if (addr == 0xFF46u) {
+#if GBJIT_PPU_OFFLOAD
+            /* OAM DMA rewrites all of OAM; flush captured scanlines first. */
+            if (gbjit_ppu_have_pending) ppu_offload_flush(m);
+#endif
             u16 src = (u16)((u16)v << 8);
             for (u16 i = 0; i < 0xA0u; i++) {
                 m->oam[i] = mmu_read8(m, (u16)(src + i));

@@ -45,4 +45,22 @@ void ppu_flush(struct cpu_state *cpu);
  * repoints LYC at the next scanline (e.g. dmg-acid2). */
 void ppu_sync_lyc(struct cpu_state *cpu);
 
+/* PPU render offload (see core/ppu.c). When enabled, the per-pixel render
+ * of the 144 scanlines is deferred out of the synchronous PPU state machine
+ * so it can be batched (and later moved to the second core). Each scanline's
+ * registers are logged at its mode3→0; VRAM/OAM are flushed lazily — the MMU
+ * calls ppu_offload_flush() just before any mid-frame VRAM/OAM write so the
+ * captured lines render against the VRAM/OAM they had at capture time. */
+#ifndef GBJIT_PPU_OFFLOAD
+#define GBJIT_PPU_OFFLOAD 0
+#endif
+
+#if GBJIT_PPU_OFFLOAD
+struct mmu;
+/* Nonzero while captured-but-undrawn scanlines exist; the MMU checks this
+ * inline and only calls ppu_offload_flush() when a flush is actually due. */
+extern int gbjit_ppu_have_pending;
+void ppu_offload_flush(struct mmu *m);
+#endif
+
 #endif

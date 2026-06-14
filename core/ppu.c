@@ -548,6 +548,164 @@ static void ppu_draw_line(mmu *m, u8 ly) {
     }
 }
 
+/* --- PPU render offload (per-line register log + deferred render) ------
+ *
+ * GBJIT_PPU_OFFLOAD decouples *rendering* from *timing*. The PPU state
+ * machine (LY/STAT/IF/mode timing) MUST stay synchronous and in lockstep
+ * with the CPU for interrupt parity — that part never moves. Only the
+ * per-pixel rendering of the 144 scanlines (~11.5 ms, the static
+ * bottleneck) is deferred to one batch at VBlank, so it can later run on
+ * the second core (Increment 2).
+ *
+ * Raster effects (SML's HUD/level split scrolls SCX/SCY per scanline,
+ * dmg-acid2 rewrites palettes per line, etc.) mean each scanline must be
+ * rendered with the register values it had *at that line's* mode3→0. So at
+ * each mode3→0 we don't render — we snapshot the line's registers into
+ * s_line_log[ly]. The single batch render at VBlank then replays line by
+ * line from the log.
+ *
+ * VRAM/OAM are NOT snapshotted per line here: this batch render uses the
+ * end-of-frame VRAM/OAM. That is bit-exact with the synchronous renderer
+ * for any game that only mutates VRAM/OAM during VBlank (the common case,
+ * and what real DMG hardware forces). A game that streams VRAM/OAM mid-
+ * frame (during HBlank) would diverge — the host parity harness gates for
+ * exactly that before this is trusted on device. window_line is logged per
+ * line (it advances only on window-active lines), so the replay needs no
+ * live PPU state. */
+#if GBJIT_PPU_OFFLOAD
+typedef struct {
+    u8 lcdc, bgp, scx, scy, obp0, obp1, wx;
+    u8 latched_wy;
+    u8 window_line;   /* window line counter value at this scanline's draw */
+} ppu_lstate;
+
+static ppu_lstate s_line_log[LCD_HEIGHT];
+static int s_cap_count;   /* scanlines captured so far this frame (0..144) */
+static int s_rendered;    /* scanlines already drawn this frame (0..s_cap_count) */
+
+/* Fast no-op gate for the MMU write hooks: nonzero only while captured-but-
+ * undrawn scanlines exist (i.e. between an active-frame mode3→0 and the next
+ * flush/VBlank). The common case — VRAM/OAM written during VBlank — sees
+ * this clear and skips the cross-TU flush call entirely. */
+int gbjit_ppu_have_pending = 0;
+
+#ifdef GBJIT_PPU_OFFLOAD_DIAG
+/* Host-only diagnostic: how often does VRAM change *during* the visible
+ * frame (between line 0's capture and VBlank)? That is exactly what makes
+ * the single-snapshot batch render diverge from the per-line renderer. */
+#include <stdio.h>
+static u8  s_diag_vram0[VRAM_SIZE];
+static u64 s_diag_frames = 0, s_diag_midframe_frames = 0, s_diag_total_changed = 0;
+static void diag_capture_vram0(mmu *m) { memcpy(s_diag_vram0, m->vram, VRAM_SIZE); }
+static void diag_check_vram(mmu *m) {
+    s_diag_frames++;
+    u32 changed = 0;
+    for (u32 i = 0; i < VRAM_SIZE; i++) if (s_diag_vram0[i] != m->vram[i]) changed++;
+    if (changed) { s_diag_midframe_frames++; s_diag_total_changed += changed; }
+}
+__attribute__((destructor)) static void diag_report(void) {
+    fprintf(stderr, "[offload-diag] frames=%llu midframe_vram_frames=%llu (%.1f%%) avg_changed_bytes=%.1f\n",
+            (unsigned long long)s_diag_frames,
+            (unsigned long long)s_diag_midframe_frames,
+            s_diag_frames ? 100.0 * s_diag_midframe_frames / s_diag_frames : 0.0,
+            s_diag_midframe_frames ? (double)s_diag_total_changed / s_diag_midframe_frames : 0.0);
+}
+#endif
+
+/* Mirror of ppu_draw_line's window-active predicate (lines 441-444): the
+ * window's internal line counter advances iff the window would render on
+ * this scanline. Capture uses this to keep window_line in step without
+ * drawing. */
+static bool ppu_window_active(mmu *m, u8 ly) {
+    u8 lcdc = m->io[LCDC_REG];
+    if (!(lcdc & LCDC_WINDOW_ENABLE)) return false;
+    if (!(lcdc & LCDC_BG_ENABLE))     return false;
+    if (ly < m->ppu_latched_wy)       return false;
+    if (m->io[WX_REG] >= 167)         return false;
+    return true;
+}
+
+/* Called at mode3→0 instead of ppu_draw_line: record the per-line register
+ * state, then advance window_line exactly as ppu_draw_line would have. VRAM
+ * and OAM are NOT snapshotted — they are flushed lazily (see below). */
+static void ppu_capture_line(mmu *m, u8 ly) {
+    ppu_lstate *L = &s_line_log[ly];
+    L->lcdc       = m->io[LCDC_REG];
+    L->bgp        = m->io[BGP_REG];
+    L->scx        = m->io[SCX_REG];
+    L->scy        = m->io[SCY_REG];
+    L->obp0       = m->io[OBP0_REG];
+    L->obp1       = m->io[OBP1_REG];
+    L->wx         = m->io[WX_REG];
+    L->latched_wy = m->ppu_latched_wy;
+    L->window_line = m->window_line;
+    s_cap_count   = (int)ly + 1;
+    gbjit_ppu_have_pending = 1;
+#ifdef GBJIT_PPU_OFFLOAD_DIAG
+    if (ly == 0) diag_capture_vram0(m);
+#endif
+    if (ppu_window_active(m, ly)) m->window_line++;
+}
+
+/* Replay captured scanlines [from,to) through ppu_draw_line using their
+ * logged registers and the CURRENT VRAM/OAM. The live io[]/latched_wy/
+ * window_line are saved and restored so the PPU state machine is
+ * undisturbed (VBlank STAT/IF/LY are already set by the caller). */
+static void ppu_render_lines(mmu *m, int from, int to) {
+    if (from >= to) return;
+    u8 s_lcdc = m->io[LCDC_REG], s_bgp = m->io[BGP_REG];
+    u8 s_scx = m->io[SCX_REG],   s_scy = m->io[SCY_REG];
+    u8 s_obp0 = m->io[OBP0_REG],  s_obp1 = m->io[OBP1_REG];
+    u8 s_wx = m->io[WX_REG];
+    u8 s_wy = m->ppu_latched_wy,  s_wl = m->window_line;
+
+    for (int ly = from; ly < to; ly++) {
+        ppu_lstate *L = &s_line_log[ly];
+        m->io[LCDC_REG] = L->lcdc;
+        m->io[BGP_REG]  = L->bgp;
+        m->io[SCX_REG]  = L->scx;
+        m->io[SCY_REG]  = L->scy;
+        m->io[OBP0_REG] = L->obp0;
+        m->io[OBP1_REG] = L->obp1;
+        m->io[WX_REG]   = L->wx;
+        m->ppu_latched_wy = L->latched_wy;
+        m->window_line    = L->window_line;
+        ppu_draw_line(m, (u8)ly);
+    }
+
+    m->io[LCDC_REG] = s_lcdc; m->io[BGP_REG] = s_bgp;
+    m->io[SCX_REG]  = s_scx;  m->io[SCY_REG] = s_scy;
+    m->io[OBP0_REG] = s_obp0; m->io[OBP1_REG] = s_obp1;
+    m->io[WX_REG]   = s_wx;
+    m->ppu_latched_wy = s_wy;  m->window_line = s_wl;
+}
+
+/* Flush captured-but-undrawn scanlines NOW with the current VRAM/OAM.
+ * Called from the MMU just before a mid-frame VRAM/OAM write (or OAM DMA)
+ * lands: every line captured since the last flush was captured under this
+ * same VRAM/OAM (the write we're about to apply is the first change since),
+ * so they render bit-exactly as the synchronous per-line renderer would.
+ * The capture/flush boundary is block-granular on both sides, matching the
+ * reference renderer's own block-granular draw point. */
+void ppu_offload_flush(struct mmu *m) {
+    if (s_rendered < s_cap_count) {
+        ppu_render_lines(m, s_rendered, s_cap_count);
+        s_rendered = s_cap_count;
+    }
+    gbjit_ppu_have_pending = 0;
+}
+
+/* End-of-frame (VBlank): draw whatever scanlines weren't already flushed. */
+static void ppu_render_frame_from_log(mmu *m) {
+#ifdef GBJIT_PPU_OFFLOAD_DIAG
+    diag_check_vram(m);
+#endif
+    ppu_render_lines(m, s_rendered, s_cap_count);
+    s_rendered = s_cap_count;
+    gbjit_ppu_have_pending = 0;
+}
+#endif /* GBJIT_PPU_OFFLOAD */
+
 /* --- Timer (FF04..FF07) ------------------------------------------------ */
 
 #define DIV_REG       0x04
@@ -669,7 +827,11 @@ static void ppu_advance(struct cpu_state *cpu) {
                  * downstream consumer (frame_seq goes unread); we'd
                  * still pay for the LY/STAT machinery either way. */
                 if (m->io[LY_REG] < LCD_HEIGHT) {
+#if GBJIT_PPU_OFFLOAD
+                    ppu_capture_line(m, m->io[LY_REG]);
+#else
                     ppu_draw_line(m, m->io[LY_REG]);
+#endif
                 }
                 ppu_update_stat_irq(m);
                 transitioned = true;
@@ -682,6 +844,13 @@ static void ppu_advance(struct cpu_state *cpu) {
                 if (m->io[LY_REG] == LCD_HEIGHT) {
                     m->ppu_lcd_mode = LCD_VBLANK;
                     m->io[STAT_REG] = (u8)((m->io[STAT_REG] & ~STAT_MODE) | LCD_VBLANK);
+#if GBJIT_PPU_OFFLOAD
+                    /* The frame's 144 scanlines were captured (not drawn)
+                     * at their mode3→0; render them all now, before
+                     * frame_seq is bumped so readers still see a complete
+                     * frame. (Increment 2 moves this batch to core 1.) */
+                    ppu_render_frame_from_log(m);
+#endif
 #ifdef GBJIT_PPU_ASYNC
                     __atomic_fetch_or(&m->io[IF_REG], INT_VBLANK_BIT, __ATOMIC_RELAXED);
 #else
@@ -726,6 +895,14 @@ static void ppu_advance(struct cpu_state *cpu) {
                      * line counter for the next frame. */
                     m->ppu_latched_wy = m->io[WY_REG];
                     m->window_line = 0;
+#if GBJIT_PPU_OFFLOAD
+                    /* New frame: reset the capture/render cursors. Lines the
+                     * PPU doesn't reach this frame (e.g. LCD off mid-frame)
+                     * simply stay below s_cap_count and are never replayed. */
+                    s_cap_count = 0;
+                    s_rendered = 0;
+                    gbjit_ppu_have_pending = 0;
+#endif
                     m->ppu_lcd_mode = LCD_SEARCH_OAM;
                     m->io[STAT_REG] = (u8)((m->io[STAT_REG] & ~STAT_MODE) | LCD_SEARCH_OAM);
                     ppu_check_lyc(m);

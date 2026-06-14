@@ -76,6 +76,20 @@ static int dump_framebuffer_pgm(const mmu *m, const char *path) {
     return 0;
 }
 
+/* Frame-exact framebuffer dump. Unlike --dump-fb (which fires at an
+ * arbitrary cycle, catching a partially-composed frame), this dumps from
+ * the PPU's frame-complete hook the instant frame_seq reaches the target —
+ * the identical point for any render strategy (incremental or batched), so
+ * it's a clean A/B oracle for the PPU offload. */
+static u64         g_dump_frame = 0;
+static const char *g_dump_frame_path = NULL;
+static bool        g_dump_frame_done = false;
+static void frame_dump_cb(struct mmu *m) {
+    if (g_dump_frame_done || m->frame_seq < g_dump_frame) return;
+    dump_framebuffer_pgm(m, g_dump_frame_path);
+    g_dump_frame_done = true;
+}
+
 /* Dump WRAM ($C000..$DFFF) as 8192 raw bytes for host-vs-device byte diffing. */
 static int dump_wram_bin(const mmu *m, const char *path) {
     FILE *f = fopen(path, "wb");
@@ -121,6 +135,13 @@ int main(int argc, char **argv) {
             dump_at_cycles = strtoull(argv[++i], NULL, 0);
             dump_path = argv[++i];
             if (max_cycles < dump_at_cycles) max_cycles = dump_at_cycles;
+        } else if (strcmp(argv[i], "--dump-at-frame") == 0 && i + 2 < argc) {
+            /* `--dump-at-frame N <file.pgm>`: dump the framebuffer the
+             * instant frame_seq reaches N (frame-exact A/B oracle). */
+            g_dump_frame = strtoull(argv[++i], NULL, 0);
+            g_dump_frame_path = argv[++i];
+            if (max_cycles < (g_dump_frame + 8) * 70224ull)
+                max_cycles = (g_dump_frame + 8) * 70224ull;
         } else if (strcmp(argv[i], "--dump-wram") == 0 && i + 2 < argc) {
             wram_at_cycles = strtoull(argv[++i], NULL, 0);
             wram_path = argv[++i];
@@ -177,8 +198,11 @@ int main(int argc, char **argv) {
     /* Unified segmented run: advance to each event cycle (a scripted press or
      * the framebuffer dump), apply it, and continue — same path for interp
      * and jit so an injected Start exercises identical code. */
+    if (g_dump_frame_path) m.frame_complete_cb = frame_dump_cb;
+
     int pi = 0; bool dumped = false;
     while (cpu.cycles < max_cycles) {
+        if (g_dump_frame_done) break;
         u64 next = max_cycles;
         if (pi < n_press && presses[pi].cyc < next) next = presses[pi].cyc;
         if (dump_path && !dumped && dump_at_cycles < next) next = dump_at_cycles;
