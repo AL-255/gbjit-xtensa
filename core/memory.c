@@ -147,13 +147,13 @@ u8 mmu_read8(mmu *m, u16 addr) {
          * return the row-select bits PLUS the 4 button bits of the
          * selected row (0 = pressed). Bits 6,7 are always 1.
          *
-         * `joypad_state` carries the active-high Paperboy bitmask
-         * (GB_BTN_A=bit0 ... GB_BTN_DOWN=bit7). Convert to the
-         * active-low JOYP nibble for whichever row(s) are selected. */
+         * `buttons` is active-high (1 = pressed) with the Paperboy bit
+         * layout. Convert to the active-low JOYP nibble for whichever
+         * row(s) are selected. */
         if (io_addr == 0x00) {
             u8 sel      = m->io[0x00];
-            u8 action_lo = (u8)(~m->joypad_state)        & 0x0Fu; /* A,B,Sel,Start */
-            u8 dir_lo    = (u8)(~(m->joypad_state >> 4)) & 0x0Fu; /* R,L,Up,Down */
+            u8 action_lo = (u8)(~m->buttons)        & 0x0Fu; /* A,B,Sel,Start */
+            u8 dir_lo    = (u8)(~(m->buttons >> 4)) & 0x0Fu; /* R,L,Up,Down */
             u8 lo4 = 0x0Fu;
             if (!(sel & 0x20u)) lo4 &= action_lo; /* P15 low -> action row */
             if (!(sel & 0x10u)) lo4 &= dir_lo;    /* P14 low -> direction row */
@@ -312,6 +312,7 @@ void mmu_write8(mmu *m, u16 addr, u8 v) {
 }
 
 void mmu_set_joypad_state(mmu *m, u8 state) {
+    m->buttons = state;
     m->joypad_state = state;
 }
 
