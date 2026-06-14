@@ -258,6 +258,12 @@ void mmu_write8(mmu *m, u16 addr, u8 v) {
         if (addr == 0xFF04u) { m->io[io_addr] = 0; m->timer_div_acc = 0; return; }
         if (addr == 0xFF05u) { m->io[io_addr] = v; m->timer_tima_acc = 0; return; }
         m->io[io_addr] = v;
+        /* LYC ($FF45): the PPU only refreshes the LY=LYC coincidence flag at
+         * line transitions, so re-evaluate it now (the ppu_flush above already
+         * advanced LY/mode to this cycle). Without this, a raster handler that
+         * repoints LYC at the next scanline leaves the old coincidence latched
+         * and the STAT IRQ for that line is dropped — see ppu_sync_lyc. */
+        if (addr == 0xFF45u) ppu_sync_lyc(m->cpu);
         /* Serial transfer, internal clock (SC $FF02 bit 7 = start, bit 0
          * = internal clock → this GB drives the transfer, so it always
          * completes). With no link cable the 8 bits shift out against an

@@ -779,3 +779,22 @@ void ppu_flush(struct cpu_state *cpu) {
     ppu_advance(cpu);
     PROF_END(PROF_PPU);
 }
+
+/* Re-evaluate the LY=LYC coincidence flag and the level-triggered STAT
+ * interrupt line after a CPU write to LYC ($FF45). The state machine only
+ * refreshes the coincidence flag at LY transitions, so a mid-line LYC
+ * write isn't reflected until the next line. That drops STAT IRQs in the
+ * common raster-effect pattern where a handler points LYC at the *very
+ * next* scanline: the old LY==LYC coincidence stays latched, ppu_stat_line
+ * never falls, and the rising edge at the new LY=LYC is lost. dmg-acid2
+ * chains its per-line register writes this way (LYC 128->129->130...), so
+ * without this only ~1 in 4 of its lines were being serviced and the image
+ * flickered through wrong register schedules frame to frame.
+ *
+ * The caller (mmu_write8) has already flushed the PPU up to cpu->cycles, so
+ * LY/mode are current; here we only recompute the LYC-derived bits. */
+void ppu_sync_lyc(struct cpu_state *cpu) {
+    if (!cpu || !cpu->mmu) return;
+    ppu_check_lyc(cpu->mmu);
+    ppu_update_stat_irq(cpu->mmu);
+}

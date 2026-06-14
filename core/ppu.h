@@ -39,4 +39,10 @@ void ppu_tick(struct cpu_state *cpu);
  * byte reflects the state at cpu->cycles. */
 void ppu_flush(struct cpu_state *cpu);
 
+/* Re-evaluate LY=LYC coincidence + the STAT IRQ line after a CPU write to
+ * LYC ($FF45). Must be called after ppu_flush has brought the PPU up to
+ * cpu->cycles. Fixes dropped STAT/LYC interrupts when a raster handler
+ * repoints LYC at the next scanline (e.g. dmg-acid2). */
+void ppu_sync_lyc(struct cpu_state *cpu);
+
 #endif
