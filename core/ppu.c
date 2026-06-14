@@ -838,15 +838,21 @@ void ppu_offload_thread_start(void) {
 
 void ppu_offload_thread_stop(void) {
     if (!s_render_started) return;
-    ppu_offload_render_wait();
+    ppu_offload_render_wait();                  /* ensure no render in flight */
+#if defined(ESP_PLATFORM)
+    /* Device: the render task is long-lived and reused across ROM reloads
+     * (thread_start is idempotent). Leaving it parked on the "go" semaphore
+     * — rather than vTaskDelete + recreate on every re-init — avoids both a
+     * delete/recreate race and re-allocating the 40 KB render context. */
+#else
+    /* Host: tear the pthread down cleanly so a test binary can exit. */
     s_render_run = false;
-    OFL_SEM_GIVE(s_sem_go);                    /* wake the task so it can exit */
-#if !defined(ESP_PLATFORM)
+    OFL_SEM_GIVE(s_sem_go);
     pthread_join(s_render_pthread, NULL);
     free(s_render_mmu);
     s_render_mmu = NULL;
-#endif
     s_render_started = false;
+#endif
 }
 #endif /* GBJIT_PPU_OFFLOAD_THREAD */
 
