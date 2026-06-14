@@ -76,6 +76,15 @@ static int dump_framebuffer_pgm(const mmu *m, const char *path) {
     return 0;
 }
 
+/* Dump WRAM ($C000..$DFFF) as 8192 raw bytes for host-vs-device byte diffing. */
+static int dump_wram_bin(const mmu *m, const char *path) {
+    FILE *f = fopen(path, "wb");
+    if (!f) return -1;
+    for (int a = 0xC000; a <= 0xDFFF; a++) fputc(mmu_read8((mmu *)m, (u16)a), f);
+    fclose(f);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     install_memory_guard();
     bool use_jit = false;
@@ -85,6 +94,9 @@ int main(int argc, char **argv) {
     const char *rom_path = NULL;
     const char *dump_path = NULL;
     u64 dump_at_cycles = 0;
+    const char *wram_path = NULL;
+    u64 wram_at_cycles = 0;
+    bool wram_dumped = false;
     /* Scripted joypad presses: set m.buttons=mask once cpu.cycles reaches cyc.
        Bit layout matches mmu_read8's JOYP: 0=A 1=B 2=Select 3=Start
        4=Right 5=Left 6=Up 7=Down. Repeatable: `--press <cyc> <hexmask>`. */
@@ -109,6 +121,10 @@ int main(int argc, char **argv) {
             dump_at_cycles = strtoull(argv[++i], NULL, 0);
             dump_path = argv[++i];
             if (max_cycles < dump_at_cycles) max_cycles = dump_at_cycles;
+        } else if (strcmp(argv[i], "--dump-wram") == 0 && i + 2 < argc) {
+            wram_at_cycles = strtoull(argv[++i], NULL, 0);
+            wram_path = argv[++i];
+            if (max_cycles < wram_at_cycles) max_cycles = wram_at_cycles;
         } else if (argv[i][0] == '-') {
             usage(argv[0]);
             return 1;
@@ -166,6 +182,7 @@ int main(int argc, char **argv) {
         u64 next = max_cycles;
         if (pi < n_press && presses[pi].cyc < next) next = presses[pi].cyc;
         if (dump_path && !dumped && dump_at_cycles < next) next = dump_at_cycles;
+        if (wram_path && !wram_dumped && wram_at_cycles < next) next = wram_at_cycles;
         if (next <= cpu.cycles) next = cpu.cycles + 1;
         if (use_jit) gbjit_dispatcher_run_until(&disp, next);
         else         sm83_run_until(&cpu, next);
@@ -175,6 +192,12 @@ int main(int argc, char **argv) {
             fprintf(stderr, "[press] buttons=%02X at cycles=%llu\n",
                     presses[pi].mask, (unsigned long long)cpu.cycles);
             pi++;
+        }
+        if (wram_path && !wram_dumped && cpu.cycles >= wram_at_cycles) {
+            dump_wram_bin(&m, wram_path);
+            fprintf(stderr, "[dump-wram] %s at cycles=%llu pc=%04X\n",
+                    wram_path, (unsigned long long)cpu.cycles, cpu.pc);
+            wram_dumped = true;
         }
         if (dump_path && !dumped && cpu.cycles >= dump_at_cycles) {
             if (dump_framebuffer_pgm(&m, dump_path) == 0)

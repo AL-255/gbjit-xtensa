@@ -25,6 +25,17 @@ sm83_step_call0:
     jx      a0
     .size   sm83_step_call0, .-sm83_step_call0
 
+    /* Op-fallback variant: no leading interrupt service in the callee, so the
+     * deep service->ppu_tick->ppu_advance->ppu_draw_line chain never runs in
+     * the JIT block's borrowed register window. */
+    .global sm83_step_noirq_call0
+    .type   sm83_step_noirq_call0, @function
+sm83_step_noirq_call0:
+    mov     a10, a2                 /* cpu → callee a2 */
+    call8   sm83_step_noirq
+    jx      a0
+    .size   sm83_step_noirq_call0, .-sm83_step_noirq_call0
+
     .global mmu_read8_call0
     .type   mmu_read8_call0, @function
 mmu_read8_call0:

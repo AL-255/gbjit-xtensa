@@ -197,6 +197,7 @@ typedef struct resolver_ctx {
  * JIT not the raw windowed C functions but the CALL0→CALL8 trampolines
  * in jit_trampolines.S. */
 extern void sm83_step_call0(void);
+extern void sm83_step_noirq_call0(void);
 extern void mmu_read8_call0(void);
 extern void mmu_write8_call0(void);
 static u32 target_helper_addr(literal_id id, void *user) {
@@ -204,7 +205,9 @@ static u32 target_helper_addr(literal_id id, void *user) {
     switch (id) {
         case ADDR_CPU_BASE:     return (u32)(uintptr_t)r->cpu;
         case ADDR_MMU_BASE:     return (u32)(uintptr_t)r->cpu->mmu;
-        case HELPER_SM83_STEP:  return (u32)(uintptr_t)&sm83_step_call0;
+        /* Op-fallback uses the no-interrupt-service variant so the deep
+         * service->ppu chain never runs in the block's borrowed window. */
+        case HELPER_SM83_STEP:  return (u32)(uintptr_t)&sm83_step_noirq_call0;
         case HELPER_MMU_READ8:  return (u32)(uintptr_t)&mmu_read8_call0;
         case HELPER_MMU_WRITE8: return (u32)(uintptr_t)&mmu_write8_call0;
         default: return 0;
@@ -557,16 +560,20 @@ static void enter_block_native(gbjit_block *b, cpu_state *cpu) {
     pad[0] = fn;
     /* Flush all register windows to the stack before running the JIT block.
      * The block runs in THIS function's borrowed window (reached by CALLX0, no
-     * ENTRY of its own). A deep helper call (sm83_step -> sm83_service_
-     * interrupts -> ppu_tick -> ...) issues a windowed `call8` from that
-     * borrowed window; the resulting register-window OVERFLOW spills frames to
-     * a1-relative save areas. Because the block has no frame of its own, those
-     * spills can clobber live data, corrupting CPU state (observed: SML's
-     * Start->level handler getting a wrong HL and branching into the bonus
-     * game). Spilling up front leaves only this frame live, so the helper
-     * call8s rotate into free physical registers and never overflow-spill into
-     * a borrowed/overlapping frame. The host simulator models no windowing, so
-     * it never reproduced this. */
+     * ENTRY of its own). A deep helper call issues a windowed `call8` from that
+     * borrowed window; if the chain nests deep enough to wrap the Xtensa window
+     * file, the register-window OVERFLOW spills frames to a1-relative save areas
+     * and — because the block has no frame of its own — can clobber live data,
+     * corrupting CPU state on real silicon (the host simulator models no
+     * windowing, so it never reproduces this).
+     *
+     * The PRIMARY fix for the SML "Start -> BONUS GAME" corruption is to keep
+     * the deepest helper chain out of the borrowed window entirely: the JIT
+     * op-fallback now calls sm83_step_noirq (no leading sm83_service_interrupts
+     * -> ppu_tick -> ppu_advance -> ppu_draw_line), since the dispatcher already
+     * services interrupts between blocks at its own real frame. This spill is
+     * kept as complementary defence-in-depth for the remaining shallower helper
+     * paths (e.g. mmu_write8 to a PPU register -> ppu_flush). */
     extern void xthal_window_spill(void);
     xthal_window_spill();
     /* Pin `cpu` into a2 — CALL0 callees receive their first argument there.
@@ -622,7 +629,8 @@ static void thunk_dispatch(xt_sim *s, u32 fn_token) {
     sim_context *ctx = (sim_context *)s->user;
     switch ((literal_id)fn_token) {
         case HELPER_SM83_STEP: {
-            sm83_step(ctx->cpu);
+            /* Match the device op-fallback (no leading interrupt service). */
+            sm83_step_noirq(ctx->cpu);
             return;
         }
         case HELPER_MMU_READ8: {

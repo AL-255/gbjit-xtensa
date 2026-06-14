@@ -7,6 +7,12 @@
    (4, 8, 12, 16, 20, or 24). Updates cpu->cycles in addition. */
 u32 sm83_step(cpu_state *cpu);
 
+/* Op-fallback variant for the native JIT helper path: executes one opcode
+   WITHOUT the leading interrupt service (the dispatcher services interrupts at
+   block boundaries). Avoids dragging the deep service->ppu call chain into the
+   JIT block's borrowed Xtensa register window. */
+u32 sm83_step_noirq(cpu_state *cpu);
+
 /* Run until cpu->cycles reaches `until`. Returns cycles actually executed. */
 u64 sm83_run_until(cpu_state *cpu, u64 until);
 

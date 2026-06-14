@@ -310,11 +310,20 @@ static inline bool cond(cpu_state *cpu, u8 cc) {
     }
 }
 
-u32 sm83_step(cpu_state *cpu) {
+/* `do_service`: when false, skip the leading sm83_service_interrupts (which
+ * also ticks the PPU). The native JIT uses this for op-fallback helper calls:
+ * the dispatcher already services interrupts before each block at its own
+ * (safe) windowed frame, so re-servicing from inside a JIT block (a) is
+ * redundant under the block-granular interrupt model and (b) drags the deep
+ * service -> ppu_tick -> ppu_advance -> ppu_draw_line call chain into the
+ * block's BORROWED Xtensa register window, where a window overflow spill can
+ * corrupt state on real silicon (SML Start -> BONUS GAME). See
+ * jit/dispatcher.c enter_block_native. */
+static u32 sm83_step_impl(cpu_state *cpu, bool do_service) {
     /* EI takes effect after the next instruction. */
     bool ei_pending_clear = (cpu->ime_pending != 0);
 
-    if (sm83_service_interrupts(cpu)) {
+    if (do_service && sm83_service_interrupts(cpu)) {
         if (ei_pending_clear) { cpu->ime = 1; cpu->ime_pending = 0; }
         return 20;
     }
@@ -559,6 +568,12 @@ u32 sm83_step(cpu_state *cpu) {
     if (ei_pending_clear) { cpu->ime = 1; cpu->ime_pending = 0; }
     return cycles;
 }
+
+u32 sm83_step(cpu_state *cpu) { return sm83_step_impl(cpu, true); }
+
+/* Op-fallback variant for the JIT helper path: no leading interrupt service.
+ * Interrupts are serviced by the dispatcher at block boundaries. */
+u32 sm83_step_noirq(cpu_state *cpu) { return sm83_step_impl(cpu, false); }
 
 u64 sm83_run_until(cpu_state *cpu, u64 until) {
     u64 start = cpu->cycles;
