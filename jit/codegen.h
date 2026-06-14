@@ -85,6 +85,14 @@ typedef struct gbjit_block {
      * path re-enters such a block directly, bounded by an iteration
      * cap, instead of paying the outer-loop overhead per iteration. */
     u8   self_loop;
+
+    /* MBC ROM bank this block was compiled under, for blocks whose
+     * gb_pc_start lies in the banked window $4000..$7FFF. The dispatcher
+     * keys lookups on (pc, rom_bank) for banked PCs so blocks compiled
+     * under different banks coexist instead of being wiped on every bank
+     * switch (which thrashed recompilation during SML gameplay). 0 for
+     * non-banked PCs ($0000..$3FFF fixed bank, RAM, etc.). */
+    u8   rom_bank;
 } gbjit_block;
 
 /* Compile from `pc` for one basic block. Allocates from `cc`. `helper_addr`

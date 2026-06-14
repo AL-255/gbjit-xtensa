@@ -2144,6 +2144,10 @@ epilogue:
     }
     b->gb_pc_start = pc_start;
     b->gb_pc_end = cur;
+    /* Tag banked-window blocks with the bank they were compiled under so the
+     * dispatcher can key lookups by (pc, bank) and avoid wiping on bank flip. */
+    b->rom_bank = (pc_start >= 0x4000u && pc_start < 0x8000u)
+                  ? cpu->mmu->rom_bank : 0u;
     b->n_ops = n_ops;
     b->code = base;
     b->code_size = actual;

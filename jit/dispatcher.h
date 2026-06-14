@@ -25,8 +25,21 @@ typedef struct gbjit_dispatcher {
      * blocks whose [gb_pc_start, gb_pc_end) overlaps that page. */
     void *smc_pages[GBJIT_SMC_PAGE_COUNT];
 
+    /* PSRAM-backed compiled-block byte cache (bbc): stores the emitted bytes
+     * of every block keyed by (gb_pc_start, rom_bank). Lets a block that was
+     * evicted from the IRAM exec arena (or dropped by a bank flip) be
+     * re-materialised by a cheap COPY into IRAM ("rehydrate") instead of a
+     * full recompile — eliminating the recompile thrash when a game's working
+     * set exceeds the small executable arena. NULL if PSRAM/alloc unavailable
+     * (graceful fallback to recompile). See gbjit_bbc_* in dispatcher.c. */
+    struct gbjit_bbc *bbc;
+    u64 bbc_hits;      /* block rehydrated from the byte cache (copy, no recompile) */
+    u64 bbc_misses;    /* block not in byte cache -> full compile */
+
     /* Stats. */
     u64 smc_invalidations;
+    u64 bank_flips;    /* rom_bank_dirty handler runs (banked-region wipe) */
+    u64 smc_flushes;   /* jit_smc_dirty handler runs (RAM code-page wipe) */
 
     /* Stats. */
     u64 blocks_compiled;

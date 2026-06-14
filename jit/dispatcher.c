@@ -58,6 +58,7 @@
 #if defined(ESP_PLATFORM)
 #include "esp_log.h"
 #include "sdkconfig.h"
+#include "esp_heap_caps.h"   /* heap_caps_malloc(MALLOC_CAP_SPIRAM) for the bbc */
 #if defined(CONFIG_IDF_TARGET_ESP32S3)
 /* IDF's IRAM_BSS_ATTR macro is a no-op on ESP32-S3 (it's gated on the
  * original ESP32's 8-bit-IRAM-access kconfig). To force genuine IRAM
@@ -249,6 +250,58 @@ static u32  dispatcher_evict_coldest(void *ctx);
 static void dispatcher_evict_range(void *ctx, u32 start, u32 end);
 #endif
 
+/* ---- PSRAM-backed compiled-block byte cache (bbc) --------------------------
+ * Stores the emitted bytes of every block keyed by (pc, rom_bank). Blocks are
+ * position-independent (only the soft predictor chains them, hard chaining is
+ * unused), and their literal pool holds only stable absolute addresses (cpu /
+ * mmu / helper pointers) plus block-relative L32R offsets — so the bytes can be
+ * memcpy'd to any IRAM address and executed. On a compile miss we first try to
+ * COPY a cached block into IRAM ("rehydrate") instead of recompiling; the
+ * executable arena stays small (<= GBJIT_ARENA_KB, codegen-safe) while the byte
+ * cache lives in roomy PSRAM. Definitions follow find_block; the data types and
+ * bbc_create are needed by gbjit_dispatcher_init/shutdown below. */
+#if defined(ESP_PLATFORM)
+#define BBC_ALLOC(sz) heap_caps_malloc((sz), MALLOC_CAP_SPIRAM)
+#define BBC_FREE(p)   heap_caps_free(p)
+#else
+#define BBC_ALLOC(sz) malloc(sz)
+#define BBC_FREE(p)   free(p)
+#endif
+
+#ifndef GBJIT_BBC_STORE_KB
+#define GBJIT_BBC_STORE_KB 512u
+#endif
+#ifndef GBJIT_BBC_MAX_ENTRIES
+#define GBJIT_BBC_MAX_ENTRIES 12288u
+#endif
+#define GBJIT_BBC_BUCKETS 8192u   /* power of two */
+
+typedef struct {
+    u16 pc;
+    u8  bank;
+    u8  self_loop;
+    u16 gb_pc_end;
+    u16 succ0, succ1;
+    u32 n_ops;
+    u32 code_size;
+    u32 entry_off;
+    u32 store_off;
+    int next;           /* hash chain: next entry index, or -1 */
+} bbc_entry;
+
+struct gbjit_bbc {
+    bbc_entry *entries;
+    u32        n_entries;
+    u32        max_entries;
+    u8        *store;
+    u32        store_used;
+    u32        store_cap;
+    int        buckets[GBJIT_BBC_BUCKETS];
+    bool       full;    /* entries or store exhausted -> stop caching */
+};
+
+static struct gbjit_bbc *bbc_create(void);
+
 bool gbjit_dispatcher_init(gbjit_dispatcher *d, cpu_state *cpu) {
     memset(d, 0, sizeof(*d));
     d->cpu = cpu;
@@ -275,6 +328,14 @@ bool gbjit_dispatcher_init(gbjit_dispatcher *d, cpu_state *cpu) {
     d->cc.evict_ctx   = d;
 #endif
     d->interp_fallback = false;
+    /* PSRAM-backed compiled-block byte cache. Optional — on failure the
+     * dispatcher just recompiles on every miss as before. */
+    d->bbc = bbc_create();
+#if defined(ESP_PLATFORM)
+    ESP_LOGI("gbjit_jit", "block byte-cache: %s (%u KB store, %u entries)",
+             d->bbc ? "PSRAM" : "DISABLED",
+             (unsigned)GBJIT_BBC_STORE_KB, (unsigned)GBJIT_BBC_MAX_ENTRIES);
+#endif
     /* Prefetch defaults — depth 4, walking both succ_pc[0] (the
      * taken / unconditional / CALL-target path) and succ_pc[1] (the
      * fallthru of conditional JR/JP and the return point of CALL).
@@ -322,6 +383,12 @@ void gbjit_dispatcher_shutdown(gbjit_dispatcher *d) {
         while (n) { smc_page_node *next = n->next; free(n); n = next; }
         d->smc_pages[p] = NULL;
     }
+    if (d->bbc) {
+        if (d->bbc->entries) BBC_FREE(d->bbc->entries);
+        if (d->bbc->store)   BBC_FREE(d->bbc->store);
+        BBC_FREE(d->bbc);
+        d->bbc = NULL;
+    }
     /* Arena is statically allocated — nothing to free. Just reset the
      * codecache so a subsequent dispatcher_init starts with cc->used=0. */
     if (d->arena) codecache_reset(&d->cc);
@@ -336,6 +403,108 @@ static gbjit_block *find_block(gbjit_dispatcher *d, u16 pc) {
         b = b->next;
     }
     return NULL;
+}
+
+/* bbc data types + macros are defined above gbjit_dispatcher_init. */
+static struct gbjit_bbc *bbc_create(void) {
+#if defined(GBJIT_BBC_DISABLE)
+    return NULL;   /* compile-time off: dispatcher recompiles on every miss */
+#endif
+    struct gbjit_bbc *c = (struct gbjit_bbc *)BBC_ALLOC(sizeof(*c));
+    if (!c) return NULL;
+    memset(c, 0, sizeof(*c));
+    c->max_entries = GBJIT_BBC_MAX_ENTRIES;
+    c->store_cap   = GBJIT_BBC_STORE_KB * 1024u;
+    c->entries = (bbc_entry *)BBC_ALLOC(c->max_entries * sizeof(bbc_entry));
+    c->store   = (u8 *)BBC_ALLOC(c->store_cap);
+    if (!c->entries || !c->store) {
+        if (c->entries) BBC_FREE(c->entries);
+        if (c->store)   BBC_FREE(c->store);
+        BBC_FREE(c);
+        return NULL;
+    }
+    for (u32 i = 0; i < GBJIT_BBC_BUCKETS; i++) c->buckets[i] = -1;
+    return c;
+}
+
+/* Bank a block at `pc` should be keyed under: the live ROM bank for the banked
+ * window $4000..$7FFF, else 0 (fixed bank / RAM are bank-agnostic). */
+static inline u8 bbc_bank_for(cpu_state *cpu, u16 pc) {
+    return (pc >= 0x4000u && pc < 0x8000u) ? cpu->mmu->rom_bank : 0u;
+}
+
+static bbc_entry *bbc_get(struct gbjit_bbc *c, u16 pc, u8 bank) {
+    int i = c->buckets[pc & (GBJIT_BBC_BUCKETS - 1u)];
+    while (i >= 0) {
+        bbc_entry *e = &c->entries[i];
+        if (e->pc == pc && e->bank == bank) return e;
+        i = e->next;
+    }
+    return NULL;
+}
+
+static void bbc_put(struct gbjit_bbc *c, const gbjit_block *b, u8 bank) {
+    if (c->full) return;
+    u32 sz = b->code_size;
+    u32 aligned = (sz + 3u) & ~3u;
+    if (c->n_entries >= c->max_entries || c->store_used + aligned > c->store_cap) {
+        c->full = true;                 /* cache saturated — leave it stable */
+        return;
+    }
+    u32 off = c->store_used;
+    memcpy(c->store + off, b->code, sz);
+    c->store_used += aligned;
+    int idx = (int)c->n_entries++;
+    bbc_entry *e = &c->entries[idx];
+    e->pc = b->gb_pc_start; e->bank = bank; e->self_loop = b->self_loop;
+    e->gb_pc_end = b->gb_pc_end; e->succ0 = b->succ_pc[0]; e->succ1 = b->succ_pc[1];
+    e->n_ops = b->n_ops; e->code_size = sz; e->entry_off = b->entry_off;
+    e->store_off = off;
+    u32 h = e->pc & (GBJIT_BBC_BUCKETS - 1u);
+    e->next = c->buckets[h]; c->buckets[h] = idx;
+}
+
+/* Drop every cached block whose start PC lies in the given 256-byte page —
+ * used when self-modifying RAM code on that page is overwritten. (Banked-ROM
+ * pages are never written, so this only fires for RAM pages.) */
+static void bbc_invalidate_page(struct gbjit_bbc *c, u32 page) {
+    u16 lo = (u16)(page << GBJIT_SMC_PAGE_SHIFT);
+    u16 hi = (u16)(lo + (1u << GBJIT_SMC_PAGE_SHIFT) - 1u);
+    for (u32 h = 0; h < GBJIT_BBC_BUCKETS; h++) {
+        int *pp = &c->buckets[h];
+        while (*pp >= 0) {
+            bbc_entry *e = &c->entries[*pp];
+            if (e->pc >= lo && e->pc <= hi) {
+                e->pc = 0xFFFFu;        /* tombstone: unmatchable, keep store */
+                *pp = e->next;
+            } else {
+                pp = &e->next;
+            }
+        }
+    }
+}
+
+/* Re-materialise a cached block: allocate IRAM, copy the stored bytes in, and
+ * build a fresh block struct. Returns NULL if IRAM can't be allocated (caller
+ * falls back to a full compile). */
+static gbjit_block *bbc_rehydrate(gbjit_dispatcher *d, const bbc_entry *e) {
+    gbjit_block *b = (gbjit_block *)calloc(1, sizeof(*b));
+    if (!b) return NULL;
+    u8 *code = codecache_alloc(&d->cc, e->code_size);
+    if (!code) { free(b); return NULL; }
+    memcpy(code, d->bbc->store + e->store_off, e->code_size);
+    codecache_finalize(&d->cc, code, e->code_size);
+    b->gb_pc_start = e->pc;
+    b->gb_pc_end   = e->gb_pc_end;
+    b->n_ops       = e->n_ops;
+    b->code        = code;
+    b->code_size   = e->code_size;
+    b->entry_off   = e->entry_off;
+    b->self_loop   = e->self_loop;
+    b->succ_pc[0]  = e->succ0;
+    b->succ_pc[1]  = e->succ1;
+    b->rom_bank    = e->bank;
+    return b;
 }
 
 static void insert_block(gbjit_dispatcher *d, gbjit_block *block) {
@@ -786,13 +955,10 @@ void gbjit_dispatcher_run_until(gbjit_dispatcher *d_param, u64 until_param) {
 
     while (cpu->cycles < until) {
         /* MBC bank switched since last iteration → invalidate every JIT
-         * block compiled from the banked ROM window ($4000..$7FFF). The
-         * cached blocks may contain stale immediates or absolute branch
-         * targets fetched at compile time under the previous bank, so
-         * executing them after a bank flip leads to wrong PCs (SML
-         * loses control at ~668k cycles otherwise). The banked region
-         * covers SMC pages [0x40 .. 0x7F] (each page is 256 GB bytes). */
+         * block compiled from the banked ROM window ($4000..$7FFF), whose
+         * bank-specific immediates / branch targets are now stale. */
         if (unlikely(cpu->mmu->rom_bank_dirty)) {
+            d->bank_flips++;
             for (u32 a = 0x4000u; a < 0x8000u; a += (1u << GBJIT_SMC_PAGE_SHIFT)) {
                 gbjit_dispatcher_invalidate_addr(d, (u16)a);
             }
@@ -807,11 +973,17 @@ void gbjit_dispatcher_run_until(gbjit_dispatcher *d_param, u64 until_param) {
          * instruction test runner) depend on this; without it the JIT
          * executes a stale translation of the old code. */
         if (unlikely(cpu->mmu->jit_smc_dirty)) {
+            d->smc_flushes++;
             u8 *st = cpu->mmu->jit_page_state;
             for (u32 p = 0; p < GBJIT_SMC_PAGE_COUNT; p++) {
                 if (st[p] == 2u) {
                     gbjit_dispatcher_invalidate_addr(
                         d, (u16)(p << GBJIT_SMC_PAGE_SHIFT));
+                    /* Also drop the byte-cache copies for this RAM page — the
+                     * code there has changed, so rehydrating the old bytes
+                     * would run stale code. (Banked-ROM pages are never
+                     * written, so this only fires for genuine RAM SMC.) */
+                    if (d->bbc) bbc_invalidate_page(d->bbc, p);
                     /* Page has no blocks now; insert_block re-marks it
                      * to state 1 when the page is recompiled. */
                     st[p] = 0u;
@@ -937,42 +1109,88 @@ void gbjit_dispatcher_run_until(gbjit_dispatcher *d_param, u64 until_param) {
         }
 
         if (unlikely(!b)) {
-            if (d->no_cache) {
-                /* Wipe the bump-allocator arena so each compile reuses the
-                 * same bytes. Without this the arena would fill within a
-                 * few hundred iterations on any non-trivial loop. */
-                codecache_reset(&d->cc);
-            }
-            resolver_ctx hr = { cpu };
+            /* PSRAM byte-cache fast path: if this (pc,bank) block was compiled
+             * before, re-materialise it by COPY into IRAM instead of paying a
+             * full recompile. This is what turns the eviction / bank-flip
+             * churn into cheap copies. */
+            if (likely(d->bbc && !d->no_cache)) {
+                bbc_entry *_e = bbc_get(d->bbc, cpu->pc, bbc_bank_for(cpu, cpu->pc));
+                if (_e) {
+                    b = bbc_rehydrate(d, _e);
+                    if (b) {
+                        insert_block(d, b);
+                        d->bbc_hits++;
+#ifdef GBJIT_BBC_VERIFY
+                        {
+                            static u8 vbuf[65536] __attribute__((aligned(8)));
+                            codecache tcc; codecache_init(&tcc, vbuf, sizeof(vbuf));
+                            resolver_ctx vhr = { cpu };
 #if defined(ESP_PLATFORM)
-            b = gbjit_compile_block(&d->cc, cpu, cpu->pc, target_helper_addr, &hr);
+                            gbjit_block *fr = gbjit_compile_block(&tcc, cpu, cpu->pc, target_helper_addr, &vhr);
 #else
-            b = gbjit_compile_block(&d->cc, cpu, cpu->pc, host_helper_addr, &hr);
+                            gbjit_block *fr = gbjit_compile_block(&tcc, cpu, cpu->pc, host_helper_addr, &vhr);
 #endif
-            /* Arena full → evict-all + retry once. With evict_on_full
-             * the dispatcher prefers wiping the cache over falling
-             * back to the interp helper; hot blocks will lazy-recompile
-             * on chain miss. Disable evict_on_full to get the old
-             * fixed-size fixed-content behaviour. */
-            if (!b && d->evict_on_full) {
-                evict_all(d);
-                prev = NULL;
+                            if (fr) {
+                                if (fr->code_size != b->code_size) {
+                                    fprintf(stderr, "[bbc-verify] pc=%04X bank=%u SIZE rehy=%u fresh=%u\n",
+                                            cpu->pc, _e->bank, b->code_size, fr->code_size);
+                                } else if (memcmp(fr->code, b->code, fr->code_size) != 0) {
+                                    u32 o=0; while (o<fr->code_size && fr->code[o]==b->code[o]) o++;
+                                    fprintf(stderr, "[bbc-verify] pc=%04X bank=%u DIFF@+%u rehy=%02X fresh=%02X sz=%u entoff=%u/%u\n",
+                                            cpu->pc, _e->bank, o, b->code[o], fr->code[o], fr->code_size,
+                                            b->entry_off, fr->entry_off);
+                                }
+                                gbjit_block_free(fr);
+                            }
+                        }
+#endif
+                    }
+                }
+            }
+            if (unlikely(!b)) {
+                if (d->no_cache) {
+                    /* Wipe the bump-allocator arena so each compile reuses the
+                     * same bytes. Without this the arena would fill within a
+                     * few hundred iterations on any non-trivial loop. */
+                    codecache_reset(&d->cc);
+                }
+                resolver_ctx hr = { cpu };
 #if defined(ESP_PLATFORM)
                 b = gbjit_compile_block(&d->cc, cpu, cpu->pc, target_helper_addr, &hr);
 #else
                 b = gbjit_compile_block(&d->cc, cpu, cpu->pc, host_helper_addr, &hr);
 #endif
-            }
-            if (!b) {
-                sm83_step(cpu);
-                GBJIT_STAT_INC(d, interp_steps);
-                prev = NULL;
-                continue;
-            }
-            if (!d->no_cache) insert_block(d, b);
-            GBJIT_STAT_INC(d, blocks_compiled);
-            if (d->prefetch_enabled) {
-                prefetch_successors(d, b, d->prefetch_depth);
+                /* Arena full → evict-all + retry once. With evict_on_full
+                 * the dispatcher prefers wiping the cache over falling
+                 * back to the interp helper; hot blocks will lazy-recompile
+                 * on chain miss. Disable evict_on_full to get the old
+                 * fixed-size fixed-content behaviour. */
+                if (!b && d->evict_on_full) {
+                    evict_all(d);
+                    prev = NULL;
+#if defined(ESP_PLATFORM)
+                    b = gbjit_compile_block(&d->cc, cpu, cpu->pc, target_helper_addr, &hr);
+#else
+                    b = gbjit_compile_block(&d->cc, cpu, cpu->pc, host_helper_addr, &hr);
+#endif
+                }
+                if (!b) {
+                    sm83_step(cpu);
+                    GBJIT_STAT_INC(d, interp_steps);
+                    prev = NULL;
+                    continue;
+                }
+                if (!d->no_cache) insert_block(d, b);
+                GBJIT_STAT_INC(d, blocks_compiled);
+                /* Persist the freshly-emitted bytes so future evictions/bank
+                 * flips can rehydrate by copy. */
+                if (d->bbc && !d->no_cache) {
+                    bbc_put(d->bbc, b, bbc_bank_for(cpu, cpu->pc));
+                    d->bbc_misses++;
+                }
+                if (d->prefetch_enabled) {
+                    prefetch_successors(d, b, d->prefetch_depth);
+                }
             }
         }
 
