@@ -51,8 +51,17 @@ void ppu_sync_lyc(struct cpu_state *cpu);
  * registers are logged at its mode3→0; VRAM/OAM are flushed lazily — the MMU
  * calls ppu_offload_flush() just before any mid-frame VRAM/OAM write so the
  * captured lines render against the VRAM/OAM they had at capture time. */
+/* GBJIT_PPU_OFFLOAD_THREAD moves the deferred render onto a second core.
+ * It implies GBJIT_PPU_OFFLOAD. */
+#ifndef GBJIT_PPU_OFFLOAD_THREAD
+#define GBJIT_PPU_OFFLOAD_THREAD 0
+#endif
 #ifndef GBJIT_PPU_OFFLOAD
-#define GBJIT_PPU_OFFLOAD 0
+#  if GBJIT_PPU_OFFLOAD_THREAD
+#    define GBJIT_PPU_OFFLOAD 1
+#  else
+#    define GBJIT_PPU_OFFLOAD 0
+#  endif
 #endif
 
 #if GBJIT_PPU_OFFLOAD
@@ -61,6 +70,20 @@ struct mmu;
  * inline and only calls ppu_offload_flush() when a flush is actually due. */
 extern int gbjit_ppu_have_pending;
 void ppu_offload_flush(struct mmu *m);
+#endif
+
+/* Render-thread lifecycle + the emul-core sync point. When offload threading
+ * is off these are no-ops, so callers need no #ifdefs. ppu_offload_render_wait
+ * MUST be called by the emulation core before it reads the framebuffer or runs
+ * another frame, so it never races the render thread. */
+#if GBJIT_PPU_OFFLOAD_THREAD
+void ppu_offload_thread_start(void);
+void ppu_offload_thread_stop(void);
+void ppu_offload_render_wait(void);
+#else
+static inline void ppu_offload_thread_start(void) {}
+static inline void ppu_offload_thread_stop(void) {}
+static inline void ppu_offload_render_wait(void) {}
 #endif
 
 #endif

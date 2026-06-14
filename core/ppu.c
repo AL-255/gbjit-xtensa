@@ -647,11 +647,13 @@ static void ppu_capture_line(mmu *m, u8 ly) {
     if (ppu_window_active(m, ly)) m->window_line++;
 }
 
-/* Replay captured scanlines [from,to) through ppu_draw_line using their
- * logged registers and the CURRENT VRAM/OAM. The live io[]/latched_wy/
- * window_line are saved and restored so the PPU state machine is
- * undisturbed (VBlank STAT/IF/LY are already set by the caller). */
-static void ppu_render_lines(mmu *m, int from, int to) {
+/* Replay captured scanlines [from,to) through ppu_draw_line using the
+ * registers in `log` and m's CURRENT VRAM/OAM, writing m->framebuffer.
+ * The live io[]/latched_wy/window_line are saved and restored so the PPU
+ * state machine is undisturbed (VBlank STAT/IF/LY are already set by the
+ * caller). `m` and `log` may be the live mmu+s_line_log (synchronous flush)
+ * or a render-thread snapshot (mmu copy + log copy on core 1). */
+static void ppu_render_lines(mmu *m, const ppu_lstate *log, int from, int to) {
     if (from >= to) return;
     u8 s_lcdc = m->io[LCDC_REG], s_bgp = m->io[BGP_REG];
     u8 s_scx = m->io[SCX_REG],   s_scy = m->io[SCY_REG];
@@ -660,7 +662,7 @@ static void ppu_render_lines(mmu *m, int from, int to) {
     u8 s_wy = m->ppu_latched_wy,  s_wl = m->window_line;
 
     for (int ly = from; ly < to; ly++) {
-        ppu_lstate *L = &s_line_log[ly];
+        const ppu_lstate *L = &log[ly];
         m->io[LCDC_REG] = L->lcdc;
         m->io[BGP_REG]  = L->bgp;
         m->io[SCX_REG]  = L->scx;
@@ -689,18 +691,175 @@ static void ppu_render_lines(mmu *m, int from, int to) {
  * reference renderer's own block-granular draw point. */
 void ppu_offload_flush(struct mmu *m) {
     if (s_rendered < s_cap_count) {
-        ppu_render_lines(m, s_rendered, s_cap_count);
+        ppu_render_lines(m, s_line_log, s_rendered, s_cap_count);
         s_rendered = s_cap_count;
     }
     gbjit_ppu_have_pending = 0;
 }
+
+#if GBJIT_PPU_OFFLOAD_THREAD
+/* --- Render thread (core 1 on ESP, pthread on host) -------------------- *
+ *
+ * The end-of-frame batch render is handed to a second core. Safety rests
+ * on one rule: the render thread and the emulation core NEVER touch the
+ * shared render state (framebuffer, the global bg-shade LUT, VRAM/OAM/log)
+ * at the same time. The handoff is a private snapshot + two semaphores:
+ *
+ *   kick (emul core, at VBlank): wait for the previous render to finish,
+ *     copy VRAM+OAM+log into a private render context, signal "go", return.
+ *   render thread: on "go", render [from,to) into its private framebuffer,
+ *     copy those lines into the live framebuffer, signal "done".
+ *   render_wait (emul core, before it next reads the framebuffer / kicks):
+ *     wait "done".
+ *
+ * Because the render thread reads ONLY the snapshot, the emul core may keep
+ * mutating live VRAM/OAM (the next frame) the instant kick returns. The
+ * emul core only renders (mid-frame flush) while the thread is idle — it
+ * always render_wait()s before resuming, so the two never run ppu_draw_line
+ * (hence touch the bg-shade LUT) concurrently. */
+
+#include <stdlib.h>   /* malloc/free (host); free on ESP routes to heap_caps */
+#if defined(ESP_PLATFORM)
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+#include "esp_heap_caps.h"
+typedef SemaphoreHandle_t ofl_sem;
+#define OFL_SEM_NEW()   xSemaphoreCreateBinary()
+#define OFL_SEM_GIVE(s) xSemaphoreGive(s)
+#define OFL_SEM_WAIT(s) ((void)xSemaphoreTake((s), portMAX_DELAY))
+#else
+#include <pthread.h>
+#include <semaphore.h>
+typedef sem_t ofl_sem;
+#define OFL_SEM_NEW()   ofl_host_sem_new()
+#define OFL_SEM_GIVE(s) sem_post(&(s))
+#define OFL_SEM_WAIT(s) ofl_host_sem_wait(&(s))
+static sem_t ofl_host_sem_new(void) { sem_t s; sem_init(&s, 0, 0); return s; }
+static void  ofl_host_sem_wait(sem_t *s) { while (sem_wait(s) != 0) {} }
+#endif
+
+static mmu        *s_render_mmu;             /* private ctx: snapshot vram/oam + own fb */
+static ppu_lstate  s_render_log[LCD_HEIGHT]; /* snapshot of the per-line register log */
+static mmu        *s_render_dst;             /* live mmu to copy finished scanlines into */
+static int         s_render_from, s_render_to;
+static volatile bool s_render_inflight = false;
+static volatile bool s_render_started  = false;
+static volatile bool s_render_run      = false;
+static ofl_sem s_sem_go, s_sem_done;
+
+/* The actual render, run on the render thread. */
+static void render_worker(void) {
+    ppu_render_lines(s_render_mmu, s_render_log, s_render_from, s_render_to);
+    if (s_render_to > s_render_from) {
+        memcpy(&s_render_dst->framebuffer[(size_t)s_render_from * 160],
+               &s_render_mmu->framebuffer[(size_t)s_render_from * 160],
+               (size_t)(s_render_to - s_render_from) * 160);
+    }
+}
+
+#if defined(ESP_PLATFORM)
+static TaskHandle_t s_render_task;
+static void render_task_fn(void *arg) {
+    (void)arg;
+    while (s_render_run) {
+        OFL_SEM_WAIT(s_sem_go);
+        if (!s_render_run) break;
+        render_worker();
+        OFL_SEM_GIVE(s_sem_done);
+    }
+    vTaskDelete(NULL);
+}
+#else
+static pthread_t s_render_pthread;
+static void *render_task_fn(void *arg) {
+    (void)arg;
+    while (s_render_run) {
+        OFL_SEM_WAIT(s_sem_go);
+        if (!s_render_run) break;
+        render_worker();
+        OFL_SEM_GIVE(s_sem_done);
+    }
+    return NULL;
+}
+#endif
+
+/* Block until the in-flight render (if any) has finished. */
+void ppu_offload_render_wait(void) {
+    if (s_render_inflight) {
+        OFL_SEM_WAIT(s_sem_done);
+        s_render_inflight = false;
+    }
+}
+
+/* Hand scanlines [from,to) to the render thread, snapshotting the state it
+ * needs. If the thread isn't up, render synchronously on the caller. */
+static void ppu_offload_kick(mmu *src, int from, int to) {
+    if (!s_render_started) {
+        ppu_render_lines(src, s_line_log, from, to);
+        return;
+    }
+    ppu_offload_render_wait();                 /* render ctx now free to reuse */
+    memcpy(s_render_mmu->vram, src->vram, VRAM_SIZE);
+    memcpy(s_render_mmu->oam,  src->oam,  OAM_SIZE);
+    memcpy(s_render_log, s_line_log, sizeof(s_render_log));
+    s_render_dst  = src;
+    s_render_from = from;
+    s_render_to   = to;
+    s_render_inflight = true;
+    OFL_SEM_GIVE(s_sem_go);
+}
+
+void ppu_offload_thread_start(void) {
+    if (s_render_started) return;
+#if defined(ESP_PLATFORM)
+    s_render_mmu = (mmu *)heap_caps_malloc(sizeof(mmu),
+                        MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+#else
+    s_render_mmu = (mmu *)malloc(sizeof(mmu));
+#endif
+    if (!s_render_mmu) return;                 /* fall back to synchronous render */
+    memset(s_render_mmu, 0, sizeof(mmu));
+    s_sem_go   = OFL_SEM_NEW();
+    s_sem_done = OFL_SEM_NEW();
+    s_render_run = true;
+#if defined(ESP_PLATFORM)
+    BaseType_t ok = xTaskCreatePinnedToCore(render_task_fn, "gb_render", 4096,
+                                            NULL, tskIDLE_PRIORITY + 1,
+                                            &s_render_task, 1 /* Core 1 */);
+    if (ok != pdPASS) { s_render_run = false; free(s_render_mmu); s_render_mmu = NULL; return; }
+#else
+    if (pthread_create(&s_render_pthread, NULL, render_task_fn, NULL) != 0) {
+        s_render_run = false; free(s_render_mmu); s_render_mmu = NULL; return;
+    }
+#endif
+    s_render_started = true;
+}
+
+void ppu_offload_thread_stop(void) {
+    if (!s_render_started) return;
+    ppu_offload_render_wait();
+    s_render_run = false;
+    OFL_SEM_GIVE(s_sem_go);                    /* wake the task so it can exit */
+#if !defined(ESP_PLATFORM)
+    pthread_join(s_render_pthread, NULL);
+    free(s_render_mmu);
+    s_render_mmu = NULL;
+#endif
+    s_render_started = false;
+}
+#endif /* GBJIT_PPU_OFFLOAD_THREAD */
 
 /* End-of-frame (VBlank): draw whatever scanlines weren't already flushed. */
 static void ppu_render_frame_from_log(mmu *m) {
 #ifdef GBJIT_PPU_OFFLOAD_DIAG
     diag_check_vram(m);
 #endif
-    ppu_render_lines(m, s_rendered, s_cap_count);
+#if GBJIT_PPU_OFFLOAD_THREAD
+    ppu_offload_kick(m, s_rendered, s_cap_count);
+#else
+    ppu_render_lines(m, s_line_log, s_rendered, s_cap_count);
+#endif
     s_rendered = s_cap_count;
     gbjit_ppu_have_pending = 0;
 }

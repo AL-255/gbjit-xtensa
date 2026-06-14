@@ -2,6 +2,7 @@
 #include "memory.h"
 #include "sm83_interp.h"
 #include "dispatcher.h"
+#include "ppu.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -85,6 +86,11 @@ static u64         g_dump_frame = 0;
 static const char *g_dump_frame_path = NULL;
 static bool        g_dump_frame_done = false;
 static void frame_dump_cb(struct mmu *m) {
+    /* Fires right after the VBlank kick. With PPU offload threading on this
+     * blocks until the render thread has finished the frame, so the dump
+     * captures a complete image and the next frame can't race it. No-op when
+     * threading is off. */
+    ppu_offload_render_wait();
     if (g_dump_frame_done || m->frame_seq < g_dump_frame) return;
     dump_framebuffer_pgm(m, g_dump_frame_path);
     g_dump_frame_done = true;
@@ -198,7 +204,15 @@ int main(int argc, char **argv) {
     /* Unified segmented run: advance to each event cycle (a scripted press or
      * the framebuffer dump), apply it, and continue — same path for interp
      * and jit so an injected Start exercises identical code. */
+    /* Install the frame-complete hook whenever a frame-exact dump is wanted
+     * OR offload threading is on (so every frame render_wait()s and the
+     * render thread never races the emulation loop). */
+#if GBJIT_PPU_OFFLOAD_THREAD
+    m.frame_complete_cb = frame_dump_cb;
+#else
     if (g_dump_frame_path) m.frame_complete_cb = frame_dump_cb;
+#endif
+    ppu_offload_thread_start();   /* no-op unless offload threading is built in */
 
     int pi = 0; bool dumped = false;
     while (cpu.cycles < max_cycles) {
@@ -232,6 +246,8 @@ int main(int argc, char **argv) {
             dumped = true;
         }
     }
+
+    ppu_offload_thread_stop();   /* no-op unless offload threading is built in */
 
     clock_gettime(CLOCK_MONOTONIC, &t1);
     double elapsed_us = (t1.tv_sec - t0.tv_sec) * 1e6 + (t1.tv_nsec - t0.tv_nsec) / 1e3;
