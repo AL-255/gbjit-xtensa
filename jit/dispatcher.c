@@ -555,6 +555,20 @@ static void enter_block_native(gbjit_block *b, cpu_state *cpu) {
      * the "memory" clobber keep it from being optimised away. */
     volatile uint32_t pad[12];
     pad[0] = fn;
+    /* Flush all register windows to the stack before running the JIT block.
+     * The block runs in THIS function's borrowed window (reached by CALLX0, no
+     * ENTRY of its own). A deep helper call (sm83_step -> sm83_service_
+     * interrupts -> ppu_tick -> ...) issues a windowed `call8` from that
+     * borrowed window; the resulting register-window OVERFLOW spills frames to
+     * a1-relative save areas. Because the block has no frame of its own, those
+     * spills can clobber live data, corrupting CPU state (observed: SML's
+     * Start->level handler getting a wrong HL and branching into the bonus
+     * game). Spilling up front leaves only this frame live, so the helper
+     * call8s rotate into free physical registers and never overflow-spill into
+     * a borrowed/overlapping frame. The host simulator models no windowing, so
+     * it never reproduced this. */
+    extern void xthal_window_spill(void);
+    xthal_window_spill();
     /* Pin `cpu` into a2 — CALL0 callees receive their first argument there.
      * Pin `fn` into a8 — CALLX0's target register, free across the call. */
     register uint32_t a2_cpu asm("a2") = (uint32_t)(uintptr_t)cpu;

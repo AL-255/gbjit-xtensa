@@ -198,6 +198,16 @@ static void step(xt_sim *s) {
                 u32 fn_token = s->a[sr];
                 s->a[0] = s->pc;        /* return address — caller may use to RET */
                 if (s->call_thunk) s->call_thunk(s, fn_token);
+                /* Faithfully model the native CALL0->CALL8 trampoline
+                 * (port/esp32s3/.../jit_trampolines.S): its `call8` rotates the
+                 * register window and CLOBBERS the caller's a8..a15, preserving
+                 * only a0..a7 (and a2 carries mmu_read8's return value). The
+                 * sim previously left a8..a15 intact, so any codegen that kept
+                 * live state in a8..a15 across a helper call worked here but
+                 * corrupted on real silicon. Poison them so the host
+                 * differential tests catch that class of bug. */
+                for (int _r = 8; _r < 16; _r++)
+                    s->a[_r] = 0x8BAD0000u | (u32)_r;
                 return;
             }
             if (t == 0x8) { /* RET (0x000080) */

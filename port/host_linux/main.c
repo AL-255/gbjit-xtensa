@@ -85,13 +85,22 @@ int main(int argc, char **argv) {
     const char *rom_path = NULL;
     const char *dump_path = NULL;
     u64 dump_at_cycles = 0;
+    /* Scripted joypad presses: set m.buttons=mask once cpu.cycles reaches cyc.
+       Bit layout matches mmu_read8's JOYP: 0=A 1=B 2=Select 3=Start
+       4=Right 5=Left 6=Up 7=Down. Repeatable: `--press <cyc> <hexmask>`. */
+    struct { u64 cyc; u8 mask; } presses[64];
+    int n_press = 0;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--interp") == 0) use_jit = false;
         else if (strcmp(argv[i], "--jit") == 0) use_jit = true;
         else if (strcmp(argv[i], "--no-cache") == 0) { use_jit = true; no_cache = true; }
         else if (strcmp(argv[i], "--no-prefetch") == 0) { use_jit = true; no_prefetch = true; }
-        else if (strcmp(argv[i], "--max-cycles") == 0 && i + 1 < argc) {
+        else if (strcmp(argv[i], "--press") == 0 && i + 2 < argc && n_press < 64) {
+            presses[n_press].cyc  = strtoull(argv[++i], NULL, 0);
+            presses[n_press].mask = (u8)strtoul(argv[++i], NULL, 0);
+            n_press++;
+        } else if (strcmp(argv[i], "--max-cycles") == 0 && i + 1 < argc) {
             max_cycles = strtoull(argv[++i], NULL, 0);
         } else if (strcmp(argv[i], "--dump-fb") == 0 && i + 2 < argc) {
             /* `--dump-fb <cycles> <file.pgm>`: run until cycles, then
@@ -131,6 +140,14 @@ int main(int argc, char **argv) {
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
 
+    /* Sort presses ascending and make sure max_cycles covers every event. */
+    for (int a = 1; a < n_press; a++) {
+        u64 c = presses[a].cyc; u8 mk = presses[a].mask; int b = a;
+        while (b > 0 && presses[b-1].cyc > c) { presses[b]=presses[b-1]; b--; }
+        presses[b].cyc = c; presses[b].mask = mk;
+    }
+    for (int a = 0; a < n_press; a++) if (presses[a].cyc > max_cycles) max_cycles = presses[a].cyc;
+
     gbjit_dispatcher disp;
     if (use_jit) {
         if (!gbjit_dispatcher_init(&disp, &cpu) ) {
@@ -139,34 +156,33 @@ int main(int argc, char **argv) {
         }
         disp.no_cache = no_cache;
         if (no_prefetch) disp.prefetch_enabled = false;
-        if (dump_path) {
-            /* Run to the dump cycle, snapshot the framebuffer, then
-             * continue to max_cycles. */
-            gbjit_dispatcher_run_until(&disp, dump_at_cycles);
-            if (dump_framebuffer_pgm(&m, dump_path) == 0) {
-                fprintf(stderr, "[dump-fb] %s at cycles=%llu pc=%04X\n",
-                        dump_path, (unsigned long long)cpu.cycles, cpu.pc);
-            } else {
-                fprintf(stderr, "[dump-fb] failed to write %s\n", dump_path);
-            }
-            if (max_cycles > dump_at_cycles) {
-                gbjit_dispatcher_run_until(&disp, max_cycles);
-            }
-        } else {
-            gbjit_dispatcher_run_until(&disp, max_cycles);
+    }
+
+    /* Unified segmented run: advance to each event cycle (a scripted press or
+     * the framebuffer dump), apply it, and continue — same path for interp
+     * and jit so an injected Start exercises identical code. */
+    int pi = 0; bool dumped = false;
+    while (cpu.cycles < max_cycles) {
+        u64 next = max_cycles;
+        if (pi < n_press && presses[pi].cyc < next) next = presses[pi].cyc;
+        if (dump_path && !dumped && dump_at_cycles < next) next = dump_at_cycles;
+        if (next <= cpu.cycles) next = cpu.cycles + 1;
+        if (use_jit) gbjit_dispatcher_run_until(&disp, next);
+        else         sm83_run_until(&cpu, next);
+
+        while (pi < n_press && cpu.cycles >= presses[pi].cyc) {
+            m.buttons = presses[pi].mask;
+            fprintf(stderr, "[press] buttons=%02X at cycles=%llu\n",
+                    presses[pi].mask, (unsigned long long)cpu.cycles);
+            pi++;
         }
-    } else {
-        if (dump_path) {
-            sm83_run_until(&cpu, dump_at_cycles);
-            if (dump_framebuffer_pgm(&m, dump_path) == 0) {
+        if (dump_path && !dumped && cpu.cycles >= dump_at_cycles) {
+            if (dump_framebuffer_pgm(&m, dump_path) == 0)
                 fprintf(stderr, "[dump-fb] %s at cycles=%llu pc=%04X\n",
                         dump_path, (unsigned long long)cpu.cycles, cpu.pc);
-            }
-            if (max_cycles > dump_at_cycles) {
-                sm83_run_until(&cpu, max_cycles);
-            }
-        } else {
-            sm83_run_until(&cpu, max_cycles);
+            else
+                fprintf(stderr, "[dump-fb] failed to write %s\n", dump_path);
+            dumped = true;
         }
     }
 
