@@ -178,10 +178,23 @@ u8 mmu_read8(mmu *m, u16 addr) {
  * no compiled code (state 0) cost one load + branch and nothing more —
  * which is every write under the pure interpreter. */
 static inline void smc_mark(mmu *m, u16 addr) {
-    u8 *st = &m->jit_page_state[addr >> 8];
+    u32 page = addr >> 8;
+    u8 *st = &m->jit_page_state[page];
+    if (*st == 0u) return;                       /* no code here — cheapest path */
+    /* Only a write that lands inside the page's compiled-code byte range can
+     * actually modify a block. A write to the data part of a code+data page
+     * (e.g. HRAM variables sharing the OAM-DMA routine's page) is ignored — no
+     * flush, no invalidation. */
+    if (addr < m->jit_page_code_lo[page] || addr >= m->jit_page_code_hi[page])
+        return;
     if (*st == 1u) {
         *st = 2u;
         m->jit_smc_dirty = 1u;
+        m->jit_page_wlo[page] = addr;
+        m->jit_page_whi[page] = addr;
+    } else { /* *st == 2u: already dirty — widen the written-address range */
+        if (addr < m->jit_page_wlo[page]) m->jit_page_wlo[page] = addr;
+        if (addr > m->jit_page_whi[page]) m->jit_page_whi[page] = addr;
     }
 }
 

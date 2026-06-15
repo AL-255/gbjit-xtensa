@@ -84,6 +84,18 @@ typedef struct gbjit_dispatcher {
     bool evict_on_full;
     u64  arena_resets;
 
+    /* Per-run compile budget: cap on gbjit_compile_block calls per
+     * gbjit_dispatcher_run_until() invocation (~one GB frame). When the cap is
+     * reached, on-demand block misses interpret instead of compiling and the
+     * prefetcher stops, so a compile burst (e.g. a level transition compiling
+     * hundreds of new blocks) is spread across many frames instead of stalling
+     * one frame for ~100 ms. This is the lever for the "1% low" frame time:
+     * it trades a little steady-state warm-up latency for a bounded worst case.
+     * 0 = unlimited (original behaviour). Cheap PSRAM-byte-cache rehydration
+     * (a memcpy, not a recompile) is NOT counted against the budget. */
+    u32  compile_budget;
+    u32  compiles_this_run;
+
     /* Monotonic epoch for the evicting code cache (GBJIT_JIT_EVICT=1).
      * Bumped on every block compile and execute; stamped into
      * gbjit_block.tag so the evictor can pick the least-recently-used

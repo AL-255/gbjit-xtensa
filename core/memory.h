@@ -95,6 +95,22 @@ typedef struct mmu {
      * never sets state 1, so it pays nothing. */
     u8       jit_smc_dirty;
     u8       jit_page_state[256];
+    /* For each dirty (state 2) page, the inclusive range of GB addresses
+     * written since it went dirty. The dispatcher invalidates only the blocks
+     * whose byte range actually overlaps [wlo,whi] instead of every block on
+     * the page — so code and data sharing a 256-byte page (e.g. SML's OAM-DMA
+     * routine + HRAM variables) no longer churns the JIT. Valid only where
+     * jit_page_state == 2. */
+    u16      jit_page_wlo[256];
+    u16      jit_page_whi[256];
+    /* Per-page bounding box [lo,hi) of the GB addresses actually covered by
+     * compiled blocks on that page. smc_mark only flags SMC when a write lands
+     * inside this range — a write to the data part of a code+data page never
+     * raises jit_smc_dirty, so it costs one compare and nothing more (no flush,
+     * no invalidation scan). hi==0 means "no code on this page". Grown by
+     * insert_block; recomputed from survivors by invalidate_page_range. */
+    u16      jit_page_code_lo[256];
+    u16      jit_page_code_hi[256];
 
     /* Back-pointer to the CPU. ppu_tick uses cpu->cycles as its time base
      * and writes back into io[$44]/io[$41]; left NULL the PPU model is

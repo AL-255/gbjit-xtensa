@@ -364,6 +364,14 @@ bool gbjit_dispatcher_init(gbjit_dispatcher *d, cpu_state *cpu) {
      * exceeds the arena, where the alternative (interp fallback for
      * every uncompiled block) would be worse than thrashing. */
     d->evict_on_full = false;
+
+    /* Per-frame compile budget. Default from GBJIT_COMPILE_BUDGET (0 = off).
+     * Tunable at runtime via the backend setter. See the field comment. */
+#ifndef GBJIT_COMPILE_BUDGET
+#define GBJIT_COMPILE_BUDGET 0
+#endif
+    d->compile_budget = GBJIT_COMPILE_BUDGET;
+    d->compiles_this_run = 0;
     return true;
 }
 
@@ -488,6 +496,26 @@ static void bbc_invalidate_page(struct gbjit_bbc *c, u32 page) {
     }
 }
 
+/* Drop only the cached blocks whose byte range [pc, gb_pc_end) overlaps the
+ * written range [lo,hi] — the byte-range-precise counterpart of
+ * bbc_invalidate_page. Used for SMC so a data write near (but not into) a
+ * cached RAM code block doesn't evict it. */
+static void bbc_invalidate_range(struct gbjit_bbc *c, u16 lo, u16 hi) {
+    for (u32 h = 0; h < GBJIT_BBC_BUCKETS; h++) {
+        int *pp = &c->buckets[h];
+        while (*pp >= 0) {
+            bbc_entry *e = &c->entries[*pp];
+            u16 end = e->gb_pc_end ? e->gb_pc_end : (u16)(e->pc + 1u);
+            if (e->pc <= hi && lo < end) {
+                e->pc = 0xFFFFu;        /* tombstone: unmatchable, keep store */
+                *pp = e->next;
+            } else {
+                pp = &e->next;
+            }
+        }
+    }
+}
+
 /* Re-materialise a cached block: allocate IRAM, copy the stored bytes in, and
  * build a fresh block struct. Returns NULL if IRAM can't be allocated (caller
  * falls back to a full compile). */
@@ -531,13 +559,31 @@ static void insert_block(gbjit_dispatcher *d, gbjit_block *block) {
     u32 last_page  = (block->gb_pc_end > 0 ? (u32)((block->gb_pc_end - 1) >> GBJIT_SMC_PAGE_SHIFT)
                                            : first_page);
     if (last_page >= GBJIT_SMC_PAGE_COUNT) last_page = GBJIT_SMC_PAGE_COUNT - 1;
+    mmu *bm = (d->cpu) ? d->cpu->mmu : NULL;
     for (u32 p = first_page; p <= last_page; p++) {
         smc_page_node *node = (smc_page_node *)calloc(1, sizeof(*node));
         node->b = block;
         node->next = (smc_page_node *)d->smc_pages[p];
         d->smc_pages[p] = node;
-        if (d->cpu && d->cpu->mmu && d->cpu->mmu->jit_page_state[p] == 0u)
-            d->cpu->mmu->jit_page_state[p] = 1u;
+        if (bm) {
+            if (bm->jit_page_state[p] == 0u) bm->jit_page_state[p] = 1u;
+            /* Grow the page's compiled-code byte-range box by this block's
+             * intersection with the page, so smc_mark ignores data writes
+             * outside it (the lever that stops code+data-page churn). */
+            u16 p_base = (u16)(p << GBJIT_SMC_PAGE_SHIFT);
+            u32 p_end  = (u32)p_base + (1u << GBJIT_SMC_PAGE_SHIFT);
+            u16 lo_c = block->gb_pc_start > p_base ? block->gb_pc_start : p_base;
+            u32 bend = block->gb_pc_end ? block->gb_pc_end
+                                        : (u32)block->gb_pc_start + 1u;
+            u16 hi_c = (u16)(bend < p_end ? bend : p_end);
+            if (bm->jit_page_code_hi[p] == 0u) {
+                bm->jit_page_code_lo[p] = lo_c;
+                bm->jit_page_code_hi[p] = hi_c;
+            } else {
+                if (lo_c < bm->jit_page_code_lo[p]) bm->jit_page_code_lo[p] = lo_c;
+                if (hi_c > bm->jit_page_code_hi[p]) bm->jit_page_code_hi[p] = hi_c;
+            }
+        }
     }
 }
 
@@ -605,6 +651,9 @@ static void clear_dangling_predictions(gbjit_dispatcher *d, gbjit_block *block) 
  * triggering block. */
 static void prefetch_successors(gbjit_dispatcher *d, gbjit_block *b, int depth) {
     if (depth <= 0 || d->no_cache) return;
+    /* Respect the per-frame compile budget: prefetch is speculative work, so it
+     * is the first thing to yield when the frame's compile quota is spent. */
+    if (d->compile_budget && d->compiles_this_run >= d->compile_budget) return;
     /* Walk BOTH succ_pc[0] (unconditional / taken / CALL-target) and
      * succ_pc[1] (JR-cc fallthru / CALL return point). Dropping the
      * second-successor walk was tempting — the depth=4 + both-succ
@@ -632,6 +681,8 @@ static void prefetch_successors(gbjit_dispatcher *d, gbjit_block *b, int depth) 
         insert_block(d, nb);
         GBJIT_STAT_INC(d, blocks_compiled);
         GBJIT_STAT_INC(d, prefetched_blocks);
+        d->compiles_this_run++;
+        if (d->compile_budget && d->compiles_this_run >= d->compile_budget) return;
         prefetch_successors(d, nb, depth - 1);
     }
 }
@@ -683,6 +734,60 @@ void gbjit_dispatcher_invalidate_addr(gbjit_dispatcher *d, u16 gb_addr) {
         GBJIT_STAT_INC(d, smc_invalidations);
         node = next;
     }
+}
+
+/* Byte-range-precise SMC invalidation: drop only the blocks on `page` whose
+ * code range [gb_pc_start, gb_pc_end) overlaps the written range [lo,hi].
+ * Blocks on the same page that were NOT touched survive (re-attached to the
+ * page list). Returns the number of survivors — the caller leaves the page
+ * marked as code (state 1) when any remain. This is what stops code+data
+ * sharing a 256-byte page (HRAM/WRAM) from churning the JIT. */
+static u32 invalidate_page_range(gbjit_dispatcher *d, u32 page, u16 lo, u16 hi) {
+    smc_page_node *node = (smc_page_node *)d->smc_pages[page];
+    d->smc_pages[page] = NULL;          /* detach; rebuild survivors below */
+    smc_page_node *survivors = NULL;
+    u32 nsurv = 0;
+    /* Recompute the page's code box from the survivors so a write to the
+     * just-invalidated bytes won't keep re-dirtying the page. */
+    u16 p_base = (u16)(page << GBJIT_SMC_PAGE_SHIFT);
+    u32 p_end  = (u32)p_base + (1u << GBJIT_SMC_PAGE_SHIFT);
+    u16 box_lo = 0; u16 box_hi = 0;     /* hi==0 => empty */
+    while (node) {
+        smc_page_node *next = node->next;
+        gbjit_block *blk = node->b;
+        u16 end = blk->gb_pc_end ? blk->gb_pc_end : (u16)(blk->gb_pc_start + 1u);
+        bool overlap = (blk->gb_pc_start <= hi) && (lo < end);
+        if (overlap) {
+            /* remove_block_from_smc prunes this block's nodes from ALL pages
+             * (including survivor lists already written back for earlier
+             * pages), so a multi-page block can't leave a dangling node. */
+            remove_block_from_smc(d, blk);
+            remove_block_from_buckets(d, blk);
+            clear_dangling_predictions(d, blk);
+#if GBJIT_JIT_EVICT
+            codecache_free(&d->cc, (u32)(blk->code - d->cc.base), blk->code_size);
+#endif
+            gbjit_block_free(blk);
+            free(node);
+            GBJIT_STAT_INC(d, smc_invalidations);
+        } else {
+            node->next = survivors;
+            survivors = node;
+            nsurv++;
+            /* Extend the recomputed code box by this survivor's page slice. */
+            u16 lo_c = blk->gb_pc_start > p_base ? blk->gb_pc_start : p_base;
+            u16 hi_c = (u16)((u32)end < p_end ? end : p_end);
+            if (box_hi == 0u) { box_lo = lo_c; box_hi = hi_c; }
+            else { if (lo_c < box_lo) box_lo = lo_c; if (hi_c > box_hi) box_hi = hi_c; }
+        }
+        node = next;
+    }
+    d->smc_pages[page] = survivors;
+    if (d->cpu && d->cpu->mmu) {
+        d->cpu->mmu->jit_page_code_lo[page] = box_lo;
+        d->cpu->mmu->jit_page_code_hi[page] = box_hi;   /* 0 => page now empty */
+    }
+    return nsurv;
 }
 
 #if defined(ESP_PLATFORM)
@@ -952,6 +1057,7 @@ void gbjit_dispatcher_run_until(gbjit_dispatcher *d_param, u64 until_param) {
     s_run_until = until_param;
     s_run_cpu   = d_param->cpu;
     s_run_prev  = NULL;
+    d_param->compiles_this_run = 0;   /* reset per-frame compile budget */
 #define d     s_run_d
 #define until s_run_until
 #define cpu   s_run_cpu
@@ -983,16 +1089,20 @@ void gbjit_dispatcher_run_until(gbjit_dispatcher *d_param, u64 until_param) {
             u8 *st = cpu->mmu->jit_page_state;
             for (u32 p = 0; p < GBJIT_SMC_PAGE_COUNT; p++) {
                 if (st[p] == 2u) {
-                    gbjit_dispatcher_invalidate_addr(
-                        d, (u16)(p << GBJIT_SMC_PAGE_SHIFT));
-                    /* Also drop the byte-cache copies for this RAM page — the
-                     * code there has changed, so rehydrating the old bytes
-                     * would run stale code. (Banked-ROM pages are never
-                     * written, so this only fires for genuine RAM SMC.) */
-                    if (d->bbc) bbc_invalidate_page(d->bbc, p);
-                    /* Page has no blocks now; insert_block re-marks it
-                     * to state 1 when the page is recompiled. */
-                    st[p] = 0u;
+                    /* Byte-range-precise: only invalidate blocks whose code
+                     * actually overlaps the addresses written this round, so a
+                     * data write that merely shares a 256-byte page with code
+                     * (HRAM/WRAM) doesn't evict the code. */
+                    u16 wlo = cpu->mmu->jit_page_wlo[p];
+                    u16 whi = cpu->mmu->jit_page_whi[p];
+                    u32 survivors = invalidate_page_range(d, p, wlo, whi);
+                    /* Drop only the byte-cache copies in the written range — the
+                     * code there changed; rehydrating it would run stale bytes.
+                     * (Banked-ROM pages are never written, so RAM SMC only.) */
+                    if (d->bbc) bbc_invalidate_range(d->bbc, wlo, whi);
+                    /* Keep the page marked as code if untouched blocks remain;
+                     * otherwise clear it (insert_block re-marks on recompile). */
+                    st[p] = survivors ? 1u : 0u;
                 }
             }
             cpu->mmu->jit_smc_dirty = 0;
@@ -1160,6 +1270,19 @@ void gbjit_dispatcher_run_until(gbjit_dispatcher *d_param, u64 until_param) {
                 }
             }
             if (unlikely(!b)) {
+                /* Per-frame compile budget: once this run has compiled its quota
+                 * of fresh blocks, interpret the overflow instead of paying more
+                 * compile cost this frame. The block compiles on a later frame
+                 * when budget is available, spreading a burst (level load) so no
+                 * single frame stalls. Rehydration above is cheap and already
+                 * handled it if possible. */
+                if (d->compile_budget
+                        && d->compiles_this_run >= d->compile_budget) {
+                    sm83_step(cpu);
+                    GBJIT_STAT_INC(d, interp_steps);
+                    prev = NULL;
+                    continue;
+                }
                 if (d->no_cache) {
                     /* Wipe the bump-allocator arena so each compile reuses the
                      * same bytes. Without this the arena would fill within a
@@ -1194,6 +1317,7 @@ void gbjit_dispatcher_run_until(gbjit_dispatcher *d_param, u64 until_param) {
                 }
                 if (!d->no_cache) insert_block(d, b);
                 GBJIT_STAT_INC(d, blocks_compiled);
+                d->compiles_this_run++;
                 /* Persist the freshly-emitted bytes so future evictions/bank
                  * flips can rehydrate by copy. */
                 if (d->bbc && !d->no_cache) {
