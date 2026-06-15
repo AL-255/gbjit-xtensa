@@ -72,6 +72,12 @@ extern int gbjit_ppu_have_pending;
 void ppu_offload_flush(struct mmu *m);
 #endif
 
+/* Set nonzero by gbjit_run_frame() while a frame is emulated only to catch up
+ * timing (it won't be displayed). ppu_draw_line then skips the ~11 ms per-pixel
+ * scanline render while keeping the PPU state machine and window_line exact.
+ * Cleared for every displayed frame. */
+extern int gbjit_ppu_skip_pixels;
+
 /* Render-thread lifecycle + the emul-core sync point. When offload threading
  * is off these are no-ops, so callers need no #ifdefs. ppu_offload_render_wait
  * MUST be called by the emulation core before it reads the framebuffer or runs

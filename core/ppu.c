@@ -4,6 +4,15 @@
 #include <string.h>   /* memcpy — frame buffer swap, tile-row pack/unpack */
 #include "profiler.h"
 
+/* Frame-skip pixel-render gate. When the main loop knows a frame won't be
+ * displayed (it fell behind the e-paper VSYNC and is catching up), it sets
+ * this so ppu_draw_line skips the ~11 ms per-pixel scanline render. The PPU
+ * STATE MACHINE (LY/STAT/mode/IRQ timing) and window_line still advance
+ * exactly as on a drawn frame — only the pixel writes are skipped, and the
+ * frame's framebuffer is never read (the next displayed frame redraws all 144
+ * lines fresh). Default 0 (render). See gbjit_run_frame(). */
+int gbjit_ppu_skip_pixels = 0;
+
 /* Fast tile-row renderer.
  *
  * When GBJIT_PPU_FAST_BG_RENDERER is on (default 1), ppu_draw_line
@@ -577,11 +586,17 @@ static void ppu_draw_line(mmu *m, u8 ly) {
         .wx = m->io[WX_REG],     .latched_wy = m->ppu_latched_wy,
         .window_line = m->window_line,
     };
+    /* On a frame the main loop has marked skip (won't be displayed), do the
+     * cheap state-machine bookkeeping only and skip the per-pixel render. The
+     * window_line advance below must still run so the PPU's internal window
+     * counter stays in lockstep with a drawn frame. */
+    if (!gbjit_ppu_skip_pixels) {
 #if GBJIT_FRAMEBUFFER_DOUBLE_BUFFER
-    ppu_draw_line_ex(m->framebuffer_back, m->vram, m->oam, &L, ly);
+        ppu_draw_line_ex(m->framebuffer_back, m->vram, m->oam, &L, ly);
 #else
-    ppu_draw_line_ex(m->framebuffer, m->vram, m->oam, &L, ly);
+        ppu_draw_line_ex(m->framebuffer, m->vram, m->oam, &L, ly);
 #endif
+    }
     if (ppu_window_active(m, ly)) m->window_line++;
 }
 
