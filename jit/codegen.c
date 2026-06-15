@@ -177,6 +177,28 @@ static bool op_touches_mmu(u8 op) {
     return false;
 }
 
+/* Upper bound on the number of extra literal-pool slots an op's inline path
+ * may allocate (via lit_alloc_u32). Used to right-size the per-block literal
+ * pool instead of always reserving MAX_EXTRA_LITERALS. Over-estimating only
+ * wastes a few pool bytes; under-estimating is harmless too — lit_alloc_u32
+ * returns -1 when the pool is full and the op simply falls back to the helper.
+ * Memory ops allocate at most 2 (base ptr + SMC-guard ptr); CALL/RET/RST touch
+ * the stack (1, bounded at 2). Everything else allocates none. */
+static u32 extras_for_op(u8 op) {
+    if (op_touches_mmu(op)) return 2u;
+    switch (op) {
+    case 0xCD:                                   /* CALL a16          */
+    case 0xC9: case 0xD9:                         /* RET, RETI         */
+    case 0xC4: case 0xCC: case 0xD4: case 0xDC:   /* CALL cc           */
+    case 0xC0: case 0xC8: case 0xD0: case 0xD8:   /* RET cc            */
+    case 0xC7: case 0xCF: case 0xD7: case 0xDF:   /* RST               */
+    case 0xE7: case 0xEF: case 0xF7: case 0xFF:
+        return 2u;
+    default:
+        return 0u;
+    }
+}
+
 /* If `ops[idx]` is a JR cc whose target is a previously-collected op in
  * the same block AND every op between that target and the JR cc itself
  * is MMU-pure, returns the target's index in `ops`. Otherwise returns
@@ -1942,8 +1964,18 @@ gbjit_block *gbjit_compile_block(codecache *cc, cpu_state *cpu, u16 pc_start,
         }
     }
 
+    /* Right-size the per-block extra literal pool. The fixed MAX_EXTRA_LITERALS
+     * (32) reservation wasted ~28% of every block; most blocks need far fewer.
+     * Sum a safe upper bound over the block's ops (+2 margin), capped at the
+     * old maximum. Smaller blocks => more fit in the IRAM arena => far less
+     * eviction/rehydration. Under-sizing is safe: an over-budget op just falls
+     * back to the helper (lit_alloc_u32 returns -1). */
+    u32 n_extra = 2u;   /* margin */
+    for (int _i = 0; _i < n_ops; _i++) n_extra += extras_for_op(ops_opcode[_i]);
+    if (n_extra > MAX_EXTRA_LITERALS) n_extra = MAX_EXTRA_LITERALS;
+
     /* Reserve. */
-    u32 lit_bytes = LITERAL_POOL_BYTES;
+    u32 lit_bytes = (u32)((LITERAL_COUNT + n_extra) * 4u);
     u32 code_bytes = PROLOGUE_EPILOGUE_BYTES + n_ops * BYTES_PER_OP;
     /* 8-aligned: the evicting code cache (GBJIT_JIT_EVICT) tracks free
      * spans at 8-byte granularity, so block sizes must be 8-aligned for
@@ -1970,7 +2002,7 @@ gbjit_block *gbjit_compile_block(codecache *cc, cpu_state *cpu, u16 pc_start,
         *(u32 *)(base + wp) = v;
         wp += 4;
     }
-    lit_ctx L = { base, wp, wp + (u32)(MAX_EXTRA_LITERALS * 4) };
+    lit_ctx L = { base, wp, wp + (u32)(n_extra * 4) };
     wp = L.limit;
     wp = align_up_4(wp);
     u32 entry_off = wp;

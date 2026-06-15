@@ -395,11 +395,15 @@ void gbjit_dispatcher_shutdown(gbjit_dispatcher *d) {
     d->arena = NULL;
 }
 
-static gbjit_block *find_block(gbjit_dispatcher *d, u16 pc) {
+/* Look up a resident block by (pc, rom_bank). Keying on bank as well as pc lets
+ * blocks compiled under different ROM banks at the same banked-window PC coexist,
+ * removing the need to wipe the table on every MBC bank flip. `bank` is the
+ * caller's wanted compile bank (bbc_bank_for); 0 for the fixed bank / RAM. */
+static gbjit_block *find_block(gbjit_dispatcher *d, u16 pc, u8 bank) {
     u32 idx = pc & (GBJIT_BLOCK_BUCKETS - 1u);
     dispatcher_bucket *b = (dispatcher_bucket *)d->buckets[idx];
     while (b) {
-        if (b->b->gb_pc_start == pc) return b->b;
+        if (b->b->gb_pc_start == pc && b->b->rom_bank == bank) return b->b;
         b = b->next;
     }
     return NULL;
@@ -613,7 +617,7 @@ static void prefetch_successors(gbjit_dispatcher *d, gbjit_block *b, int depth) 
     for (int i = 0; i < 2; i++) {
         u16 pc = b->succ_pc[i];
         if (pc == 0xFFFFu) continue;
-        if (find_block(d, pc)) {
+        if (find_block(d, pc, bbc_bank_for(d->cpu, pc))) {
             GBJIT_STAT_INC(d, prefetch_already_cached);
             continue;
         }
@@ -954,16 +958,18 @@ void gbjit_dispatcher_run_until(gbjit_dispatcher *d_param, u64 until_param) {
 #define prev  s_run_prev
 
     while (cpu->cycles < until) {
-        /* MBC bank switched since last iteration → invalidate every JIT
-         * block compiled from the banked ROM window ($4000..$7FFF), whose
-         * bank-specific immediates / branch targets are now stale. */
+        /* MBC bank switched since last iteration. Blocks from the banked ROM
+         * window ($4000..$7FFF) are (pc,rom_bank)-keyed (see find_block), so
+         * old- and new-bank blocks coexist — the next lookup just uses the new
+         * bank's key. No wipe: the old bank's blocks stay resident and are
+         * re-found instantly on the next flip back (the coldness evictor
+         * reclaims them only if the arena needs the space). This kills the
+         * dominant scroll thrash — SML ping-pongs between 2 banks and the old
+         * wipe re-invalidated + re-rehydrated ~60 blocks per flip. */
         if (unlikely(cpu->mmu->rom_bank_dirty)) {
             d->bank_flips++;
-            for (u32 a = 0x4000u; a < 0x8000u; a += (1u << GBJIT_SMC_PAGE_SHIFT)) {
-                gbjit_dispatcher_invalidate_addr(d, (u16)a);
-            }
             cpu->mmu->rom_bank_dirty = 0;
-            prev = NULL;
+            prev = NULL;   /* predicted target may be a different bank now */
         }
         /* Self-modifying code: a RAM page that a JIT block was compiled
          * from has since been written (mmu_write8 set jit_page_state to
@@ -1082,6 +1088,11 @@ void gbjit_dispatcher_run_until(gbjit_dispatcher *d_param, u64 until_param) {
          * value vs always-recompile-on-encounter behaviour. */
         gbjit_block *b = NULL;
         if (likely(!d->no_cache)) {
+            /* Bank the next block must match: blocks are (pc,bank)-keyed, so a
+             * cached pointer / bucket entry for a different ROM bank at this PC
+             * must NOT be reused (it would run the wrong bank's baked-in
+             * immediates — silent corruption). */
+            u8 want_bank = bbc_bank_for(cpu, cpu->pc);
             if (likely(prev)) {
                 /* N-way predicted-next cache. The first slot is the
                  * hot path; on a typical conditional branch alternating
@@ -1091,7 +1102,8 @@ void gbjit_dispatcher_run_until(gbjit_dispatcher *d_param, u64 until_param) {
                 bool hit = false;
                 for (int _i = 0; _i < GBJIT_CHAIN_PREDICTOR_WAYS; _i++) {
                     if (prev->predicted_next_pc[_i] == cpu->pc
-                            && prev->predicted_next[_i]) {
+                            && prev->predicted_next[_i]
+                            && prev->predicted_next[_i]->rom_bank == want_bank) {
                         b = prev->predicted_next[_i];
                         hit = true;
                         break;
@@ -1100,11 +1112,11 @@ void gbjit_dispatcher_run_until(gbjit_dispatcher *d_param, u64 until_param) {
                 if (likely(hit)) {
                     GBJIT_STAT_INC(d, chain_hits);
                 } else {
-                    b = find_block(d, cpu->pc);
+                    b = find_block(d, cpu->pc, want_bank);
                     GBJIT_STAT_INC(d, chain_misses);
                 }
             } else {
-                b = find_block(d, cpu->pc);
+                b = find_block(d, cpu->pc, want_bank);
             }
         }
 

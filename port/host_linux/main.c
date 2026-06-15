@@ -263,13 +263,20 @@ int main(int argc, char **argv) {
             cpu.pc, (unsigned long long)cpu.cycles, elapsed_us, mhz, dmg_ratio);
     if (use_jit) {
         fprintf(stderr,
-                " blocks=%llu/%llu chain=%llu/%llu prefetch=%llu(+%llu_cached)",
+                " blocks=%llu/%llu chain=%llu/%llu prefetch=%llu(+%llu_cached)"
+                " bbc=%llu/%llu smcinv=%llu bankflip=%llu smcflush=%llu interp=%llu",
                 (unsigned long long)disp.blocks_compiled,
                 (unsigned long long)disp.blocks_executed,
                 (unsigned long long)disp.chain_hits,
                 (unsigned long long)disp.chain_misses,
                 (unsigned long long)disp.prefetched_blocks,
-                (unsigned long long)disp.prefetch_already_cached);
+                (unsigned long long)disp.prefetch_already_cached,
+                (unsigned long long)disp.bbc_hits,
+                (unsigned long long)disp.bbc_misses,
+                (unsigned long long)disp.smc_invalidations,
+                (unsigned long long)disp.bank_flips,
+                (unsigned long long)disp.smc_flushes,
+                (unsigned long long)disp.interp_steps);
         gbjit_dispatcher_shutdown(&disp);
     }
     fprintf(stderr, " ---\n");
