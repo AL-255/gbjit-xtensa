@@ -74,6 +74,10 @@ typedef struct mmu {
     u8       ram_bank;
     u8       ram_enable;
     u8       has_battery;
+    /* Set on every write to external cart RAM; the host firmware polls it to
+     * decide when to flush the .sav to flash, and clears it after a successful
+     * write. (RTC writes also set it.) */
+    u8       cart_ram_dirty;
     /* MBC3 real-time clock — latched copy of S,M,H,DayLo,DayHi. Ticked
      * deterministically from cpu->cycles on a latch ($6000..$7FFF 0->1), so
      * the JIT and interpreter read identical values. Pokemon R/B (no timer)

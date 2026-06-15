@@ -330,10 +330,11 @@ void mmu_write8(mmu *m, u16 addr, u8 v) {
         if (m->cart_ram && m->ram_enable) {
             if (m->mbc == MBC_3 && m->ram_bank >= 0x08u && m->ram_bank <= 0x0Cu) {
                 m->rtc[m->ram_bank - 0x08u] = v;       /* MBC3 RTC register */
+                m->cart_ram_dirty = 1u;
                 return;
             }
             u32 off = ((u32)(m->ram_bank & 0x03u) << 13) + (u32)(addr - 0xA000u);
-            if (off < m->cart_ram_size) m->cart_ram[off] = v;
+            if (off < m->cart_ram_size) { m->cart_ram[off] = v; m->cart_ram_dirty = 1u; }
         }
         return;
     }
