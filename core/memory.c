@@ -41,6 +41,7 @@ void gb_mmu_init(mmu *m) {
      * first use because static mmu instances are zero-initialised, and
      * rom_free(NULL) is a no-op. */
     rom_free(m->rom);
+    rom_free(m->cart_ram);
     memset(m, 0, sizeof(*m));
     m->boot_rom_disabled = 1; /* skip boot ROM — start at $0100 */
     m->mbc = MBC_NONE;
@@ -75,6 +76,35 @@ void mmu_destroy(mmu *m) {
     rom_free(m->rom);
     m->rom = NULL;
     m->rom_capacity = 0;
+    rom_free(m->cart_ram);
+    m->cart_ram = NULL;
+    m->cart_ram_size = 0;
+}
+
+/* External-RAM size from the cart header byte $0149 (Pan Docs §"RAM size"). */
+static u32 cart_ram_bytes(u8 code) {
+    switch (code) {
+        case 0x01: return  2u * 1024u;   /* 2 KB (unofficial)         */
+        case 0x02: return  8u * 1024u;   /* 8 KB  — 1 bank            */
+        case 0x03: return 32u * 1024u;   /* 32 KB — 4 banks           */
+        case 0x04: return 128u * 1024u;  /* 128 KB — 16 banks         */
+        case 0x05: return 64u * 1024u;   /* 64 KB — 8 banks           */
+        default:   return 0u;
+    }
+}
+
+/* MBC3 RTC latch: snapshot a deterministic clock derived from elapsed CPU
+ * cycles (4.194304 MHz) into the latched registers. Deterministic so the JIT
+ * and interpreter — which share this mmu — always read identical values. */
+static void mbc3_latch_rtc(mmu *m) {
+    u64 cyc = m->cpu ? m->cpu->cycles : 0u;
+    u64 secs = cyc / 4194304ull;
+    m->rtc[0] = (u8)(secs % 60u);
+    m->rtc[1] = (u8)((secs / 60u) % 60u);
+    m->rtc[2] = (u8)((secs / 3600u) % 24u);
+    u32 days = (u32)(secs / 86400ull);
+    m->rtc[3] = (u8)(days & 0xFFu);
+    m->rtc[4] = (u8)((days >> 8) & 0x01u);
 }
 
 bool mmu_load_rom(mmu *m, const u8 *data, size_t len) {
@@ -90,9 +120,10 @@ bool mmu_load_rom(mmu *m, const u8 *data, size_t len) {
     }
     memset(m->rom, 0xFF, m->rom_capacity);
     memcpy(m->rom, data, len);
-    /* Decode cartridge header (Pan Docs $0147 / $0148). */
+    /* Decode cartridge header (Pan Docs $0147 / $0148 / $0149). */
     u8 cart_type = (len > 0x147u) ? data[0x147] : 0;
     u8 rom_size_code = (len > 0x148u) ? data[0x148] : 0;
+    u8 ram_size_code = (len > 0x149u) ? data[0x149] : 0;
     switch (cart_type) {
         case 0x00:                                          /* ROM only */
             m->mbc = MBC_NONE;
@@ -100,16 +131,42 @@ bool mmu_load_rom(mmu *m, const u8 *data, size_t len) {
         case 0x01: case 0x02: case 0x03:                    /* MBC1 family */
             m->mbc = MBC_1;
             break;
+        case 0x0F: case 0x10: case 0x11: case 0x12: case 0x13: /* MBC3 family */
+            m->mbc = MBC_3;
+            break;
         default:
             /* Treat unknown MBCs as MBC1 for a best effort. */
             m->mbc = MBC_1;
             break;
     }
+    /* Battery-backed RAM cart types (save RAM). Recorded for a future
+     * persist-to-flash hook; not yet wired. */
+    m->has_battery = (cart_type == 0x03 || cart_type == 0x06 ||
+                      cart_type == 0x09 || cart_type == 0x0D ||
+                      cart_type == 0x0F || cart_type == 0x10 ||
+                      cart_type == 0x13) ? 1u : 0u;
     m->rom_banks = (rom_size_code <= 8u) ? (u16)(2u << rom_size_code) : 2u;
     /* Don't trust the header above the file size — clamp. */
     u16 actual_banks = (u16)((len + ROM_BANK_SIZE - 1u) / ROM_BANK_SIZE);
     if (actual_banks < m->rom_banks) m->rom_banks = actual_banks;
     m->rom_bank = 1;
+
+    /* External RAM. MBC2 has 512x4 bits built in (not modelled here); for the
+     * MBC1/MBC3 carts we support, allocate per the header RAM-size byte. */
+    rom_free(m->cart_ram);
+    m->cart_ram = NULL;
+    m->cart_ram_size = 0;
+    u32 ram_bytes = cart_ram_bytes(ram_size_code);
+    if (ram_bytes > 0u) {
+        m->cart_ram = (u8 *)rom_alloc(ram_bytes);
+        if (m->cart_ram) {
+            m->cart_ram_size = ram_bytes;
+            memset(m->cart_ram, 0xFFu, ram_bytes);   /* uninit SRAM reads as $FF */
+        }
+    }
+    m->ram_bank = 0;
+    m->ram_enable = 0;
+    m->rtc_latch = 0;
     return true;
 }
 
@@ -135,7 +192,15 @@ u8 mmu_read8(mmu *m, u16 addr) {
         return m->rom[off];
     }
     if (addr < 0xA000u) return m->vram[addr - 0x8000u];
-    if (addr < 0xC000u) return 0xFFu; /* no external RAM */
+    if (addr < 0xC000u) {                              /* external RAM / RTC */
+        if (m->cart_ram && m->ram_enable) {
+            if (m->mbc == MBC_3 && m->ram_bank >= 0x08u && m->ram_bank <= 0x0Cu)
+                return m->rtc[m->ram_bank - 0x08u];    /* MBC3 RTC register */
+            u32 off = ((u32)(m->ram_bank & 0x03u) << 13) + (u32)(addr - 0xA000u);
+            if (off < m->cart_ram_size) return m->cart_ram[off];
+        }
+        return 0xFFu;                                  /* RAM disabled / none */
+    }
     if (addr < 0xE000u) return m->wram[addr - 0xC000u];
     if (addr < 0xFE00u) return m->wram[(addr - 0xE000u) & 0x1FFFu];
     if (addr < 0xFEA0u) return m->oam[addr - 0xFE00u];
@@ -200,11 +265,36 @@ static inline void smc_mark(mmu *m, u16 addr) {
 
 void mmu_write8(mmu *m, u16 addr, u8 v) {
     if (addr < 0x8000u) {
+        /* MBC3 control registers — see Pan Docs "MBC3". */
+        if (m->mbc == MBC_3) {
+            if (addr < 0x2000u) {                     /* RAM + timer enable */
+                m->ram_enable = ((v & 0x0Fu) == 0x0Au) ? 1u : 0u;
+                return;
+            }
+            if (addr < 0x4000u) {                     /* 7-bit ROM bank */
+                u8 b = v & 0x7Fu;
+                if (b == 0u) b = 1u;                  /* bank 0 selects 1 */
+                if (m->rom_banks && b >= m->rom_banks) b = (u8)(b % m->rom_banks);
+                if (b == 0u) b = 1u;
+                if (b != m->rom_bank) m->rom_bank_dirty = 1;
+                m->rom_bank = b;
+                return;
+            }
+            if (addr < 0x6000u) {                     /* RAM bank (0-3) / RTC sel (8-C) */
+                m->ram_bank = v & 0x0Fu;
+                return;
+            }
+            /* $6000..$7FFF: latch clock data — a 0 then 1 latches the RTC. */
+            if (m->rtc_latch == 0u && v == 1u) mbc3_latch_rtc(m);
+            m->rtc_latch = v;
+            return;
+        }
         /* MBC1 control register writes — see Pan Docs "Memory Bank
          * Controller 1". For ROM-only carts these are no-ops. */
         if (m->mbc != MBC_1) return;
         if (addr < 0x2000u) {
-            /* RAM enable (we don't model RAM yet) — ignore. */
+            /* RAM enable: $0A in the low nibble enables external RAM. */
+            m->ram_enable = ((v & 0x0Fu) == 0x0Au) ? 1u : 0u;
             return;
         }
         if (addr < 0x4000u) {
@@ -236,7 +326,17 @@ void mmu_write8(mmu *m, u16 addr, u8 v) {
 #endif
         smc_mark(m, addr); m->vram[addr - 0x8000u] = v; return;
     }
-    if (addr < 0xC000u) return;
+    if (addr < 0xC000u) {                              /* external RAM / RTC */
+        if (m->cart_ram && m->ram_enable) {
+            if (m->mbc == MBC_3 && m->ram_bank >= 0x08u && m->ram_bank <= 0x0Cu) {
+                m->rtc[m->ram_bank - 0x08u] = v;       /* MBC3 RTC register */
+                return;
+            }
+            u32 off = ((u32)(m->ram_bank & 0x03u) << 13) + (u32)(addr - 0xA000u);
+            if (off < m->cart_ram_size) m->cart_ram[off] = v;
+        }
+        return;
+    }
     if (addr < 0xE000u) { smc_mark(m, addr); m->wram[addr - 0xC000u] = v; return; }
     if (addr < 0xFE00u) {
         /* Echo RAM mirrors WRAM $C000..$DDFF — JIT blocks register

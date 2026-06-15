@@ -16,8 +16,14 @@
    cart needs, or (b) place the cart in PSRAM on real hardware, freeing
    ~200 KB of internal SRAM for JIT-emitted code. */
 
-#define ROM_SIZE_MAX (256u * 1024u)
+/* Max cart ROM we accept. 2 MB covers the largest MBC1/MBC3 carts (e.g.
+ * 1 MB Pokemon R/B). ROM lives in a heap buffer (PSRAM on device), never a
+ * static array, so raising this costs nothing until a big cart is actually
+ * loaded. NOTE: the device's embedded-autoboot path is bounded by the app
+ * flash partition (~1.5 MB incl. firmware), so >~1 MB ROMs must come from SD. */
+#define ROM_SIZE_MAX (2u * 1024u * 1024u)
 #define ROM_BANK_SIZE (16u * 1024u)
+#define RAM_BANK_SIZE (8u  * 1024u)
 #define ROM_DEFAULT_BYTES (32u * 1024u)  /* allocated by gb_mmu_init */
 #define VRAM_SIZE  (8u  * 1024u)
 #define WRAM_SIZE  (8u  * 1024u)
@@ -28,6 +34,7 @@
 typedef enum {
     MBC_NONE = 0,
     MBC_1    = 1,
+    MBC_3    = 3,
 } mbc_type;
 
 typedef struct mmu {
@@ -55,6 +62,24 @@ typedef struct mmu {
     mbc_type mbc;
     u8       rom_bank;
     u16      rom_banks;
+
+    /* External cartridge RAM ($A000..$BFFF), heap-backed (PSRAM on device),
+     * NULL if the cart has none. `cart_ram_size` is the allocated byte count.
+     * `ram_bank` selects the 8 KB RAM bank (0..3) — or, on MBC3, an RTC
+     * register ($08..$0C). `ram_enable` gates all RAM/RTC access (set by a
+     * $0A write to $0000..$1FFF). `has_battery` marks save-backed RAM (for a
+     * future persist-to-flash hook; not yet wired). */
+    u8      *cart_ram;
+    u32      cart_ram_size;
+    u8       ram_bank;
+    u8       ram_enable;
+    u8       has_battery;
+    /* MBC3 real-time clock — latched copy of S,M,H,DayLo,DayHi. Ticked
+     * deterministically from cpu->cycles on a latch ($6000..$7FFF 0->1), so
+     * the JIT and interpreter read identical values. Pokemon R/B (no timer)
+     * never touch it; present so MBC3+TIMER carts don't fault. */
+    u8       rtc[5];
+    u8       rtc_latch;
 
     /* Joypad button mask. Bit per button, 1 = pressed:
      *   bit 0 = A, 1 = B, 2 = Select, 3 = Start
