@@ -334,7 +334,12 @@ void mmu_write8(mmu *m, u16 addr, u8 v) {
                 return;
             }
             u32 off = ((u32)(m->ram_bank & 0x03u) << 13) + (u32)(addr - 0xA000u);
-            if (off < m->cart_ram_size) { m->cart_ram[off] = v; m->cart_ram_dirty = 1u; }
+            if (off < m->cart_ram_size) {
+                /* Only flag dirty on an actual content change: many games re-write
+                 * cart RAM with identical bytes every frame, which would otherwise
+                 * trigger an endless stream of (flash-stalling) auto-saves. */
+                if (m->cart_ram[off] != v) { m->cart_ram[off] = v; m->cart_ram_dirty = 1u; }
+            }
         }
         return;
     }
